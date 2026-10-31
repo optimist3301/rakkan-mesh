@@ -13,7 +13,7 @@
 результаты перепроверяются, а доступ к вычислениям ограничен кредитом и
 репутацией (EigenTrust).
 Из Node.js — через [`sdk/js`](sdk/js), задачи — на AssemblyScript ([`sdk/as`](sdk/as)).
-Архитектура и план — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+Архитектура и план — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), объяснение простыми словами — в [docs/README-для-чайников.md](docs/README-для-чайников.md).
 
 ```sh
 go test ./...
