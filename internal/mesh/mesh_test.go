@@ -336,3 +336,32 @@ func TestMDNSDiscovery(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// A node restarting on a new address, with every bootstrap peer gone,
+// rejoins through its peer cache alone: the others cannot redial it.
+func TestPeerCacheRejoin(t *testing.T) {
+	tn := newTestNet(t)
+	cache := t.TempDir() + "/peers.json"
+	a := tn.member(t)
+	hub := tn.member(t)
+	key, id := newKey(t)
+	cert := tn.issue(t, id, []string{membership.RoleMember}, nil, nil)
+	withCache := func(c *Config) { c.PeerCache = cache }
+
+	b, err := New(tn.config(t, key, cert, withCache, withBootstrap(hub, a)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 10*time.Second, "b joins", func() bool { return connectedMember(a, id) })
+	b.Close() // writes the cache
+	hub.Close()
+
+	b, err = New(tn.config(t, key, cert, withCache, withListen(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", freePort(t)))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	eventually(t, 10*time.Second, "b rejoins from its cache", func() bool {
+		return connectedMember(a, id) && connectedMember(b, a.ID())
+	})
+}

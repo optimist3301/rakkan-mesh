@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 )
@@ -32,6 +33,10 @@ var errNotMember = errors.New("peer is not an authenticated member")
 type hello struct {
 	Cert *membership.SignedCert `json:"cert"`
 	CRL  *membership.SignedCRL  `json:"crl,omitempty"`
+	// Observed is the address the sender sees the receiver connect from,
+	// on direct connections. A node behind NAT learns its external address
+	// this way, from members only (see advertisedAddrs).
+	Observed string `json:"observed,omitempty"`
 }
 
 // peerState is what a node knows about a peer it has connected to.
@@ -145,6 +150,8 @@ func (n *Node) onDisconnected(c network.Conn) {
 	if !st.authed {
 		return
 	}
+	// The NAT mapping it saw may not outlive the connection.
+	delete(n.observed, p)
 	st.authed = false
 	st.ready = make(chan struct{})
 	st.failures = 0
@@ -195,23 +202,27 @@ func (n *Node) handleAuth(s network.Stream) {
 	n.writeHello(s)
 }
 
-func (n *Node) writeHello(w io.Writer) error {
+func (n *Node) writeHello(s network.Stream) error {
 	crl, _ := n.revs.Current()
-	b, err := json.Marshal(hello{Cert: n.cfg.Cert, CRL: crl})
+	h := hello{Cert: n.cfg.Cert, CRL: crl}
+	if !isRelayed(s.Conn()) {
+		h.Observed = s.Conn().RemoteMultiaddr().String()
+	}
+	b, err := json.Marshal(h)
 	if err != nil {
 		return err
 	}
 	var hdr [4]byte
 	binary.BigEndian.PutUint32(hdr[:], uint32(len(b)))
-	if _, err := w.Write(hdr[:]); err != nil {
+	if _, err := s.Write(hdr[:]); err != nil {
 		return err
 	}
-	_, err = w.Write(b)
+	_, err = s.Write(b)
 	return err
 }
 
 // readHello reads and verifies a peer's hello, admitting it on success.
-func (n *Node) readHello(r io.Reader, p peer.ID) bool {
+func (n *Node) readHello(r network.Stream, p peer.ID) bool {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		n.log.Debug("auth: read", "peer", p.ShortString(), "err", err)
@@ -249,7 +260,31 @@ func (n *Node) readHello(r io.Reader, p peer.ID) bool {
 		return false
 	}
 	n.admit(p, cert, h.Cert)
+	n.observe(p, h.Observed)
 	return true
+}
+
+// observe records the external address a member reports for this node.
+// Only public addresses of transports the node listens on are kept.
+func (n *Node) observe(p peer.ID, addr string) {
+	if addr == "" {
+		return
+	}
+	a, err := ma.NewMultiaddr(addr)
+	if err != nil || !manet.IsPublicAddr(a) {
+		return
+	}
+	if _, err := a.ValueForProtocol(ma.P_TCP); err != nil {
+		if _, err := a.ValueForProtocol(ma.P_QUIC_V1); err != nil {
+			return
+		}
+	}
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if _, seen := n.observed[p]; !seen {
+		n.log.Debug("member observed our address", "peer", p.ShortString(), "addr", a)
+	}
+	n.observed[p] = a
 }
 
 func (n *Node) admit(p peer.ID, cert *membership.Cert, signed *membership.SignedCert) {

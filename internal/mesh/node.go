@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -41,9 +42,12 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	"github.com/libp2p/go-libp2p/p2p/host/autorelay"
 	"github.com/libp2p/go-libp2p/p2p/net/connmgr"
+	circuitproto "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/proto"
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	ma "github.com/multiformats/go-multiaddr"
+	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 )
@@ -59,6 +63,9 @@ type Config struct {
 	// ListenAddrs default to QUIC and TCP on all interfaces, random ports.
 	ListenAddrs []string
 	Bootstrap   []peer.AddrInfo
+	// PeerCache is a file remembering members' addresses across restarts,
+	// so a node can rejoin when no bootstrap peer is up. Empty disables it.
+	PeerCache string
 	// MDNS enables discovery on the local network.
 	MDNS bool
 	// NAT enables UPnP port mapping, hole punching and AutoNAT.
@@ -66,6 +73,9 @@ type Config struct {
 	// RelayService lets this node relay traffic between members that cannot
 	// reach each other directly. Enable it on publicly reachable nodes.
 	RelayService bool
+	// Reachability says whether other nodes can dial this one. The default,
+	// ReachabilityAuto, decides from interface addresses (see reachability).
+	Reachability Reachability
 
 	AuthTimeout       time.Duration // default 10s
 	HealthInterval    time.Duration // default 15s
@@ -98,6 +108,29 @@ func (c *Config) setDefaults() {
 	}
 }
 
+// Reachability is whether a node accepts inbound connections from the
+// internet.
+type Reachability int
+
+const (
+	ReachabilityAuto Reachability = iota
+	ReachabilityPublic
+	ReachabilityPrivate
+)
+
+// ParseReachability parses "auto", "public" or "private".
+func ParseReachability(s string) (Reachability, error) {
+	switch s {
+	case "auto", "":
+		return ReachabilityAuto, nil
+	case "public":
+		return ReachabilityPublic, nil
+	case "private":
+		return ReachabilityPrivate, nil
+	}
+	return 0, fmt.Errorf("reachability %q: want auto, public or private", s)
+}
+
 // Node is a member of a Rakkan network.
 type Node struct {
 	cfg   Config
@@ -108,6 +141,7 @@ type Node struct {
 	ps    *pubsub.PubSub
 	crl   *pubsub.Topic
 	mdns  mdns.Service
+	relay *relayv2.Relay
 	revs  *membership.Revocations
 	self  *membership.Cert
 
@@ -117,10 +151,11 @@ type Node struct {
 
 	discover chan struct{} // requests a discovery round
 
-	mu      sync.Mutex
-	peers   map[peer.ID]*peerState
-	denied  map[peer.ID]time.Time
-	authing map[peer.ID]bool
+	mu       sync.Mutex
+	peers    map[peer.ID]*peerState
+	observed map[peer.ID]ma.Multiaddr // our address as members see it
+	denied   map[peer.ID]time.Time
+	authing  map[peer.ID]bool
 }
 
 // New starts a node.
@@ -140,6 +175,7 @@ func New(cfg Config) (*Node, error) {
 		peers:    map[peer.ID]*peerState{},
 		denied:   map[peer.ID]time.Time{},
 		authing:  map[peer.ID]bool{},
+		observed: map[peer.ID]ma.Multiaddr{},
 		discover: make(chan struct{}, 1),
 	}
 	if cfg.CRL != nil {
@@ -165,18 +201,38 @@ func New(cfg Config) (*Node, error) {
 		libp2p.ConnectionGater(&gater{n}),
 		libp2p.ConnectionManager(cm),
 		libp2p.UserAgent("rakkan/0.2"),
+		libp2p.AddrsFactory(n.advertisedAddrs),
 		libp2p.EnableRelay(),
-		libp2p.EnableAutoRelayWithPeerSource(n.relayCandidates),
+		// Defaults suit large public networks: wait for 4 candidates and up
+		// to 3 minutes, and ask for candidates every 30s. A closed network
+		// may have a single relay, known only once it has authenticated.
+		libp2p.EnableAutoRelayWithPeerSource(n.relayCandidates,
+			autorelay.WithMinCandidates(1), autorelay.WithBootDelay(0),
+			autorelay.WithMinInterval(5*time.Second)),
+		// libp2p.EnableRelayService would wait for AutoNAT to confirm the
+		// node is public; the relay is started directly below instead.
 	}
 	if cfg.NAT {
 		opts = append(opts, libp2p.NATPortMap(), libp2p.EnableHolePunching(), libp2p.EnableNATService())
 	}
-	if cfg.RelayService {
-		opts = append(opts, libp2p.EnableRelayService(relayv2.WithACL(relayACL{n}), relayv2.WithInfiniteLimits()))
+	switch reach := n.reachability(); reach {
+	case ReachabilityPublic:
+		opts = append(opts, libp2p.ForceReachabilityPublic())
+	case ReachabilityPrivate:
+		opts = append(opts, libp2p.ForceReachabilityPrivate())
 	}
 	if n.host, err = libp2p.New(opts...); err != nil {
 		n.cancel()
 		return nil, fmt.Errorf("mesh: %w", err)
+	}
+	if cfg.RelayService {
+		// The operator asked for a relay; do not wait for AutoNAT, which in
+		// a small network may never gather enough observations.
+		if n.relay, err = relayv2.New(n.host, relayv2.WithACL(relayACL{n}), relayv2.WithInfiniteLimits()); err != nil {
+			n.host.Close()
+			n.cancel()
+			return nil, fmt.Errorf("mesh: relay: %w", err)
+		}
 	}
 	n.gated = &gatedHost{Host: n.host, n: n}
 	n.host.SetStreamHandler(authProtocol, n.handleAuth)
@@ -223,6 +279,7 @@ func (n *Node) startServices() error {
 	for _, ai := range n.cfg.Bootstrap {
 		n.addDialTarget(ai)
 	}
+	n.loadPeerCache()
 	n.wg.Go(n.healthLoop)
 	n.wg.Go(n.dialLoop)
 	n.wg.Go(n.discoveryLoop)
@@ -231,7 +288,13 @@ func (n *Node) startServices() error {
 
 // Close shuts the node down.
 func (n *Node) Close() error {
+	if n.host != nil {
+		n.savePeerCache()
+	}
 	n.cancel()
+	if n.relay != nil {
+		n.relay.Close()
+	}
 	if n.mdns != nil {
 		n.mdns.Close()
 	}
@@ -282,6 +345,82 @@ func (n *Node) Connect(ctx context.Context, ai peer.AddrInfo) error {
 	return n.waitMember(ctx, ai.ID)
 }
 
+// reachability resolves ReachabilityAuto. AutoNAT cannot be relied on in a
+// small network: it needs several peers to dial back, and a single peer
+// dialling back over the existing 5-tuple passes through a NAT and reports
+// a NATed node as public. Instead: a node listening on a public address is
+// public; one listening only on private addresses is behind NAT
+// and uses relays and hole punching. A port mapped by UPnP is still
+// advertised and dialled directly; the node is merely also given a relay
+// address. Loopback-only nodes (tests, local clusters) are left to AutoNAT.
+func (n *Node) reachability() Reachability {
+	if n.cfg.Reachability != ReachabilityAuto {
+		return n.cfg.Reachability
+	}
+	// The addresses the node listens on, with wildcards expanded.
+	var addrs []ma.Multiaddr
+	ifaces, err := manet.InterfaceMultiaddrs()
+	if err != nil {
+		return ReachabilityAuto
+	}
+	for _, s := range n.cfg.ListenAddrs {
+		l, err := ma.NewMultiaddr(s)
+		if err != nil {
+			continue
+		}
+		if expanded, err := manet.ResolveUnspecifiedAddress(l, ifaces); err == nil {
+			addrs = append(addrs, expanded...)
+		}
+	}
+	sawPrivate := false
+	for _, a := range addrs {
+		switch {
+		case manet.IsIPLoopback(a):
+		case manet.IsPublicAddr(a):
+			return ReachabilityPublic
+		default:
+			sawPrivate = true
+		}
+	}
+	if sawPrivate {
+		return ReachabilityPrivate
+	}
+	return ReachabilityAuto
+}
+
+// advertisedAddrs is what the node tells others: its listen addresses
+// without loopback, plus the external addresses members observed. libp2p's
+// own observed-address tracking needs four distinct observers, which a
+// small network may never have, and counts any connected peer; this counts
+// authenticated members only, and one is enough. Hole punching needs it:
+// without a known external address there is nothing to punch.
+func (n *Node) advertisedAddrs(addrs []ma.Multiaddr) []ma.Multiaddr {
+	out := withoutLoopback(addrs)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	for _, a := range n.observed {
+		if !slices.ContainsFunc(out, a.Equal) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// withoutLoopback stops a node from advertising loopback addresses, which
+// make other nodes dial themselves, unless it has nothing else.
+func withoutLoopback(addrs []ma.Multiaddr) []ma.Multiaddr {
+	var out []ma.Multiaddr
+	for _, a := range addrs {
+		if !manet.IsIPLoopback(a) {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return addrs
+	}
+	return out
+}
+
 // tag is a short network identifier used in protocol and service names.
 func (n *Node) tag() string {
 	id := n.cfg.Network.ID
@@ -307,13 +446,16 @@ func (r relayACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
 	return r.n.isMember(src) && r.n.isMember(dest)
 }
 
-// relayCandidates offers connected members as relays to AutoRelay.
+// relayCandidates offers connected members running a relay to AutoRelay.
 func (n *Node) relayCandidates(ctx context.Context, num int) <-chan peer.AddrInfo {
 	out := make(chan peer.AddrInfo, num)
 	go func() {
 		defer close(out)
 		for _, m := range n.Members() {
 			if !m.Connected || num == 0 {
+				continue
+			}
+			if ok, _ := n.host.Peerstore().SupportsProtocols(m.ID, circuitproto.ProtoIDv2Hop); len(ok) == 0 {
 				continue
 			}
 			select {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"io/fs"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -27,10 +27,13 @@ func daemonCmd(args []string) int {
 	crlPath := flags.String("crl", "", "revocation list; reloaded and published to the network when it changes")
 	listen := flags.String("listen", "", "comma-separated listen multiaddrs (default: QUIC and TCP on all interfaces)")
 	bootstrap := flags.String("bootstrap", "", "comma-separated multiaddrs of known members, ending in /p2p/<peer ID>")
+	peerCache := flags.String("peers", "peers.json", "file remembering members' addresses across restarts; empty disables")
 	mdnsOn := flags.Bool("mdns", true, "discover members on the local network")
 	nat := flags.Bool("nat", true, "UPnP port mapping, hole punching and AutoNAT")
 	relay := flags.Bool("relay", false, "relay traffic for members; enable on publicly reachable nodes")
+	reach := flags.String("reachability", "auto", "auto (from interface addresses), public, or private (behind NAT)")
 	verbose := flags.Bool("v", false, "debug logging")
+	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
 	n, err := membership.ParseNetwork(*network)
@@ -45,7 +48,11 @@ func daemonCmd(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, NAT: *nat, RelayService: *relay}
+	reachability, err := mesh.ParseReachability(*reach)
+	if err != nil {
+		return fail(err)
+	}
+	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, NAT: *nat, RelayService: *relay, Reachability: reachability, PeerCache: *peerCache}
 	if *crlPath != "" {
 		// A missing file is fine: it is picked up once the operator creates it.
 		if cfg.CRL, err = membership.LoadCRL(*crlPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -82,7 +89,7 @@ func daemonCmd(args []string) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	status := time.NewTicker(30 * time.Second)
+	status := time.NewTicker(*statusEvery)
 	defer status.Stop()
 	reload := time.NewTicker(5 * time.Second)
 	defer reload.Stop()
@@ -130,7 +137,11 @@ func printMembers(node *mesh.Node) {
 	for _, m := range ms {
 		state := "disconnected"
 		if m.Connected {
-			state = "rtt " + m.RTT.Round(100*time.Microsecond).String()
+			path := "direct"
+			if m.Relayed {
+				path = "relayed"
+			}
+			state = fmt.Sprintf("%s rtt %s via %s", path, m.RTT.Round(100*time.Microsecond), m.Addr)
 		}
 		fmt.Printf("  %s %-24s %s\n", m.ID, strings.Join(m.Roles, ","), state)
 	}

@@ -13,6 +13,7 @@ import (
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	"github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+	ma "github.com/multiformats/go-multiaddr"
 )
 
 // maxPingFailures closes a connection after this many consecutive failed
@@ -24,14 +25,17 @@ type Member struct {
 	ID        peer.ID
 	Roles     []string
 	Connected bool
-	RTT       time.Duration
-	LastSeen  time.Time
+	// Relayed is set when every connection to the member goes through a
+	// relay; Addr is the remote address of the preferred connection.
+	Relayed  bool
+	Addr     string
+	RTT      time.Duration
+	LastSeen time.Time
 }
 
 // Members lists known members, connected or not.
 func (n *Node) Members() []Member {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	var out []Member
 	for p, st := range n.peers {
 		if st.cert == nil {
@@ -39,8 +43,28 @@ func (n *Node) Members() []Member {
 		}
 		out = append(out, Member{ID: p, Roles: st.cert.Roles, Connected: st.authed, RTT: st.rtt, LastSeen: st.lastSeen})
 	}
+	n.mu.Unlock()
+	for i := range out {
+		conns := n.host.Network().ConnsToPeer(out[i].ID)
+		if len(conns) == 0 {
+			continue
+		}
+		out[i].Relayed = true
+		out[i].Addr = conns[0].RemoteMultiaddr().String()
+		for _, c := range conns {
+			if !isRelayed(c) {
+				out[i].Relayed, out[i].Addr = false, c.RemoteMultiaddr().String()
+				break
+			}
+		}
+	}
 	slices.SortFunc(out, func(a, b Member) int { return a.LastSeen.Compare(b.LastSeen) })
 	return out
+}
+
+func isRelayed(c network.Conn) bool {
+	_, err := c.RemoteMultiaddr().ValueForProtocol(ma.P_CIRCUIT)
+	return err == nil
 }
 
 // healthLoop pings connected members, closes connections that stop
@@ -48,11 +72,17 @@ func (n *Node) Members() []Member {
 func (n *Node) healthLoop() {
 	tick := time.NewTicker(n.cfg.HealthInterval)
 	defer tick.Stop()
+	lastSave := time.Now()
 	for {
 		select {
 		case <-n.ctx.Done():
 			return
 		case <-tick.C:
+		}
+		// Save periodically too: a crash skips the save in Close.
+		if time.Since(lastSave) > 30*time.Second {
+			n.savePeerCache()
+			lastSave = time.Now()
 		}
 		for _, m := range n.Members() {
 			if m.Connected {
