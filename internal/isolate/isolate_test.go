@@ -159,6 +159,9 @@ func newPool(t *testing.T, cfg Config) *Pool {
 	if cfg.Workers == 0 {
 		cfg.Workers = 1
 	}
+	if raceEnabled && cfg.Isolation.MemoryBytes == 0 {
+		cfg.Isolation.MemoryBytes = 1 << 40
+	}
 	p, err := NewPool(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -170,7 +173,7 @@ func newPool(t *testing.T, cfg Config) *Pool {
 func TestPoolRunsTask(t *testing.T) {
 	p := newPool(t, Config{Isolation: StrictIsolation()})
 	in := []byte("hello from the other process")
-	res, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
+	res, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,24 +194,24 @@ func TestPoolRunsTask(t *testing.T) {
 }
 
 func TestPoolSandboxErrorsCrossBoundary(t *testing.T) {
-	p := newPool(t, Config{Isolation: StrictIsolation(), TasksPerWorker: 100})
+	p := newPool(t, Config{Isolation: StrictIsolation()})
 	lim := testLimits()
 
 	lim.MaxGas = 1000
-	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrOutOfGas) {
+	if _, err := p.Run(t.Context(), "alice", sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrOutOfGas) {
 		t.Fatalf("got %v, want ErrOutOfGas", err)
 	}
 	lim = testLimits()
 	lim.Timeout = 200 * time.Millisecond
-	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrTimeout) {
+	if _, err := p.Run(t.Context(), "alice", sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrTimeout) {
 		t.Fatalf("got %v, want ErrTimeout", err)
 	}
-	if _, err := p.Run(t.Context(), sandbox.Task{Module: []byte("junk"), Limits: testLimits()}); !errors.Is(err, sandbox.ErrInvalidModule) {
+	if _, err := p.Run(t.Context(), "", sandbox.Task{Module: []byte("junk"), Limits: testLimits()}); !errors.Is(err, sandbox.ErrInvalidModule) {
 		t.Fatalf("got %v, want ErrInvalidModule", err)
 	}
-	// Sandbox errors leave the worker healthy.
-	if got := p.spawned.Load(); got != 1 {
-		t.Fatalf("spawned %d workers, want 1", got)
+	// Sandbox errors leave the worker healthy and reusable.
+	if got := p.reused.Load(); got != 1 {
+		t.Fatalf("reused %d times, want 1", got)
 	}
 }
 
@@ -216,18 +219,64 @@ func TestPoolSandboxErrorsCrossBoundary(t *testing.T) {
 // and promptly. A regression here once came from interrupting through the
 // gas counter, which the guest's writes kept overwriting.
 func TestPoolTimeoutIsPrecise(t *testing.T) {
-	p := newPool(t, Config{Isolation: StrictIsolation(), TasksPerWorker: 100})
+	p := newPool(t, Config{Isolation: StrictIsolation()})
 	lim := testLimits()
 	lim.Timeout = 100 * time.Millisecond
 	for range 5 {
 		start := time.Now()
-		_, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim})
+		_, err := p.Run(t.Context(), "alice", sandbox.Task{Module: w.Spin(), Limits: lim})
 		if !errors.Is(err, sandbox.ErrTimeout) || strings.Contains(err.Error(), "unresponsive") {
 			t.Fatalf("got %v, want in-worker timeout", err)
 		}
 		if el := time.Since(start); el > 300*time.Millisecond {
 			t.Fatalf("timeout after %s", el)
 		}
+	}
+}
+
+// A module within structural limits can still be slow and memory hungry to
+// compile. Neither may hold a worker beyond the task's limits, and the pool
+// must recover.
+func TestCompileBombIsContained(t *testing.T) {
+	defer func(g time.Duration) { workerGrace = g }(workerGrace)
+	workerGrace = 300 * time.Millisecond
+	lim := testLimits()
+	lim.Timeout = time.Second
+
+	cases := map[string]struct {
+		memory int64
+		want   []error
+	}{
+		// The default worker memory is far below what compilation wants.
+		"memory": {0, []error{ErrWorkerOOM}},
+		// With ample memory, the timeout stops it (or memory, if it grows
+		// faster than the timeout on this machine).
+		"time": {4 << 30, []error{sandbox.ErrTimeout, ErrWorkerOOM}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			if raceEnabled && name == "memory" {
+				t.Skip("address space limits are meaningless under ThreadSanitizer")
+			}
+			iso := StrictIsolation()
+			iso.MemoryBytes = c.memory
+			p := newPool(t, Config{Isolation: iso})
+			start := time.Now()
+			_, err := p.Run(t.Context(), "", sandbox.Task{Module: w.CompileBomb(16_000), Limits: lim})
+			matched := false
+			for _, want := range c.want {
+				matched = matched || errors.Is(err, want)
+			}
+			if !matched {
+				t.Fatalf("got %v, want one of %v", err, c.want)
+			}
+			if el := time.Since(start); el > lim.Timeout+workerGrace+500*time.Millisecond {
+				t.Fatalf("compile bomb held the pool for %s", el)
+			}
+			if _, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+				t.Fatalf("pool did not recover: %v", err)
+			}
+		})
 	}
 }
 
@@ -240,7 +289,7 @@ func TestCgroupLimits(t *testing.T) {
 	iso.MemoryBytes = 96 << 20
 	iso.CPUs = 0.5
 	p := newPool(t, Config{Isolation: iso, Workers: 2})
-	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+	if _, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -272,12 +321,76 @@ func TestCgroupLimits(t *testing.T) {
 func TestPoolFreshProcessPerTask(t *testing.T) {
 	p := newPool(t, Config{Isolation: StrictIsolation()})
 	for range 3 {
-		if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+		if _, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	if got := p.spawned.Load(); got < 3 {
 		t.Fatalf("spawned %d workers for 3 tasks", got)
+	}
+	if got := p.reused.Load(); got != 0 {
+		t.Fatalf("anonymous tasks reused workers %d times", got)
+	}
+}
+
+func TestPoolAffinity(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), Workers: 4, TasksPerWorker: 3})
+	run := func(owner string, mod []byte) {
+		t.Helper()
+		if _, err := p.Run(t.Context(), owner, sandbox.Task{Module: mod, Limits: testLimits()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	echo, spin := w.Echo(), w.CompileBomb(10)
+	run("alice", echo)
+	run("alice", echo)
+	run("alice", echo)
+	if got := p.reused.Load(); got != 2 {
+		t.Fatalf("reused %d times for one owner and module, want 2", got)
+	}
+	run("alice", echo) // TasksPerWorker reached: fresh worker
+	run("bob", echo)   // other owner: fresh worker
+	run("alice", spin) // other module: fresh worker
+	if got := p.reused.Load(); got != 2 {
+		t.Fatalf("reused %d times across owners or modules, want 2", got)
+	}
+}
+
+func TestPoolAffinitySkipsCompilation(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	mod := w.CompileBomb(500)
+	lim := sandbox.DefaultLimits()
+	first, err := p.Run(t.Context(), "alice", sandbox.Task{Module: mod, Limits: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := p.Run(t.Context(), "alice", sandbox.Task{Module: mod, Limits: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Elapsed*5 > first.Elapsed {
+		t.Fatalf("second run took %s, first %s", second.Elapsed, first.Elapsed)
+	}
+	t.Logf("first %s, second %s", first.Elapsed, second.Elapsed)
+}
+
+func TestPoolRetiresIdleWorkers(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), IdleTimeout: 100 * time.Millisecond})
+	if _, err := p.Run(t.Context(), "alice", sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		p.mu.Lock()
+		n := len(p.parked)
+		p.mu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d idle workers still parked", n)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -287,7 +400,7 @@ func TestPoolConcurrent(t *testing.T) {
 	for i := range 16 {
 		go func() {
 			in := []byte{byte(i)}
-			res, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
+			res, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
 			if err == nil && !bytes.Equal(res.Output, in) {
 				err = errors.New("output mismatch")
 			}
@@ -306,7 +419,7 @@ func TestPoolCancellationKillsWorker(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := p.Run(ctx, sandbox.Task{Module: w.Spin(), Limits: testLimits()}); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := p.Run(ctx, "", sandbox.Task{Module: w.Spin(), Limits: testLimits()}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("got %v, want context.DeadlineExceeded", err)
 	}
 	if el := time.Since(start); el > time.Second {
@@ -328,7 +441,7 @@ func TestPoolMisbehavingWorkers(t *testing.T) {
 	for mode, want := range cases {
 		t.Run(mode, func(t *testing.T) {
 			p := newPool(t, Config{Isolation: StrictIsolation(), args: []string{mode}})
-			_, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: lim})
+			_, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Limits: lim})
 			if !errors.Is(err, want) {
 				t.Fatalf("got %v, want %v", err, want)
 			}
@@ -340,7 +453,7 @@ func TestPoolRejectsOverPolicy(t *testing.T) {
 	p := newPool(t, Config{Isolation: StrictIsolation()})
 	lim := sandbox.DefaultLimits()
 	lim.MaxGas *= 2
-	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: lim}); !errors.Is(err, sandbox.ErrLimitPolicy) {
+	if _, err := p.Run(t.Context(), "", sandbox.Task{Module: w.Echo(), Limits: lim}); !errors.Is(err, sandbox.ErrLimitPolicy) {
 		t.Fatalf("got %v, want ErrLimitPolicy", err)
 	}
 }
@@ -432,6 +545,9 @@ func TestHardenedWorkerConfinement(t *testing.T) {
 }
 
 func TestAddressSpaceLimit(t *testing.T) {
+	if raceEnabled {
+		t.Skip("address space limits are meaningless under ThreadSanitizer")
+	}
 	iso := StrictIsolation()
 	iso.MemoryBytes = 128 << 20
 	if got := runProbe(t, iso, "alloc"); !strings.HasPrefix(got, "exited") {

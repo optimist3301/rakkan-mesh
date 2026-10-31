@@ -14,6 +14,7 @@ package sandbox
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -46,11 +47,29 @@ type Result struct {
 type Runner struct {
 	ceiling Limits
 	cache   wazero.CompilationCache
+	metered *meteredCache
 }
+
+// meteredCacheBytes bounds the instrumented modules a Runner keeps.
+const meteredCacheBytes = 64 << 20
 
 // NewRunner returns a runner that refuses tasks requesting more than ceiling.
 func NewRunner(ceiling Limits) *Runner {
-	return &Runner{ceiling: ceiling, cache: wazero.NewCompilationCache()}
+	return &Runner{ceiling: ceiling, cache: wazero.NewCompilationCache(), metered: newMeteredCache(meteredCacheBytes)}
+}
+
+// instrument returns the metered module, from cache when possible.
+func (r *Runner) instrument(module []byte) ([]byte, error) {
+	key := sha256.Sum256(module)
+	if m, ok := r.metered.get(key); ok {
+		return m, nil
+	}
+	m, err := meter.Instrument(module)
+	if err != nil {
+		return nil, err
+	}
+	r.metered.add(key, m)
+	return m, nil
 }
 
 // Close releases compiled code held in the cache.
@@ -97,7 +116,7 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 		return nil, fmt.Errorf("instantiate host module: %w", err)
 	}
 
-	metered, err := meter.Instrument(t.Module)
+	metered, err := r.instrument(t.Module)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidModule, err)
 	}

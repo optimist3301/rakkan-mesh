@@ -112,7 +112,7 @@ func runCmd(args []string) int {
 			return 1
 		}
 		defer pool.Close()
-		res, err = pool.Run(ctx, task)
+		res, err = pool.Run(ctx, "", task)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "task failed:", err)

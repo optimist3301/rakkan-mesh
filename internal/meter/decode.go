@@ -84,7 +84,7 @@ func decode(r *reader) (instr, error) {
 		in.split = true
 	case op == opBrTable:
 		var n uint32
-		if n, err = r.u32(); err == nil {
+		if n, err = vecLen(r, MaxBrTableTargets, "br_table targets"); err == nil {
 			for i := uint64(0); i <= uint64(n) && err == nil; i++ {
 				_, err = r.u32()
 			}
@@ -100,7 +100,7 @@ func decode(r *reader) (instr, error) {
 		}
 		in.cost = CallCost + 1
 	case op == 0x1c: // select t*
-		err = valTypes(r)
+		err = valTypes(r, 1)
 	case op >= opLocalGet && op <= opLocalTee:
 		var idx uint32
 		idx, err = r.u32()
@@ -220,8 +220,8 @@ func valType(r *reader) error {
 	return fmt.Errorf("unsupported value type 0x%02x", b)
 }
 
-func valTypes(r *reader) error {
-	n, err := r.u32()
+func valTypes(r *reader, limit int) error {
+	n, err := vecLen(r, limit, "value types")
 	if err != nil {
 		return err
 	}

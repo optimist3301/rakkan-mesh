@@ -58,13 +58,29 @@ const (
 	StartExport     = "__rakkan_start"
 )
 
-// Structural limits, protecting the instrumenter and the compiler from
-// modules crafted to be expensive to process.
+// Structural limits, protecting the instrumenter, the compiler and the
+// runtime from modules crafted to be expensive to process. They are part of
+// the module acceptance rules, so nodes agree on which modules are valid.
+//
+// wazero's compiler is superlinear in nesting depth, br_table size and in
+// locals live across many branches, so a small module can take minutes to
+// compile. These limits cut the worst ratios without rejecting code real
+// toolchains emit; compilation also counts against the task timeout, past
+// which the node kills the worker.
 const (
-	MaxFunctions = 100_000
-	MaxLocals    = 50_000 // per function, excluding parameters
-	MaxGlobals   = 100_000
-	MaxBodyBytes = 1 << 20
+	MaxTypes          = 100_000
+	MaxParams         = 128 // per function type, also results
+	MaxImports        = 1_000
+	MaxFunctions      = 100_000
+	MaxTables         = 4
+	MaxTableElements  = 1 << 18 // declared maxima above this are lowered to it
+	MaxGlobals        = 100_000
+	MaxExports        = 100_000
+	MaxSegments       = 100_000 // data and element segments, each
+	MaxLocals         = 50_000  // per function, excluding parameters
+	MaxBodyBytes      = 1 << 20
+	MaxNesting        = 1_024 // block, loop and if depth within a function
+	MaxBrTableTargets = 16_384
 )
 
 var ErrUnsupported = errors.New("unsupported module")
@@ -173,14 +189,12 @@ func parse(wasm []byte) (*module, error) {
 		case secFunc:
 			err = m.parseFuncs(sr)
 		case secTable:
-			err = eachEntry(sr, func() error {
-				if err := valType(sr); err != nil {
-					return err
-				}
-				return skipLimits(sr)
-			})
+			var clamped []byte
+			if clamped, err = parseTables(sr); err == nil {
+				m.sections[len(m.sections)-1].data = clamped
+			}
 		case secMemory:
-			err = eachEntry(sr, func() error { return skipLimits(sr) })
+			err = eachEntry(sr, 1, "memories", func() error { return skipLimits(sr) })
 		case secGlobal:
 			err = m.parseGlobals(sr)
 		case secExport:
@@ -190,9 +204,9 @@ func parse(wasm []byte) (*module, error) {
 			idx, err = sr.u32()
 			m.start = int64(idx)
 		case secElem:
-			err = eachEntry(sr, func() error { return skipElemSegment(sr) })
+			err = eachEntry(sr, MaxSegments, "element segments", func() error { return skipElemSegment(sr) })
 		case secData:
-			err = eachEntry(sr, func() error { return skipDataSegment(sr) })
+			err = eachEntry(sr, MaxSegments, "data segments", func() error { return skipDataSegment(sr) })
 		case secDataCount:
 			_, err = sr.u32()
 		case secCode:
@@ -219,29 +233,71 @@ func parse(wasm []byte) (*module, error) {
 }
 
 func (m *module) parseTypes(r *reader) error {
-	n, err := r.u32()
-	if err != nil {
-		return err
-	}
-	for range n {
+	return eachEntry(r, MaxTypes, "types", func() error {
 		if b, err := r.byte(); err != nil || b != 0x60 {
 			return errors.New("malformed function type")
 		}
 		start := r.pos
-		if err := valTypes(r); err != nil {
+		if err := valTypes(r, MaxParams); err != nil {
 			return err
 		}
 		params, _ := (&reader{buf: r.buf, pos: start}).u32()
-		if err := valTypes(r); err != nil {
+		if err := valTypes(r, MaxParams); err != nil {
 			return err
 		}
 		m.types = append(m.types, int(params))
+		return nil
+	})
+}
+
+// parseTables checks table declarations and re-encodes them with every
+// maximum at most MaxTableElements, so table.grow fails deterministically
+// instead of exhausting memory.
+func parseTables(r *reader) ([]byte, error) {
+	n, err := vecLen(r, MaxTables, "tables")
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	out := appendUleb(nil, uint64(n))
+	for range n {
+		rt, err := r.byte()
+		if err != nil {
+			return nil, err
+		}
+		if rt != 0x70 && rt != 0x6f {
+			return nil, fmt.Errorf("unsupported table element type 0x%02x", rt)
+		}
+		flag, err := r.byte()
+		if err != nil {
+			return nil, err
+		}
+		if flag > 1 {
+			return nil, fmt.Errorf("unsupported table limits flags %d", flag)
+		}
+		minSize, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		maxSize := uint32(MaxTableElements)
+		if flag == 1 {
+			declared, err := r.u32()
+			if err != nil {
+				return nil, err
+			}
+			maxSize = min(declared, maxSize)
+		}
+		if minSize > MaxTableElements {
+			return nil, fmt.Errorf("table of %d elements, limit %d", minSize, MaxTableElements)
+		}
+		out = append(out, rt, 0x01)
+		out = appendUleb(out, uint64(minSize))
+		out = appendUleb(out, uint64(maxSize))
+	}
+	return out, nil
 }
 
 func (m *module) parseImports(r *reader) error {
-	n, err := r.u32()
+	n, err := vecLen(r, MaxImports, "imports")
 	if err != nil {
 		return err
 	}
@@ -287,6 +343,10 @@ func skipLimits(r *reader) error {
 	if err != nil {
 		return err
 	}
+	// Shared (threads) and 64-bit (memory64) limits are unsupported.
+	if flag > 1 {
+		return fmt.Errorf("unsupported limits flags %d", flag)
+	}
 	if _, err := r.u32(); err != nil {
 		return err
 	}
@@ -296,9 +356,21 @@ func skipLimits(r *reader) error {
 	return err
 }
 
-// eachEntry reads a vector, calling entry once per declared element.
-func eachEntry(r *reader, entry func() error) error {
+// vecLen reads a vector length, enforcing a structural limit.
+func vecLen(r *reader, limit int, what string) (uint32, error) {
 	n, err := r.u32()
+	if err != nil {
+		return 0, err
+	}
+	if uint64(n) > uint64(limit) {
+		return 0, fmt.Errorf("%d %s, limit %d", n, what, limit)
+	}
+	return n, nil
+}
+
+// eachEntry reads a vector, calling entry once per declared element.
+func eachEntry(r *reader, limit int, what string, entry func() error) error {
+	n, err := vecLen(r, limit, what)
 	if err != nil {
 		return err
 	}
@@ -336,9 +408,9 @@ func skipElemSegment(r *reader) error {
 		}
 	}
 	if exprs {
-		return eachEntry(r, func() error { return skipConstExpr(r) })
+		return eachEntry(r, MaxTableElements, "segment elements", func() error { return skipConstExpr(r) })
 	}
-	return eachEntry(r, func() error { _, err := r.u32(); return err })
+	return eachEntry(r, MaxTableElements, "segment elements", func() error { _, err := r.u32(); return err })
 }
 
 func skipDataSegment(r *reader) error {
@@ -368,12 +440,9 @@ func skipDataSegment(r *reader) error {
 }
 
 func (m *module) parseGlobals(r *reader) error {
-	n, err := r.u32()
+	n, err := vecLen(r, MaxGlobals, "globals")
 	if err != nil {
 		return err
-	}
-	if n > MaxGlobals {
-		return fmt.Errorf("%d globals, limit %d", n, MaxGlobals)
 	}
 	for range n {
 		if err := valType(r); err != nil {
@@ -404,12 +473,9 @@ func skipConstExpr(r *reader) error {
 }
 
 func (m *module) parseFuncs(r *reader) error {
-	n, err := r.u32()
+	n, err := vecLen(r, MaxFunctions, "functions")
 	if err != nil {
 		return err
-	}
-	if n > MaxFunctions {
-		return fmt.Errorf("%d functions, limit %d", n, MaxFunctions)
 	}
 	for range n {
 		idx, err := r.u32()
@@ -425,7 +491,7 @@ func (m *module) parseFuncs(r *reader) error {
 }
 
 func (m *module) parseExports(r *reader) error {
-	n, err := r.u32()
+	n, err := vecLen(r, MaxExports, "exports")
 	if err != nil {
 		return err
 	}
@@ -596,10 +662,19 @@ func (m *module) rewriteBody(body []byte, params int, gas uint32) ([]byte, error
 
 	var code []instr
 	needScratch := false
+	depth := 1 // the function body is a block
 	for !r.done() {
 		in, err := decode(r)
 		if err != nil {
 			return nil, err
+		}
+		switch in.op {
+		case opBlock, opLoop, opIf:
+			if depth++; depth > MaxNesting {
+				return nil, fmt.Errorf("blocks nested deeper than %d", MaxNesting)
+			}
+		case opEnd:
+			depth--
 		}
 		if in.global >= int64(m.numGlobals) {
 			return nil, fmt.Errorf("global %d out of range", in.global)

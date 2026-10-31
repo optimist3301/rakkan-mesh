@@ -12,12 +12,15 @@ package isolate
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -48,12 +51,13 @@ type Config struct {
 	Ceiling sandbox.Limits
 	// Workers is the number of tasks run concurrently. Default: GOMAXPROCS.
 	Workers int
-	// TasksPerWorker is how many tasks a worker process serves before it is
-	// replaced. The default of 1 means no state, compromised or not, carries
-	// over between tasks; larger values reuse compiled modules and save
-	// process start-up.
+	// TasksPerWorker bounds how many tasks of one owner and module a worker
+	// serves before it is replaced (see Run). Default: 100.
 	TasksPerWorker int
-	Isolation      Isolation
+	// IdleTimeout retires workers kept for an owner and module after this
+	// long without use. Default: 30s.
+	IdleTimeout time.Duration
+	Isolation   Isolation
 	// Executable is the worker binary. Default: the running executable,
 	// which must call RunWorker when IsWorker reports true.
 	Executable string
@@ -66,11 +70,16 @@ type Pool struct {
 	cfg    Config
 	cg     *cgroupRoot
 	slots  chan struct{}
-	idle   chan *worker
+	idle   chan *worker // fresh workers that have run nothing yet
 	closed atomic.Bool
 	bg     sync.WaitGroup
+	stop   chan struct{}
+
+	mu     sync.Mutex
+	parked []*worker // workers bound to an owner and module, oldest first
 
 	spawned atomic.Int64
+	reused  atomic.Int64
 }
 
 // NewPool validates the configuration and starts Workers warm workers, so
@@ -80,7 +89,10 @@ func NewPool(cfg Config) (*Pool, error) {
 		cfg.Workers = runtime.GOMAXPROCS(0)
 	}
 	if cfg.TasksPerWorker <= 0 {
-		cfg.TasksPerWorker = 1
+		cfg.TasksPerWorker = 100
+	}
+	if cfg.IdleTimeout <= 0 {
+		cfg.IdleTimeout = 30 * time.Second
 	}
 	if cfg.Isolation.MemoryBytes <= 0 {
 		// Linear memory may be copied when it grows, plus runtime and
@@ -102,6 +114,7 @@ func NewPool(cfg Config) (*Pool, error) {
 		cfg:   cfg,
 		slots: make(chan struct{}, cfg.Workers),
 		idle:  make(chan *worker, cfg.Workers),
+		stop:  make(chan struct{}),
 	}
 	if cfg.Isolation.Cgroup != "" {
 		cg, err := openCgroupRoot(cfg.Isolation.Cgroup)
@@ -118,12 +131,23 @@ func NewPool(cfg Config) (*Pool, error) {
 		}
 		p.idle <- w
 	}
+	p.bg.Go(p.reapIdle)
 	return p, nil
 }
 
 // Close stops all workers. Tasks in flight are not interrupted.
 func (p *Pool) Close() error {
-	p.closed.Store(true)
+	if p.closed.Swap(true) {
+		return nil
+	}
+	close(p.stop)
+	p.mu.Lock()
+	parked := p.parked
+	p.parked = nil
+	p.mu.Unlock()
+	for _, w := range parked {
+		w.retire()
+	}
 	for {
 		select {
 		case w := <-p.idle:
@@ -136,7 +160,14 @@ func (p *Pool) Close() error {
 }
 
 // Run executes a task in a worker process.
-func (p *Pool) Run(ctx context.Context, t sandbox.Task) (*sandbox.Result, error) {
+//
+// A task with an empty owner runs in a process that has never run anything
+// else. Tasks naming an owner may reuse a process that already ran the same
+// module for the same owner, which then skips start-up, instrumentation and
+// compilation. Processes are never shared between owners or modules, so a
+// task that compromises its worker can reach only data its owner already
+// gave to the same code.
+func (p *Pool) Run(ctx context.Context, owner string, t sandbox.Task) (*sandbox.Result, error) {
 	if err := t.Limits.Within(p.cfg.Ceiling); err != nil {
 		return nil, err
 	}
@@ -159,49 +190,108 @@ func (p *Pool) Run(ctx context.Context, t sandbox.Task) (*sandbox.Result, error)
 		return nil, ErrPoolClosed
 	}
 
-	w, err := p.acquire()
+	var key string
+	if owner != "" {
+		h := sha256.Sum256(t.Module)
+		key = owner + "\x00" + string(h[:])
+	}
+	w, err := p.acquire(key)
 	if err != nil {
 		return nil, err
 	}
 	res, healthy, err := w.run(ctx, t)
-	p.release(w, healthy)
+	p.release(w, key, healthy)
 	return res, err
 }
 
-func (p *Pool) acquire() (*worker, error) {
+func (p *Pool) acquire(key string) (*worker, error) {
+	if key != "" {
+		p.mu.Lock()
+		for i, w := range p.parked {
+			if w.key == key {
+				p.parked = slices.Delete(p.parked, i, i+1)
+				p.mu.Unlock()
+				p.reused.Add(1)
+				return w, nil
+			}
+		}
+		p.mu.Unlock()
+	}
 	select {
 	case w := <-p.idle:
+		// Keep a warm replacement so the next task skips start-up.
+		p.bg.Go(p.replenish)
+		w.key = key
 		return w, nil
 	default:
-		return p.spawn()
+		w, err := p.spawn()
+		if w != nil {
+			w.key = key
+		}
+		return w, err
 	}
 }
 
-// release returns a worker to the idle set or replaces it.
-func (p *Pool) release(w *worker, healthy bool) {
-	if healthy && w.tasks < p.cfg.TasksPerWorker && !p.closed.Load() {
+func (p *Pool) replenish() {
+	if p.closed.Load() {
+		return
+	}
+	w, err := p.spawn()
+	if err != nil {
+		return // the next Run spawns synchronously and reports the error
+	}
+	select {
+	case p.idle <- w:
+	default:
+		w.retire()
+	}
+}
+
+// release keeps a worker for its owner and module, or retires it.
+func (p *Pool) release(w *worker, key string, healthy bool) {
+	if healthy && key != "" && w.tasks < p.cfg.TasksPerWorker && !p.closed.Load() {
+		w.parkedAt = time.Now()
+		p.mu.Lock()
+		p.parked = append(p.parked, w)
+		var evicted *worker
+		if len(p.parked) > p.cfg.Workers {
+			evicted = p.parked[0]
+			p.parked = p.parked[1:]
+		}
+		p.mu.Unlock()
+		if evicted != nil {
+			p.bg.Go(evicted.retire)
+		}
+		return
+	}
+	p.bg.Go(w.retire)
+}
+
+// reapIdle retires parked workers unused for IdleTimeout.
+func (p *Pool) reapIdle() {
+	tick := time.NewTicker(max(p.cfg.IdleTimeout/4, 10*time.Millisecond))
+	defer tick.Stop()
+	for {
 		select {
-		case p.idle <- w:
+		case <-p.stop:
 			return
-		default:
+		case <-tick.C:
+		}
+		deadline := time.Now().Add(-p.cfg.IdleTimeout)
+		p.mu.Lock()
+		var stale []*worker
+		p.parked = slices.DeleteFunc(p.parked, func(w *worker) bool {
+			if w.parkedAt.Before(deadline) {
+				stale = append(stale, w)
+				return true
+			}
+			return false
+		})
+		p.mu.Unlock()
+		for _, w := range stale {
+			w.retire()
 		}
 	}
-	p.bg.Go(func() {
-		w.retire()
-		if p.closed.Load() {
-			return
-		}
-		// Keep a warm replacement so the next task skips start-up.
-		nw, err := p.spawn()
-		if err != nil {
-			return // the next Run spawns synchronously and reports the error
-		}
-		select {
-		case p.idle <- nw:
-		default:
-			nw.retire()
-		}
-	})
 }
 
 type worker struct {
@@ -212,6 +302,9 @@ type worker struct {
 	cg     *workerCgroup
 	exited chan struct{}
 	tasks  int
+
+	key      string // owner and module the worker is bound to, if any
+	parkedAt time.Time
 }
 
 func (p *Pool) spawn() (*worker, error) {
@@ -326,6 +419,10 @@ func (w *worker) failure(err error) error {
 		return err
 	case w.cg != nil && w.cg.oomKilled():
 		return ErrWorkerOOM
+	case strings.Contains(w.stderr.String(), "fatal error: out of memory"):
+		// The Go runtime hit the address space limit. The report comes
+		// from the worker, but misreporting only affects its own task.
+		return fmt.Errorf("%w (address space limit)", ErrWorkerOOM)
 	}
 	return fmt.Errorf("%w: %s%s", ErrWorkerCrashed, exitDescription(w.cmd.ProcessState), w.diagnostics())
 }
@@ -374,26 +471,42 @@ func (w *worker) cleanup() {
 	}
 }
 
-// tailBuffer keeps the last bytes written to it.
+// tailBuffer keeps the first and last bytes written to it: a Go runtime
+// crash states its cause at the start and goroutine dumps follow.
 type tailBuffer struct {
-	mu  sync.Mutex
-	buf []byte
+	mu   sync.Mutex
+	head []byte
+	tail []byte
+	cut  bool
 }
 
-const tailSize = 4 << 10
+const (
+	headSize = 1 << 10
+	tailSize = 3 << 10
+)
 
 func (t *tailBuffer) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.buf = append(t.buf, p...)
-	if len(t.buf) > tailSize {
-		t.buf = append(t.buf[:0], t.buf[len(t.buf)-tailSize:]...)
+	n := len(p)
+	if room := headSize - len(t.head); room > 0 {
+		k := min(room, len(p))
+		t.head = append(t.head, p[:k]...)
+		p = p[k:]
 	}
-	return len(p), nil
+	t.tail = append(t.tail, p...)
+	if len(t.tail) > tailSize {
+		t.tail = append(t.tail[:0], t.tail[len(t.tail)-tailSize:]...)
+		t.cut = true
+	}
+	return n, nil
 }
 
 func (t *tailBuffer) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return string(t.buf)
+	if t.cut {
+		return string(t.head) + "\n[...]\n" + string(t.tail)
+	}
+	return string(t.head) + string(t.tail)
 }

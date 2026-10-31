@@ -1,6 +1,7 @@
 package meter
 
 import (
+	"bytes"
 	"errors"
 	"testing"
 
@@ -117,6 +118,107 @@ func withoutCustomSections(t *testing.T, wasm []byte) []byte {
 		t.Fatal(err)
 	}
 	return encode(m.sections)
+}
+
+func TestStructuralLimitBoundaries(t *testing.T) {
+	nest := func(depth int) []byte {
+		// The function body is the outermost block.
+		return entry(w.Cat(w.Repeat([]byte{0x02, w.BlockEmpty}, depth-1), w.Repeat([]byte{w.OpEnd}, depth-1), w.I32Const(0))).Encode()
+	}
+	brTable := func(n int) []byte {
+		return entry(w.Cat([]byte{0x02, w.BlockEmpty}, w.I32Const(0), []byte{0x0e}, w.ULEB(uint32(n)), make([]byte, n+1), []byte{w.OpEnd}, w.I32Const(0))).Encode()
+	}
+	params := func(n int) []byte {
+		m := entry(w.I32Const(0))
+		m.Funcs = append(m.Funcs, w.Func{Params: w.Repeat([]byte{w.I32}, n)})
+		return m.Encode()
+	}
+	cases := []struct {
+		name string
+		wasm []byte
+		ok   bool
+	}{
+		{"nesting at limit", nest(MaxNesting), true},
+		{"nesting over limit", nest(MaxNesting + 1), false},
+		{"br_table at limit", brTable(MaxBrTableTargets), true},
+		{"br_table over limit", brTable(MaxBrTableTargets + 1), false},
+		{"params at limit", params(MaxParams), true},
+		{"params over limit", params(MaxParams + 1), false},
+		{"table over limit", withSection(t, entry(w.I32Const(0)).Encode(), 4, w.Cat([]byte{1, 0x70, 0}, w.ULEB(MaxTableElements+1))), false},
+		{"two memories", withSection(t, entry(w.I32Const(0)).Encode(), 5, []byte{2, 0, 1, 0, 1}), false},
+		{"shared memory", withSection(t, entry(w.I32Const(0)).Encode(), 5, []byte{1, 3, 1, 1}), false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			out, err := Instrument(c.wasm)
+			if c.ok {
+				if err != nil {
+					t.Fatal(err)
+				}
+				compiles(t, out)
+			} else if !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("got %v, want ErrUnsupported", err)
+			}
+		})
+	}
+}
+
+func TestTableMaximumClamped(t *testing.T) {
+	cases := map[string][]byte{
+		"no maximum":   {1, 0x70, 0x00, 1},
+		"huge maximum": w.Cat([]byte{1, 0x70, 0x01, 1}, w.ULEB(1<<30)),
+	}
+	for name, table := range cases {
+		t.Run(name, func(t *testing.T) {
+			out, err := Instrument(withSection(t, entry(w.I32Const(0)).Encode(), 4, table))
+			if err != nil {
+				t.Fatal(err)
+			}
+			compiles(t, out)
+			want := w.Cat([]byte{1, 0x70, 0x01, 1}, w.ULEB(MaxTableElements))
+			if got := rawSection(t, out, 4); !bytes.Equal(got, want) {
+				t.Fatalf("table section % x, want % x", got, want)
+			}
+		})
+	}
+}
+
+// rawSection returns the content of section id without validating the module.
+func rawSection(t *testing.T, wasm []byte, id byte) []byte {
+	t.Helper()
+	r := &reader{buf: wasm, pos: len(header)}
+	for !r.done() {
+		sid, _ := r.byte()
+		size, _ := r.u32()
+		data, err := r.bytes(uint64(size))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sid == id {
+			return data
+		}
+	}
+	t.Fatalf("no section %d", id)
+	return nil
+}
+
+// withSection inserts or replaces section id in a module.
+func withSection(t *testing.T, wasm []byte, id byte, content []byte) []byte {
+	t.Helper()
+	m, err := parse(wasm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secs, err := upsert(m.sections, id, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range secs {
+		if secs[i].id == id {
+			secs[i].data = content
+		}
+	}
+	return encode(secs)
 }
 
 func replaceSection(t *testing.T, wasm []byte, id byte, content []byte) []byte {

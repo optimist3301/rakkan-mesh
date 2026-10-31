@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"testing"
 	"time"
@@ -255,5 +256,52 @@ func TestConcurrentRuns(t *testing.T) {
 		if err := <-errs; err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+func TestRepeatedRunsAreCached(t *testing.T) {
+	r := NewRunner(DefaultLimits())
+	defer r.Close(t.Context())
+	mod := w.CompileBomb(500) // slow enough to compile that a cache hit is obvious
+	lim := DefaultLimits()
+
+	first, err := r.Run(t.Context(), Task{Module: mod, Limits: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.metered.get(sha256.Sum256(mod)); !ok {
+		t.Fatal("instrumented module not cached")
+	}
+	lim.MaxMemoryPages = 32 // different limits share the cache
+	second, err := r.Run(t.Context(), Task{Module: mod, Limits: lim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.GasUsed != first.GasUsed {
+		t.Fatalf("gas %d then %d", first.GasUsed, second.GasUsed)
+	}
+	if second.Elapsed*5 > first.Elapsed {
+		t.Fatalf("second run took %s, first %s: cache miss?", second.Elapsed, first.Elapsed)
+	}
+}
+
+func TestMeteredCacheEviction(t *testing.T) {
+	c := newMeteredCache(10)
+	keys := [][32]byte{{1}, {2}, {3}}
+	c.add(keys[0], make([]byte, 4))
+	c.add(keys[1], make([]byte, 4))
+	c.get(keys[0]) // keys[1] is now least recently used
+	c.add(keys[2], make([]byte, 4))
+	if _, ok := c.get(keys[1]); ok {
+		t.Fatal("least recently used entry kept")
+	}
+	for _, k := range []([32]byte){keys[0], keys[2]} {
+		if _, ok := c.get(k); !ok {
+			t.Fatalf("entry %v evicted", k[0])
+		}
+	}
+	c.add([32]byte{4}, make([]byte, 11)) // larger than the cache: ignored
+	if c.size != 8 {
+		t.Fatalf("size %d, want 8", c.size)
 	}
 }
