@@ -87,13 +87,15 @@ func TestInfiniteLoopTimesOut(t *testing.T) {
 	lim.Timeout = 100 * time.Millisecond
 	body := w.Cat([]byte{w.OpLoop, w.BlockEmpty, w.OpBr, 0, w.OpEnd}, w.I32Const(0))
 
-	start := time.Now()
-	_, err := run(t, taskModule(1, nil, body).Encode(), nil, lim)
-	if !errors.Is(err, ErrTimeout) {
-		t.Fatalf("got %v, want ErrTimeout", err)
-	}
-	if el := time.Since(start); el > time.Second {
-		t.Fatalf("interruption took %s", el)
+	for range 5 {
+		start := time.Now()
+		_, err := run(t, taskModule(1, nil, body).Encode(), nil, lim)
+		if !errors.Is(err, ErrTimeout) {
+			t.Fatalf("got %v, want ErrTimeout", err)
+		}
+		if el := time.Since(start); el > 300*time.Millisecond {
+			t.Fatalf("interruption took %s", el)
+		}
 	}
 }
 

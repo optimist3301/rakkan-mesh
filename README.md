@@ -8,9 +8,14 @@
 
 ```sh
 go test ./...
-go build ./cmd/rakkan-node
+CGO_ENABLED=0 go build ./cmd/rakkan-node   # статический бинарник рекомендуется
 ./rakkan-node run -input data.bin -mem 64 -gas 1000000000 -timeout 5s task.wasm
 ```
+
+Задача исполняется в изолированном воркер-процессе (`-isolation strict`: namespaces,
+seccomp, без capabilities). `-cgroup self` добавляет лимиты памяти/CPU через cgroup v2,
+если узлу делегирована cgroup. Подробности — в разделе об изоляции в
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## ABI задачи
 

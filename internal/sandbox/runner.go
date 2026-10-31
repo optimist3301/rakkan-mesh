@@ -4,7 +4,7 @@
 //   - the module may only import the rakkan host ABI (see abi.go);
 //   - execution is bounded by deterministic gas (see package meter), with a
 //     wall clock timeout and caller cancellation as a backstop, both delivered
-//     by draining the gas counter (see watch);
+//     through an interrupt flag checked alongside the gas (see watch);
 //   - linear memory is capped per task;
 //   - input, output and log sizes are bounded.
 //
@@ -16,7 +16,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sync"
 	"time"
 
@@ -119,6 +118,7 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 
 	st.gas = mod.ExportedGlobal(meter.GasExport).(api.MutableGlobal)
 	st.gas.Set(api.EncodeI64(lim.MaxGas))
+	st.interrupt = mod.ExportedGlobal(meter.InterruptExport).(api.MutableGlobal)
 
 	stop := st.watch(ctx)
 	var ret []uint64
@@ -160,39 +160,22 @@ type execState struct {
 	logs         []byte
 	logTruncated bool
 	gas          api.MutableGlobal // remaining gas, set once instantiated
-	gasMu        sync.Mutex        // orders host charges with interruption
+	interrupt    api.MutableGlobal // non-zero stops the guest
 	fault        error             // set by host functions before they trap
 }
 
-// interrupted is stored in the gas counter to stop the guest. It is far
-// below zero so that no charges in flight can bring it back up.
-const interrupted = math.MinInt64 / 2
-
-// watch interrupts the guest when ctx ends by draining its gas, so the next
-// check (at the latest the next loop iteration or call) traps. Guest code
-// updates the counter with a non-atomic read-modify-write that may overwrite
-// the store, so it is repeated until the guest stops. The returned function
-// stops watching and waits until no further stores can happen.
+// watch interrupts the guest when ctx ends by setting its interrupt flag,
+// which the guest checks at every function entry and loop iteration (see
+// package meter). The returned function stops watching and waits until the
+// watcher can no longer touch the instance.
 func (s *execState) watch(ctx context.Context) (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
 		select {
 		case <-done:
-			return
 		case <-ctx.Done():
-		}
-		tick := time.NewTicker(time.Millisecond)
-		defer tick.Stop()
-		for {
-			s.gasMu.Lock()
-			s.gas.Set(api.EncodeI64(interrupted))
-			s.gasMu.Unlock()
-			select {
-			case <-done:
-				return
-			case <-tick.C:
-			}
+			s.interrupt.Set(1)
 		}
 	})
 	return func() {
@@ -214,10 +197,8 @@ func (s *execState) outOfGas() error {
 // charge bills a host call transferring n bytes, trapping when the balance
 // goes negative.
 func (s *execState) charge(n uint32) {
-	s.gasMu.Lock()
 	rem := int64(s.gas.Get()) - meter.HostCallCost - int64(n>>meter.BytesPerGasShift)
 	s.gas.Set(api.EncodeI64(rem))
-	s.gasMu.Unlock()
 	if rem < 0 {
 		s.trap(s.outOfGas())
 	}

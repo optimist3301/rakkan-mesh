@@ -22,8 +22,10 @@ const (
 	opGlobalGet   = 0x23
 	opGlobalSet   = 0x24
 	opMemoryGrow  = 0x40
+	opI32Const    = 0x41
 	opI64Const    = 0x42
 	opI64LtS      = 0x53
+	opI32Or       = 0x72
 	opI64Sub      = 0x7d
 	opI64Mul      = 0x7e
 	opI64ShrU     = 0x88

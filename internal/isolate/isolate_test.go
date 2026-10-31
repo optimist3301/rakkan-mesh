@@ -1,0 +1,440 @@
+package isolate
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	w "github.com/optimist3301/rakkan-mesh/internal/wasmtest"
+)
+
+// The test binary doubles as the worker. Its first argument selects a mode:
+// none for a real worker, "probe=<name>" to attempt a forbidden operation
+// after hardening, or a misbehaviour (crash, hang, lie) to exercise the
+// node's defences.
+func TestMain(m *testing.M) {
+	if !IsWorker() {
+		os.Exit(m.Run())
+	}
+	mode := ""
+	if len(os.Args) > 1 {
+		mode = os.Args[1]
+	}
+	if mode == "" {
+		if err := RunWorker(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if err := hardenFromEnv(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if name, ok := strings.CutPrefix(mode, "probe="); ok {
+		fmt.Println(probe(name))
+		os.Exit(0)
+	}
+	misbehave(mode)
+}
+
+func probe(name string) string {
+	result := func(err error) string {
+		if err != nil {
+			return "denied: " + err.Error()
+		}
+		return "allowed"
+	}
+	switch name {
+	case "read-file":
+		_, err := os.ReadFile("/etc/passwd")
+		return result(err)
+	case "list-root":
+		var names []string
+		err := filepath.WalkDir("/", func(path string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				names = append(names, path)
+			}
+			return err
+		})
+		if err != nil {
+			return result(err)
+		}
+		return "files: " + strings.Join(names, " ")
+	case "write-file":
+		return result(os.WriteFile("/x", []byte("x"), 0o644))
+	case "socket":
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+		if err == nil {
+			syscall.Close(fd)
+		}
+		return result(err)
+	case "connect":
+		c, err := net.DialTimeout("tcp", "1.1.1.1:53", time.Second)
+		if err == nil {
+			c.Close()
+		}
+		return result(err)
+	case "fork":
+		_, err := syscall.ForkExec(os.Args[0], []string{"x"}, nil)
+		return result(err)
+	case "mount":
+		return result(unix.Mount("tmpfs", "/", "tmpfs", 0, ""))
+	case "caps":
+		hdr := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+		var data [2]unix.CapUserData
+		if err := unix.Capget(&hdr, &data[0]); err != nil {
+			return result(err)
+		}
+		return fmt.Sprintf("caps: %x %x %x", data[0].Effective, data[0].Permitted, data[0].Inheritable)
+	case "alloc":
+		b := make([]byte, 1<<30)
+		for i := range b {
+			if i%4096 == 0 {
+				b[i] = 1
+			}
+		}
+		return result(nil)
+	}
+	return "unknown probe"
+}
+
+func misbehave(mode string) {
+	out := bufio.NewWriter(os.Stdout)
+	writeFrame(out, []byte{protoVersion})
+	out.Flush()
+	in := bufio.NewReader(os.Stdin)
+	if _, err := readFrame(in, maxRequestFrame); err != nil {
+		os.Exit(1)
+	}
+	switch mode {
+	case "crash":
+		os.Exit(3)
+	case "hang":
+		time.Sleep(time.Hour)
+	case "lie":
+		writeFrame(out, encodeResponse(&sandbox.Result{GasUsed: sandbox.MaxGas}, nil))
+		out.Flush()
+		time.Sleep(time.Hour)
+	}
+	os.Exit(4)
+}
+
+func requireIsolationSupport(t *testing.T) {
+	t.Helper()
+	cmd := exec.Command("/bin/true")
+	cmd.SysProcAttr = StrictIsolation().sysProcAttr()
+	if err := cmd.Run(); err != nil {
+		t.Skipf("user namespaces unavailable: %v", err)
+	}
+}
+
+func testLimits() sandbox.Limits {
+	l := sandbox.DefaultLimits()
+	l.MaxMemoryPages = 16
+	l.Timeout = 2 * time.Second
+	return l
+}
+
+func newPool(t *testing.T, cfg Config) *Pool {
+	t.Helper()
+	requireIsolationSupport(t)
+	if cfg.Ceiling == (sandbox.Limits{}) {
+		cfg.Ceiling = sandbox.DefaultLimits()
+	}
+	if cfg.Workers == 0 {
+		cfg.Workers = 1
+	}
+	p, err := NewPool(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { p.Close() })
+	return p
+}
+
+func TestPoolRunsTask(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	in := []byte("hello from the other process")
+	res, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.Output, in) {
+		t.Fatalf("output %q", res.Output)
+	}
+
+	// Gas is deterministic across process boundaries.
+	r := sandbox.NewRunner(sandbox.DefaultLimits())
+	defer r.Close(t.Context())
+	local, err := r.Run(t.Context(), sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if local.GasUsed != res.GasUsed {
+		t.Fatalf("gas %d in worker, %d in process", res.GasUsed, local.GasUsed)
+	}
+}
+
+func TestPoolSandboxErrorsCrossBoundary(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), TasksPerWorker: 100})
+	lim := testLimits()
+
+	lim.MaxGas = 1000
+	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrOutOfGas) {
+		t.Fatalf("got %v, want ErrOutOfGas", err)
+	}
+	lim = testLimits()
+	lim.Timeout = 200 * time.Millisecond
+	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim}); !errors.Is(err, sandbox.ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	}
+	if _, err := p.Run(t.Context(), sandbox.Task{Module: []byte("junk"), Limits: testLimits()}); !errors.Is(err, sandbox.ErrInvalidModule) {
+		t.Fatalf("got %v, want ErrInvalidModule", err)
+	}
+	// Sandbox errors leave the worker healthy.
+	if got := p.spawned.Load(); got != 1 {
+		t.Fatalf("spawned %d workers, want 1", got)
+	}
+}
+
+// The worker's own timeout, not the node's kill, must stop a spinning task,
+// and promptly. A regression here once came from interrupting through the
+// gas counter, which the guest's writes kept overwriting.
+func TestPoolTimeoutIsPrecise(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), TasksPerWorker: 100})
+	lim := testLimits()
+	lim.Timeout = 100 * time.Millisecond
+	for range 5 {
+		start := time.Now()
+		_, err := p.Run(t.Context(), sandbox.Task{Module: w.Spin(), Limits: lim})
+		if !errors.Is(err, sandbox.ErrTimeout) || strings.Contains(err.Error(), "unresponsive") {
+			t.Fatalf("got %v, want in-worker timeout", err)
+		}
+		if el := time.Since(start); el > 300*time.Millisecond {
+			t.Fatalf("timeout after %s", el)
+		}
+	}
+}
+
+func TestCgroupLimits(t *testing.T) {
+	if os.Getenv("RAKKAN_TEST_CGROUP") == "" {
+		t.Skip("set RAKKAN_TEST_CGROUP=1 and run inside a delegated cgroup, see docs/ARCHITECTURE.md")
+	}
+	iso := StrictIsolation()
+	iso.Cgroup = "self"
+	iso.MemoryBytes = 96 << 20
+	iso.CPUs = 0.5
+	p := newPool(t, Config{Isolation: iso, Workers: 2})
+	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A worker exceeding memory.max is OOM-killed and reported as such.
+	cg, err := p.cg.newWorker(iso)
+	if err != nil {
+		t.Fatal(err)
+	}
+	iso.MemoryBytes = 0 // no address space limit: let the cgroup act
+	cmd := exec.Command(os.Args[0], "probe=alloc")
+	cmd.Env = []string{workerEnv + "=" + iso.encode(iso.startStage())}
+	cmd.SysProcAttr = iso.sysProcAttr()
+	setCgroupFD(cmd.SysProcAttr, cg)
+	err = cmd.Run()
+	if err == nil || !cg.oomKilled() {
+		t.Fatalf("1 GiB allocation under a 96 MiB cgroup: err=%v oom=%v", err, cg.oomKilled())
+	}
+	cg.remove()
+
+	p.Close()
+	ents, _ := os.ReadDir(p.cg.dir)
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), "worker-") {
+			t.Errorf("worker cgroup %s left behind", e.Name())
+		}
+	}
+}
+
+func TestPoolFreshProcessPerTask(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	for range 3 {
+		if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: testLimits()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := p.spawned.Load(); got < 3 {
+		t.Fatalf("spawned %d workers for 3 tasks", got)
+	}
+}
+
+func TestPoolConcurrent(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), Workers: 4})
+	errs := make(chan error, 16)
+	for i := range 16 {
+		go func() {
+			in := []byte{byte(i)}
+			res, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Input: in, Limits: testLimits()})
+			if err == nil && !bytes.Equal(res.Output, in) {
+				err = errors.New("output mismatch")
+			}
+			errs <- err
+		}()
+	}
+	for range 16 {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestPoolCancellationKillsWorker(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := p.Run(ctx, sandbox.Task{Module: w.Spin(), Limits: testLimits()}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("got %v, want context.DeadlineExceeded", err)
+	}
+	if el := time.Since(start); el > time.Second {
+		t.Fatalf("cancellation took %s", el)
+	}
+}
+
+func TestPoolMisbehavingWorkers(t *testing.T) {
+	defer func(g time.Duration) { workerGrace = g }(workerGrace)
+	workerGrace = 200 * time.Millisecond
+	lim := testLimits()
+	lim.Timeout = 100 * time.Millisecond
+
+	cases := map[string]error{
+		"crash": ErrWorkerCrashed,
+		"hang":  sandbox.ErrTimeout,
+		"lie":   ErrWorkerProtocol,
+	}
+	for mode, want := range cases {
+		t.Run(mode, func(t *testing.T) {
+			p := newPool(t, Config{Isolation: StrictIsolation(), args: []string{mode}})
+			_, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: lim})
+			if !errors.Is(err, want) {
+				t.Fatalf("got %v, want %v", err, want)
+			}
+		})
+	}
+}
+
+func TestPoolRejectsOverPolicy(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	lim := sandbox.DefaultLimits()
+	lim.MaxGas *= 2
+	if _, err := p.Run(t.Context(), sandbox.Task{Module: w.Echo(), Limits: lim}); !errors.Is(err, sandbox.ErrLimitPolicy) {
+		t.Fatalf("got %v, want ErrLimitPolicy", err)
+	}
+}
+
+// runProbe starts a hardened worker in probe mode and returns its report,
+// or "killed: <signal>" if the kernel killed it.
+func runProbe(t *testing.T, iso Isolation, name string) string {
+	t.Helper()
+	requireIsolationSupport(t)
+	cmd := exec.Command(os.Args[0], "probe="+name)
+	cmd.Env = []string{workerEnv + "=" + iso.encode(iso.startStage())}
+	cmd.SysProcAttr = iso.sysProcAttr()
+	cmd.Dir = "/"
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	var exit *exec.ExitError
+	if errors.As(err, &exit) {
+		if ws := exit.Sys().(syscall.WaitStatus); ws.Signaled() {
+			return "killed: " + ws.Signal().String()
+		}
+		return fmt.Sprintf("exited %d: %s", exit.ExitCode(), lastLine(stderr.String()))
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func lastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	return lines[0]
+}
+
+// onlyWorkerFiles accepts a root containing the worker binary and, for a
+// dynamically linked binary, the loader and the shared objects it maps.
+func onlyWorkerFiles(report string) bool {
+	files, ok := strings.CutPrefix(report, "files: ")
+	if !ok {
+		return false
+	}
+	for _, f := range strings.Fields(files) {
+		if f != "/w" && !strings.Contains(filepath.Base(f), ".so") {
+			return false
+		}
+	}
+	return true
+}
+
+func TestHardenedWorkerConfinement(t *testing.T) {
+	strict := StrictIsolation()
+	nsOnly := Isolation{Namespaces: true}
+
+	type expect func(string) bool
+	denied := func(s string) bool { return strings.HasPrefix(s, "denied") }
+	deniedOrKilled := func(s string) bool { return denied(s) || s == "killed: bad system call" }
+	cases := []struct {
+		iso   Isolation
+		probe string
+		ok    expect
+	}{
+		// Namespaces alone: empty read-only root, no capabilities, no network.
+		{nsOnly, "read-file", denied},
+		{nsOnly, "list-root", onlyWorkerFiles},
+		{nsOnly, "write-file", denied},
+		{nsOnly, "mount", denied},
+		{nsOnly, "caps", func(s string) bool { return s == "caps: 0 0 0" }},
+		{nsOnly, "connect", denied},
+		// With seccomp on top: dangerous calls are refused or fatal.
+		{strict, "read-file", denied},
+		{strict, "list-root", deniedOrKilled},
+		{strict, "socket", deniedOrKilled},
+		{strict, "fork", deniedOrKilled},
+		{strict, "mount", deniedOrKilled},
+	}
+	for _, c := range cases {
+		name := c.probe
+		if c.iso.Seccomp {
+			name += "/seccomp"
+		}
+		t.Run(name, func(t *testing.T) {
+			got := runProbe(t, c.iso, c.probe)
+			if !c.ok(got) {
+				t.Fatalf("probe %s: %s", c.probe, got)
+			}
+			t.Log(got)
+		})
+	}
+}
+
+func TestAddressSpaceLimit(t *testing.T) {
+	iso := StrictIsolation()
+	iso.MemoryBytes = 128 << 20
+	if got := runProbe(t, iso, "alloc"); !strings.HasPrefix(got, "exited") {
+		t.Fatalf("1 GiB allocation under a 128 MiB limit: %s", got)
+	}
+}

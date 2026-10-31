@@ -2,13 +2,15 @@
 // accounting.
 //
 // Instrumentation adds a mutable i64 global, exported as GasExport, holding the
-// remaining gas. The host sets it before running guest code and reads it
+// remaining gas, and a mutable i32 global, exported as InterruptExport, that
+// the host sets to stop the guest. The host sets it before running guest code and reads it
 // afterwards. Every function body is split into straight-line segments, each
 // ending at a control instruction; on entry to a segment its exact static cost
 // is subtracted. Because no instruction inside a segment transfers control
 // (calls return to it), the charge equals the cost of what executes.
 //
-// The remaining gas is checked, trapping with unreachable when negative, only
+// The remaining gas and the interrupt flag are checked, trapping with
+// unreachable when the gas is negative or the flag set, only
 // where unbounded execution could otherwise begin: function entry (recursion),
 // loop headers, and instructions whose cost depends on an operand (bulk memory
 // and table operations, memory.grow), which are charged dynamically. Between
@@ -17,6 +19,12 @@
 // pure function of the module and input, so replicas agree on it.
 //
 // Custom sections (names, debug info) carry no semantics and are dropped.
+//
+// The interrupt flag exists because the gas counter cannot carry the signal:
+// the guest updates it with a non-atomic read-modify-write in every segment,
+// and on real hardware its loads are served from its own store buffer, so a
+// store from another thread is overwritten almost every time. The guest
+// never writes the flag, so the host's store is seen at the next check.
 //
 // A start function would run during instantiation, before the host can set
 // the gas balance, so the start section is removed and the function exported
@@ -45,8 +53,9 @@ const (
 
 // Exported names added by instrumentation.
 const (
-	GasExport   = "__rakkan_gas"
-	StartExport = "__rakkan_start"
+	GasExport       = "__rakkan_gas"
+	InterruptExport = "__rakkan_interrupt"
+	StartExport     = "__rakkan_start"
 )
 
 // Structural limits, protecting the instrumenter and the compiler from
@@ -201,7 +210,7 @@ func parse(wasm []byte) (*module, error) {
 	if m.numGlobals > MaxGlobals {
 		return nil, fmt.Errorf("%d globals, limit %d", m.numGlobals, MaxGlobals)
 	}
-	for _, name := range []string{GasExport, StartExport} {
+	for _, name := range []string{GasExport, InterruptExport, StartExport} {
 		if m.exportNames[name] {
 			return nil, fmt.Errorf("export name %q is reserved", name)
 		}
@@ -444,17 +453,24 @@ func (m *module) parseExports(r *reader) error {
 }
 
 func (m *module) rewrite() ([]byte, error) {
-	gas := uint32(m.numGlobals) // index of the injected global
+	gas := uint32(m.numGlobals) // index of the injected gas global
+	intr := gas + 1             // index of the injected interrupt flag
 	secs := slices.Clone(m.sections)
 
-	// Global: append (mut i64) initialised to 0.
+	// Globals: gas (mut i64) and interrupt flag (mut i32), both 0.
 	secs, err := upsert(secs, secGlobal, []byte{0x7e, 0x01, opI64Const, 0x00, opEnd})
 	if err != nil {
 		return nil, err
 	}
+	if secs, err = upsert(secs, secGlobal, []byte{0x7f, 0x01, opI32Const, 0x00, opEnd}); err != nil {
+		return nil, err
+	}
 
 	// Export: the gas global, and the start function if there is one.
-	exports := [][]byte{appendUleb(append(appendName(nil, GasExport), 0x03), uint64(gas))}
+	exports := [][]byte{
+		appendUleb(append(appendName(nil, GasExport), 0x03), uint64(gas)),
+		appendUleb(append(appendName(nil, InterruptExport), 0x03), uint64(intr)),
+	}
 	if m.start >= 0 {
 		exports = append(exports, appendUleb(append(appendName(nil, StartExport), 0x00), uint64(m.start)))
 	}
@@ -642,10 +658,13 @@ func emitCharge(out []byte, gas uint32, cost int64) []byte {
 	return appendUleb(out, uint64(gas))
 }
 
-// emitCheck emits: if gas < 0 { unreachable }
+// emitCheck emits: if (gas < 0) | interrupt { unreachable }
+// The interrupt flag is the global after the gas counter.
 func emitCheck(out []byte, gas uint32) []byte {
 	out = appendUleb(append(out, opGlobalGet), uint64(gas))
-	return append(out, opI64Const, 0x00, opI64LtS, opIf, blockEmpty, opUnreachable, opEnd)
+	out = append(out, opI64Const, 0x00, opI64LtS)
+	out = appendUleb(append(out, opGlobalGet), uint64(gas+1))
+	return append(out, opI32Or, opIf, blockEmpty, opUnreachable, opEnd)
 }
 
 // emitDynCharge charges for the i32 operand on top of the stack, leaving it

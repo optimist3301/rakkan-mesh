@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"time"
 
+	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
 
@@ -21,6 +22,14 @@ commands:
 `
 
 func main() {
+	// The node re-executes itself as sandbox worker processes.
+	if isolate.IsWorker() {
+		if err := isolate.RunWorker(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
@@ -42,6 +51,8 @@ func runCmd(args []string) int {
 	memMiB := fs.Uint("mem", uint(def.MaxMemoryPages)*sandbox.PageSize>>20, "memory limit in MiB")
 	gas := fs.Int64("gas", def.MaxGas, "gas budget")
 	timeout := fs.Duration("timeout", def.Timeout, "wall clock limit")
+	isolation := fs.String("isolation", "strict", "worker process isolation: strict, ns, process or none (in-process)")
+	cgroup := fs.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
 	fs.Parse(args)
 	if fs.NArg() != 1 {
 		fmt.Fprintln(os.Stderr, "run: expected exactly one module path")
@@ -75,10 +86,34 @@ func runCmd(args []string) int {
 	defer stop()
 	// Local runs are trusted by the operator, so the requested limits are
 	// also the policy ceiling.
-	r := sandbox.NewRunner(lim)
-	defer r.Close(context.Background())
-
-	res, err := r.Run(ctx, sandbox.Task{Module: module, Entry: *entry, Input: input, Limits: lim})
+	task := sandbox.Task{Module: module, Entry: *entry, Input: input, Limits: lim}
+	var res *sandbox.Result
+	if *isolation == "none" {
+		r := sandbox.NewRunner(lim)
+		defer r.Close(context.Background())
+		res, err = r.Run(ctx, task)
+	} else {
+		var iso isolate.Isolation
+		switch *isolation {
+		case "strict":
+			iso = isolate.StrictIsolation()
+		case "ns":
+			iso = isolate.Isolation{Namespaces: true}
+		case "process":
+		default:
+			fmt.Fprintf(os.Stderr, "run: unknown isolation %q\n", *isolation)
+			return 2
+		}
+		iso.Cgroup = *cgroup
+		var pool *isolate.Pool
+		pool, err = isolate.NewPool(isolate.Config{Ceiling: lim, Workers: 1, Isolation: iso})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 1
+		}
+		defer pool.Close()
+		res, err = pool.Run(ctx, task)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "task failed:", err)
 		return 1
