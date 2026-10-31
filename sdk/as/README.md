@@ -39,6 +39,9 @@ export function run(): i32 {        // 0 — успех
 | `img.fit/resize/crop/grayscale/blur` | операции — новое изображение или `null` |
 | `img.readPixels/writePixels` | RGBA8-буфер для своих алгоритмов |
 | `img.outputJPEG(q)/outputPNG()` | закодировать сразу в выход |
+| `Tensor.fromF32/fromI8/fromBlob` | тензоры через нативные kernels (capability `tensor/1`); веса из блоба |
+| `t.matmul/matmulT/add/scale/relu/softmax/quantize` | операции — новый тензор; ошибка формы прерывает задачу |
+| `t.argmax()/toF32()` | результаты в память задачи |
 
 ## Примеры
 
@@ -47,7 +50,12 @@ export function run(): i32 {        // 0 — успех
 - `examples/sepia.ts` — декодирование и масштабирование kernels, попиксельная
   сепия на AssemblyScript, JPEG в выход;
 - `examples/wordcount.ts` — подсчёт слова в диапазоне большого прикреплённого
-  блоба; запускается как map по диапазонам (`sdk/js/examples/wordcount.js`).
+  блоба; запускается как map по диапазонам (`sdk/js/examples/wordcount.js`);
+- `examples/mlp.ts` — двухслойный перцептрон, веса в прикреплённом блобе,
+  матрицы в tensor kernels; батчи по сети — `sdk/js/examples/inference.js`;
+- `examples/matmul-wasm.ts` / `matmul-kernel.ts` — одно умножение матриц на
+  чистом WebAssembly и через kernel: результаты побитово равны, kernel в ~8 раз
+  быстрее.
 
 Собранные модули лежат в `build/` и используются тестами Go
 (`internal/sandbox/as_test.go`) и JS SDK.

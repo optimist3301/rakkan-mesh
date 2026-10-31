@@ -215,3 +215,116 @@ export function abort(message: string | null, fileName: string | null, line: u32
   );
   unreachable();
 }
+
+// --- tensor kernels (capability tensor/1) -----------------------------------
+
+@external("rakkan_tensor_v1", "from_memory") declare function ten_from_memory(src: usize, dtype: i32, rows: i32, cols: i32): i32;
+@external("rakkan_tensor_v1", "from_blob") declare function ten_from_blob(index: i32, offset: i64, dtype: i32, rows: i32, cols: i32): i32;
+@external("rakkan_tensor_v1", "to_memory") declare function ten_to_memory(h: i32, dst: usize, len: u32): i32;
+@external("rakkan_tensor_v1", "rows") declare function ten_rows(h: i32): i32;
+@external("rakkan_tensor_v1", "cols") declare function ten_cols(h: i32): i32;
+@external("rakkan_tensor_v1", "matmul") declare function ten_matmul(a: i32, b: i32): i32;
+@external("rakkan_tensor_v1", "matmul_t") declare function ten_matmul_t(a: i32, b: i32): i32;
+@external("rakkan_tensor_v1", "add") declare function ten_add(a: i32, b: i32): i32;
+@external("rakkan_tensor_v1", "scale") declare function ten_scale(a: i32, s: f32): i32;
+@external("rakkan_tensor_v1", "relu") declare function ten_relu(a: i32): i32;
+@external("rakkan_tensor_v1", "softmax") declare function ten_softmax(a: i32): i32;
+@external("rakkan_tensor_v1", "quantize") declare function ten_quantize(a: i32, s: f32): i32;
+@external("rakkan_tensor_v1", "argmax") declare function ten_argmax(h: i32, dst: usize, len: u32): i32;
+@external("rakkan_tensor_v1", "free") declare function ten_free(h: i32): i32;
+
+/** Tensor element types. */
+export enum DType {
+  F32 = 0,
+  I8 = 1,
+  I32 = 2,
+}
+
+function tensor(handle: i32): Tensor {
+  if (handle < 0) {
+    // Shape or type mismatches are programming errors; the budget is a limit.
+    abort(handle == -3 ? "tensor exceeds the memory budget" : "tensor operation failed: code " + handle.toString(), null, 0, 0);
+  }
+  return new Tensor(handle);
+}
+
+/**
+ * A matrix held by the host (a vector is 1 x n). Operations run as native
+ * code, bit-identical on every architecture, and return a new tensor;
+ * misuse (mismatched shapes or types) aborts the task.
+ */
+export class Tensor {
+  constructor(public readonly handle: i32) {}
+
+  static fromF32(data: Float32Array, rows: i32, cols: i32): Tensor {
+    return tensor(ten_from_memory(data.dataStart, DType.F32, rows, cols));
+  }
+
+  static fromI8(data: Int8Array, rows: i32, cols: i32): Tensor {
+    return tensor(ten_from_memory(data.dataStart, DType.I8, rows, cols));
+  }
+
+  /** Loads rows x cols elements from attached blob index at offset: weights. */
+  static fromBlob(index: i32, offset: i64, dtype: DType, rows: i32, cols: i32): Tensor {
+    return tensor(ten_from_blob(index, offset, dtype, rows, cols));
+  }
+
+  get rows(): i32 {
+    return ten_rows(this.handle);
+  }
+
+  get cols(): i32 {
+    return ten_cols(this.handle);
+  }
+
+  /** this[m,k] x b[k,n]. */
+  matmul(b: Tensor): Tensor {
+    return tensor(ten_matmul(this.handle, b.handle));
+  }
+
+  /** this[m,k] x b[n,k] transposed: weights stored [out, in]. */
+  matmulT(b: Tensor): Tensor {
+    return tensor(ten_matmul_t(this.handle, b.handle));
+  }
+
+  /** Elementwise sum; b may be a single row, added to every row. */
+  add(b: Tensor): Tensor {
+    return tensor(ten_add(this.handle, b.handle));
+  }
+
+  scale(s: f32): Tensor {
+    return tensor(ten_scale(this.handle, s));
+  }
+
+  relu(): Tensor {
+    return tensor(ten_relu(this.handle));
+  }
+
+  /** Row-wise softmax. */
+  softmax(): Tensor {
+    return tensor(ten_softmax(this.handle));
+  }
+
+  /** round(x / s) clamped to int8. */
+  quantize(s: f32): Tensor {
+    return tensor(ten_quantize(this.handle, s));
+  }
+
+  /** Index of each row's maximum. */
+  argmax(): Int32Array {
+    const out = new Int32Array(this.rows);
+    ten_argmax(this.handle, out.dataStart, out.length * 4);
+    return out;
+  }
+
+  /** The f32 elements, row by row. */
+  toF32(): Float32Array {
+    const out = new Float32Array(this.rows * this.cols);
+    ten_to_memory(this.handle, out.dataStart, out.length * 4);
+    return out;
+  }
+
+  free(): void {
+    ten_free(this.handle);
+  }
+}

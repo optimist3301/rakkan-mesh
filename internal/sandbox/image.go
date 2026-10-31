@@ -33,15 +33,18 @@ const (
 
 // Error codes returned by image functions.
 const (
-	imgErrArgs    = -1 // bad handle or arguments
-	imgErrFormat  = -2 // not a decodable image
-	imgErrTooBig  = -3 // over the pixel budget
-	imgErrEncode  = -4 // encoding failed
-	maxDimension  = 1 << 15
-	formatPNG     = 0
-	formatJPEG    = 1
-	pixelGas      = 4 // per pixel processed, per pass
-	codecPixelGas = 16
+	imgErrArgs   = -1 // bad handle or arguments
+	imgErrFormat = -2 // not a decodable image
+	imgErrTooBig = -3 // over the pixel budget
+	imgErrEncode = -4 // encoding failed
+	maxDimension = 1 << 15
+	formatPNG    = 0
+	formatJPEG   = 1
+	// Gas per pixel, calibrated like WebAssembly instructions (about
+	// 0.15 ns of work each on the reference machine): decoding a 12 MP
+	// JPEG takes about 260 ms; resampling about 1 ns per pixel and pass.
+	pixelGas      = 24
+	codecPixelGas = 128
 )
 
 var imageABI = map[string]signature{
@@ -75,10 +78,14 @@ var imageABI = map[string]signature{
 type imageTable struct {
 	images map[int32]*image.NRGBA
 	next   int32
-	bytes  int64 // pixel bytes held
 }
 
+// budget is the host memory a task's images and tensors may hold together:
+// as much as its linear memory may grow to.
 func (s *execState) budget() int64 { return int64(s.lim.MaxMemoryPages) * PageSize }
+
+// fits reports whether n more bytes of host data stay within the budget.
+func (s *execState) fits(n int64) bool { return n >= 0 && s.hostBytes+n <= s.budget() }
 
 // add stores an image, refusing it if it would exceed the budget.
 func (s *execState) addImage(img *image.NRGBA) int32 {
@@ -88,7 +95,7 @@ func (s *execState) addImage(img *image.NRGBA) int32 {
 	}
 	t.next++
 	t.images[t.next] = img
-	t.bytes += int64(len(img.Pix))
+	s.hostBytes += int64(len(img.Pix))
 	return t.next
 }
 
@@ -97,7 +104,7 @@ func (s *execState) reserve(w, h int) bool {
 	if w <= 0 || h <= 0 || w > maxDimension || h > maxDimension {
 		return false
 	}
-	return s.images.bytes+int64(w)*int64(h)*4 <= s.budget()
+	return s.fits(int64(w) * int64(h) * 4)
 }
 
 func (s *execState) image(h int32) *image.NRGBA { return s.images.images[h] }
@@ -143,10 +150,29 @@ func (s *execState) decodeBytes(data []byte) int32 {
 	if err != nil {
 		return imgErrFormat
 	}
+	return s.addImage(toNRGBA(src))
+}
+
+// toNRGBA converts a decoded image. image/draw's fast paths target RGBA
+// only, and its generic path converts pixel by pixel through interfaces,
+// several times slower for a JPEG. Opaque images have the same bytes in
+// RGBA and NRGBA, so those take the fast path.
+func toNRGBA(src image.Image) *image.NRGBA {
 	b := src.Bounds()
-	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
-	draw.Draw(dst, dst.Rect, src, b.Min, draw.Src)
-	return s.addImage(dst)
+	r := image.Rect(0, 0, b.Dx(), b.Dy())
+	switch img := src.(type) {
+	case *image.NRGBA:
+		if img.Rect == r && img.Stride == 4*r.Dx() {
+			return img
+		}
+	case *image.YCbCr, *image.Gray: // no alpha: always opaque
+		rgba := image.NewRGBA(r)
+		draw.Draw(rgba, r, src, b.Min, draw.Src)
+		return &image.NRGBA{Pix: rgba.Pix, Stride: rgba.Stride, Rect: r}
+	}
+	dst := image.NewNRGBA(r)
+	draw.Draw(dst, r, src, b.Min, draw.Src)
+	return dst
 }
 
 func (s *execState) imgDecodeInput() int32 {
@@ -342,7 +368,7 @@ func (s *execState) imgFree(h int32) int32 {
 	if img == nil {
 		return imgErrArgs
 	}
-	s.images.bytes -= int64(len(img.Pix))
+	s.hostBytes -= int64(len(img.Pix))
 	delete(s.images.images, h)
 	return 0
 }

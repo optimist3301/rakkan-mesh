@@ -5,8 +5,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"image/jpeg"
+	"math"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -123,4 +126,127 @@ func TestAssemblyScriptAbortIsLoggedAndTraps(t *testing.T) {
 		t.Fatalf("got %v, want ErrTrap carrying the abort message", err)
 	}
 	t.Log(err)
+}
+
+func f32Bytes(v []float32) []byte {
+	b := make([]byte, 4*len(v))
+	for i, x := range v {
+		binary.LittleEndian.PutUint32(b[4*i:], math.Float32bits(x))
+	}
+	return b
+}
+
+func randF32(rng *rand.Rand, n int) []float32 {
+	v := make([]float32, n)
+	for i := range v {
+		v[i] = float32(rng.NormFloat64() * 0.5)
+	}
+	return v
+}
+
+// matmulTRef computes x[rows,k] W[n,k]^T + b with the kernels' rounding.
+func matmulTRef(x []float32, rows, k int, w []float32, n int, b []float32) []float32 {
+	out := make([]float32, rows*n)
+	for i := range rows {
+		for j := range n {
+			var acc float32
+			for p := range k {
+				acc += float32(x[i*k+p] * w[j*k+p])
+			}
+			out[i*n+j] = acc + b[j]
+		}
+	}
+	return out
+}
+
+func TestAssemblyScriptMLPMatchesReferenceBitForBit(t *testing.T) {
+	mod := asModule(t, "mlp")
+	const nIn, nHidden, nOut, rows = 64, 32, 10, 16
+	rng := rand.New(rand.NewPCG(7, 7))
+	w1, b1 := randF32(rng, nHidden*nIn), randF32(rng, nHidden)
+	w2, b2 := randF32(rng, nOut*nHidden), randF32(rng, nOut)
+	x := randF32(rng, rows*nIn)
+	weights := slices.Concat(f32Bytes(w1), f32Bytes(b1), f32Bytes(w2), f32Bytes(b2))
+
+	in := binary.LittleEndian.AppendUint32(nil, nIn)
+	in = binary.LittleEndian.AppendUint32(in, nHidden)
+	in = binary.LittleEndian.AppendUint32(in, nOut)
+	in = binary.LittleEndian.AppendUint32(in, rows)
+	in = append(in, f32Bytes(x)...)
+
+	r := NewRunner(DefaultLimits())
+	defer r.Close(t.Context())
+	res, err := r.Run(t.Context(), Task{Module: mod, Input: in, Blobs: []BlobSource{memBlob{data: weights}}, Limits: DefaultLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hidden := matmulTRef(x, rows, nIn, w1, nHidden, b1)
+	for i, v := range hidden {
+		hidden[i] = max(v, 0)
+	}
+	logits := matmulTRef(hidden, rows, nHidden, w2, nOut, b2)
+	if want := f32Bytes(logits); !bytes.Equal(res.Output[:len(want)], want) {
+		t.Fatal("logits differ from the reference")
+	}
+	for r := range rows {
+		best := 0
+		for j := range nOut {
+			if logits[r*nOut+j] > logits[r*nOut+best] {
+				best = j
+			}
+		}
+		if got := binary.LittleEndian.Uint32(res.Output[4*rows*nOut+4*r:]); got != uint32(best) {
+			t.Fatalf("row %d: class %d, want %d", r, got, best)
+		}
+	}
+}
+
+func matmulInput(rng *rand.Rand, m, k, n int) []byte {
+	in := binary.LittleEndian.AppendUint32(nil, uint32(m))
+	in = binary.LittleEndian.AppendUint32(in, uint32(k))
+	in = binary.LittleEndian.AppendUint32(in, uint32(n))
+	in = append(in, f32Bytes(randF32(rng, m*k))...)
+	return append(in, f32Bytes(randF32(rng, k*n))...)
+}
+
+// WebAssembly has no fused multiply-add, so a product computed in plain
+// AssemblyScript rounds exactly as the kernel does: the results must match.
+func TestKernelMatmulMatchesWebAssembly(t *testing.T) {
+	wasmMod, kernelMod := asModule(t, "matmul-wasm"), asModule(t, "matmul-kernel")
+	in := matmulInput(rand.New(rand.NewPCG(3, 4)), 40, 70, 30)
+	a, err := run(t, wasmMod, in, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := run(t, kernelMod, in, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(a.Output, b.Output) {
+		t.Fatal("kernel and WebAssembly products differ")
+	}
+}
+
+func BenchmarkMatmul256(b *testing.B) {
+	in := matmulInput(rand.New(rand.NewPCG(1, 1)), 256, 256, 256)
+	for _, name := range []string{"matmul-wasm", "matmul-kernel"} {
+		b.Run(name, func(b *testing.B) {
+			mod, err := os.ReadFile(filepath.Join("..", "..", "sdk", "as", "build", name+".wasm"))
+			if err != nil {
+				b.Skip(err)
+			}
+			r := NewRunner(DefaultLimits())
+			defer r.Close(b.Context())
+			task := Task{Module: mod, Input: in, Limits: DefaultLimits()}
+			r.Run(b.Context(), task) // compile once
+			for b.Loop() {
+				res, err := r.Run(b.Context(), task)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.ReportMetric(float64(res.GasUsed), "gas/op")
+			}
+		})
+	}
 }

@@ -200,6 +200,47 @@ test('AssemblyScript: an abort explains itself', async () => {
   });
 });
 
+test('distributed inference matches a JavaScript reference bit for bit', async () => {
+  const { IN, HIDDEN, OUT, makeWeights, rng, batchInput } = await import('../examples/inference.js');
+  const weights = makeWeights(1);
+  const { id } = await mesh.putBlob(new Uint8Array(weights.buffer));
+  const r = rng(2);
+  const batches = [];
+  for (let b = 0; b < 6; b++) {
+    const x = new Float32Array(8 * IN);
+    for (let i = 0; i < x.length; i++) x[i] = r();
+    batches.push(x);
+  }
+
+  // Reference: the kernels' order of operations, each rounded to float32.
+  const f = Math.fround;
+  const w1 = weights.subarray(0, HIDDEN * IN), b1 = weights.subarray(HIDDEN * IN, HIDDEN * IN + HIDDEN);
+  const w2 = weights.subarray(HIDDEN * IN + HIDDEN, HIDDEN * IN + HIDDEN + OUT * HIDDEN);
+  const b2 = weights.subarray(HIDDEN * IN + HIDDEN + OUT * HIDDEN);
+  const layer = (x, rows, k, w, n, b, relu) => {
+    const out = new Float32Array(rows * n);
+    for (let i = 0; i < rows; i++)
+      for (let j = 0; j < n; j++) {
+        let acc = 0;
+        for (let p = 0; p < k; p++) acc = f(acc + f(x[i * k + p] * w[j * k + p]));
+        const v = f(acc + b[j]);
+        out[i * n + j] = relu ? Math.max(v, 0) : v;
+      }
+    return out;
+  };
+
+  const nodes = new Set();
+  for await (const item of mesh.map({ module: asModule('mlp'), inputs: batches.map(batchInput), blobs: [id], limits: { memoryMB: 16 } })) {
+    assert.equal(item.error, undefined);
+    nodes.add(item.node);
+    const hidden = layer(batches[item.index], 8, IN, w1, HIDDEN, b1, true);
+    const want = layer(hidden, 8, HIDDEN, w2, OUT, b2, false);
+    const got = new Float32Array(item.output.buffer.slice(item.output.byteOffset, item.output.byteOffset + want.byteLength));
+    assert.deepEqual(new Uint32Array(got.buffer), new Uint32Array(want.buffer), `batch ${item.index} logits differ`);
+  }
+  assert.ok(nodes.size > 1, 'batches ran on several nodes');
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

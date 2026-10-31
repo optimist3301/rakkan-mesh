@@ -194,6 +194,8 @@ type execState struct {
 	input        []byte
 	blobs        []BlobSource
 	images       imageTable
+	tensors      tensorTable
+	hostBytes    int64 // held by images and tensors, within budget()
 	lim          Limits
 	output       []byte
 	logs         []byte
@@ -242,6 +244,9 @@ func (s *execState) charge(n uint32) {
 // chargeUnits bills host work in gas units, trapping when the balance goes
 // negative. Host work is charged before it is done.
 func (s *execState) chargeUnits(units int64) {
+	if s.gas == nil {
+		return // kernels called outside a task, by tests
+	}
 	rem := int64(s.gas.Get()) - units
 	s.gas.Set(api.EncodeI64(rem))
 	if rem < 0 {
@@ -305,7 +310,10 @@ func (s *execState) instantiateHost(ctx context.Context, rt wazero.Runtime) erro
 	if err != nil {
 		return err
 	}
-	return s.instantiateImage(ctx, rt)
+	if err := s.instantiateImage(ctx, rt); err != nil {
+		return err
+	}
+	return s.instantiateTensor(ctx, rt)
 }
 
 func (s *execState) blobCount() uint32 {

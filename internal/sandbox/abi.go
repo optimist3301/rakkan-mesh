@@ -49,13 +49,15 @@ var (
 			// memory (0 at the end), or -1 for no such blob
 			"blob_read": sig([]api.ValueType{i32, i32, i64, i32}, i32),
 		},
-		ImageModule: imageABI,
+		ImageModule:  imageABI,
+		TensorModule: tensorABI,
 	}
 
 	// capabilityOf names the capability each optional namespace provides.
 	// Nodes advertise capabilities; schedulers send tasks only to nodes
 	// having every capability a task imports.
-	capabilityOf = map[string]string{ImageModule: ImageCapability}
+	capabilityOf = map[string]string{ImageModule: ImageCapability, TensorModule: TensorCapability}
+	f32          = api.ValueTypeF32
 
 	// Entry points take no arguments and return an exit code; 0 means success.
 	entrySignature = signature{nil, []api.ValueType{i32}}
