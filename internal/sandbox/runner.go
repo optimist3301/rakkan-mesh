@@ -2,20 +2,25 @@
 //
 // Isolation layers implemented here:
 //   - the module may only import the rakkan host ABI (see abi.go);
+//   - execution is bounded by deterministic gas (see package meter), with a
+//     wall clock timeout and caller cancellation as a backstop, both delivered
+//     by draining the gas counter (see watch);
 //   - linear memory is capped per task;
-//   - execution is interrupted on timeout or caller cancellation;
 //   - input, output and log sizes are bounded.
 //
-// Deterministic fuel metering and OS-level isolation (separate worker process,
-// seccomp, cgroups) are layered on top of this package.
+// OS-level isolation (separate worker process, seccomp, cgroups) is layered on
+// top of this package.
 package sandbox
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sync"
 	"time"
 
+	"github.com/optimist3301/rakkan-mesh/internal/meter"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -34,6 +39,7 @@ type Result struct {
 	Output       []byte
 	Logs         []byte
 	LogTruncated bool
+	GasUsed      int64
 	Elapsed      time.Duration
 }
 
@@ -77,10 +83,12 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 
 	// A runtime per task gives each task its own memory ceiling; the shared
 	// compilation cache keeps repeated modules cheap.
+	//
+	// WithCloseOnContextDone is deliberately not used: it slows loops ~30x
+	// in wazero 1.12, and the gas checks already provide interruption points.
 	cfg := wazero.NewRuntimeConfig().
 		WithCoreFeatures(api.CoreFeaturesV2).
 		WithMemoryLimitPages(lim.MaxMemoryPages).
-		WithCloseOnContextDone(true).
 		WithCompilationCache(r.cache)
 	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
 	defer rt.Close(context.Background())
@@ -90,7 +98,11 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 		return nil, fmt.Errorf("instantiate host module: %w", err)
 	}
 
-	cm, err := rt.CompileModule(ctx, t.Module)
+	metered, err := meter.Instrument(t.Module)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalidModule, err)
+	}
+	cm, err := rt.CompileModule(ctx, metered)
 	if err != nil {
 		return nil, st.classify(ctx, fmt.Errorf("%w: %v", ErrInvalidModule, err))
 	}
@@ -105,15 +117,37 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 		return nil, st.classify(ctx, err)
 	}
 
-	ret, err := mod.ExportedFunction(entry).Call(ctx)
+	st.gas = mod.ExportedGlobal(meter.GasExport).(api.MutableGlobal)
+	st.gas.Set(api.EncodeI64(lim.MaxGas))
+
+	stop := st.watch(ctx)
+	var ret []uint64
+	if start := mod.ExportedFunction(meter.StartExport); start != nil {
+		_, err = start.Call(ctx)
+	}
+	if err == nil {
+		ret, err = mod.ExportedFunction(entry).Call(ctx)
+	}
+	stop()
 	if err != nil {
 		return nil, st.classify(ctx, err)
+	}
+	if ctx.Err() != nil {
+		// Finished while being interrupted; the balance is unreliable.
+		return nil, st.classify(ctx, nil)
+	}
+	// Checks run only at function entry, loop headers and dynamic charges,
+	// so straight-line code may finish slightly in debt.
+	remaining := int64(st.gas.Get())
+	if remaining < 0 {
+		return nil, st.outOfGas()
 	}
 	return &Result{
 		ExitCode:     api.DecodeU32(ret[0]),
 		Output:       st.output,
 		Logs:         st.logs,
 		LogTruncated: st.logTruncated,
+		GasUsed:      lim.MaxGas - remaining,
 		Elapsed:      time.Since(start),
 	}, nil
 }
@@ -125,7 +159,46 @@ type execState struct {
 	output       []byte
 	logs         []byte
 	logTruncated bool
-	fault        error // set by host functions before they trap
+	gas          api.MutableGlobal // remaining gas, set once instantiated
+	gasMu        sync.Mutex        // orders host charges with interruption
+	fault        error             // set by host functions before they trap
+}
+
+// interrupted is stored in the gas counter to stop the guest. It is far
+// below zero so that no charges in flight can bring it back up.
+const interrupted = math.MinInt64 / 2
+
+// watch interrupts the guest when ctx ends by draining its gas, so the next
+// check (at the latest the next loop iteration or call) traps. Guest code
+// updates the counter with a non-atomic read-modify-write that may overwrite
+// the store, so it is repeated until the guest stops. The returned function
+// stops watching and waits until no further stores can happen.
+func (s *execState) watch(ctx context.Context) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+		}
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			s.gasMu.Lock()
+			s.gas.Set(api.EncodeI64(interrupted))
+			s.gasMu.Unlock()
+			select {
+			case <-done:
+				return
+			case <-tick.C:
+			}
+		}
+	})
+	return func() {
+		close(done)
+		wg.Wait()
+	}
 }
 
 // trap aborts guest execution with err as the reported cause.
@@ -134,15 +207,33 @@ func (s *execState) trap(err error) {
 	panic(err)
 }
 
+func (s *execState) outOfGas() error {
+	return fmt.Errorf("%w: budget %d", ErrOutOfGas, s.lim.MaxGas)
+}
+
+// charge bills a host call transferring n bytes, trapping when the balance
+// goes negative.
+func (s *execState) charge(n uint32) {
+	s.gasMu.Lock()
+	rem := int64(s.gas.Get()) - meter.HostCallCost - int64(n>>meter.BytesPerGasShift)
+	s.gas.Set(api.EncodeI64(rem))
+	s.gasMu.Unlock()
+	if rem < 0 {
+		s.trap(s.outOfGas())
+	}
+}
+
 // classify maps a runtime error to a sandbox error.
 func (s *execState) classify(ctx context.Context, err error) error {
 	switch {
-	case s.fault != nil:
-		return s.fault
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return fmt.Errorf("%w after %s", ErrTimeout, s.lim.Timeout)
 	case ctx.Err() != nil:
 		return ctx.Err()
+	case s.fault != nil:
+		return s.fault
+	case s.gas != nil && int64(s.gas.Get()) < 0:
+		return s.outOfGas()
 	case errors.Is(err, ErrInvalidModule):
 		return err
 	}
@@ -160,10 +251,12 @@ func (s *execState) instantiateHost(ctx context.Context, rt wazero.Runtime) erro
 }
 
 func (s *execState) inputLen() uint32 {
+	s.charge(0)
 	return uint32(len(s.input))
 }
 
 func (s *execState) inputRead(_ context.Context, m api.Module, dst, offset, n uint32) uint32 {
+	s.charge(n)
 	if uint64(offset) >= uint64(len(s.input)) {
 		return 0
 	}
@@ -178,6 +271,7 @@ func (s *execState) inputRead(_ context.Context, m api.Module, dst, offset, n ui
 }
 
 func (s *execState) outputWrite(_ context.Context, m api.Module, src, n uint32) {
+	s.charge(n)
 	if uint64(len(s.output))+uint64(n) > uint64(s.lim.MaxOutputBytes) {
 		s.trap(fmt.Errorf("%w: limit %d bytes", ErrOutputLimit, s.lim.MaxOutputBytes))
 	}
@@ -189,6 +283,7 @@ func (s *execState) outputWrite(_ context.Context, m api.Module, src, n uint32) 
 }
 
 func (s *execState) log(_ context.Context, m api.Module, src, n uint32) {
+	s.charge(n)
 	buf, ok := m.Memory().Read(src, n)
 	if !ok {
 		s.trap(fmt.Errorf("%w: log src=%d len=%d", ErrMemoryAccess, src, n))

@@ -40,6 +40,7 @@ func runCmd(args []string) int {
 	entry := fs.String("entry", sandbox.DefaultEntry, "exported entry point")
 	inputPath := fs.String("input", "", "input file, or - for stdin")
 	memMiB := fs.Uint("mem", uint(def.MaxMemoryPages)*sandbox.PageSize>>20, "memory limit in MiB")
+	gas := fs.Int64("gas", def.MaxGas, "gas budget")
 	timeout := fs.Duration("timeout", def.Timeout, "wall clock limit")
 	fs.Parse(args)
 	if fs.NArg() != 1 {
@@ -67,6 +68,7 @@ func runCmd(args []string) int {
 
 	lim := def
 	lim.MaxMemoryPages = uint32(*memMiB << 20 / sandbox.PageSize)
+	lim.MaxGas = *gas
 	lim.Timeout = *timeout
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -88,7 +90,7 @@ func runCmd(args []string) int {
 			fmt.Fprintln(os.Stderr, "\n[log truncated]")
 		}
 	}
-	fmt.Fprintf(os.Stderr, "exit=%d elapsed=%s\n", res.ExitCode, res.Elapsed.Round(time.Microsecond))
+	fmt.Fprintf(os.Stderr, "exit=%d gas=%d elapsed=%s\n", res.ExitCode, res.GasUsed, res.Elapsed.Round(time.Microsecond))
 	if res.ExitCode != 0 {
 		return 3
 	}

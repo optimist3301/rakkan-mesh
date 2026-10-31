@@ -9,7 +9,7 @@
 ```sh
 go test ./...
 go build ./cmd/rakkan-node
-./rakkan-node run -input data.bin -mem 64 -timeout 5s task.wasm
+./rakkan-node run -input data.bin -mem 64 -gas 1000000000 -timeout 5s task.wasm
 ```
 
 ## ABI задачи
@@ -23,3 +23,6 @@ go build ./cmd/rakkan-node
 | `input_read` | `(dst, offset, len) -> i32` | скопировать часть входа в память, вернуть число байт |
 | `output_write` | `(src, len)` | дописать в выход |
 | `log` | `(src, len)` | диагностический лог (обрезается по лимиту) |
+
+Имена с префиксом `__rakkan_` зарезервированы. Исполнение ограничено детерминированным
+gas: одинаковый модуль с одинаковым входом тратит одинаковый gas на любом узле.

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -42,6 +43,9 @@ var (
 
 // validate checks a compiled module against the host ABI and entry contract.
 func validate(cm wazero.CompiledModule, entry string) error {
+	if strings.HasPrefix(entry, "__rakkan_") {
+		return fmt.Errorf("%w: %q is reserved", ErrMissingEntry, entry)
+	}
 	for _, fn := range cm.ImportedFunctions() {
 		mod, name, _ := fn.Import()
 		want, ok := hostABI[name]

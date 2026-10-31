@@ -18,9 +18,19 @@ const (
 	OpDrop        byte = 0x1a
 	OpLocalGet    byte = 0x20
 	OpLocalSet    byte = 0x21
+	OpLocalTee    byte = 0x22
+	OpGlobalGet   byte = 0x23
+	OpGlobalSet   byte = 0x24
+	OpIf          byte = 0x04
+	OpI32Add      byte = 0x6a
+	OpI32Sub      byte = 0x6b
+	OpI32Eqz      byte = 0x45
+	OpBrIf        byte = 0x0d
 	OpMemoryGrow  byte = 0x40
 	OpI32Const    byte = 0x41
 	BlockEmpty    byte = 0x40
+	PrefixFC      byte = 0xfc
+	MemoryFill    byte = 0x0b // after PrefixFC
 )
 
 type Import struct {
@@ -40,8 +50,16 @@ type Data struct {
 	Bytes  []byte
 }
 
+type Global struct {
+	Type    byte
+	Mutable bool
+	Init    []byte // constant expression without the trailing end opcode
+}
+
 type Module struct {
 	Imports      []Import
+	Globals      []Global
+	Start        *uint32 // function index
 	Funcs        []Func
 	Memory       bool
 	MemMin       uint32
@@ -112,6 +130,18 @@ func (m Module) Encode() []byte {
 		out = section(out, 5, vec([][]byte{lim}))
 	}
 
+	if len(m.Globals) > 0 {
+		var gs [][]byte
+		for _, g := range m.Globals {
+			mut := byte(0)
+			if g.Mutable {
+				mut = 1
+			}
+			gs = append(gs, Cat([]byte{g.Type, mut}, g.Init, []byte{OpEnd}))
+		}
+		out = section(out, 6, vec(gs))
+	}
+
 	var exports [][]byte
 	for i, f := range m.Funcs {
 		if f.Export != "" {
@@ -123,6 +153,10 @@ func (m Module) Encode() []byte {
 	}
 	if len(exports) > 0 {
 		out = section(out, 7, vec(exports))
+	}
+
+	if m.Start != nil {
+		out = section(out, 8, uleb(uint64(*m.Start)))
 	}
 
 	if len(m.Funcs) > 0 {
