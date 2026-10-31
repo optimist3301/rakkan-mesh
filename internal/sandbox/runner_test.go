@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"testing"
 	"time"
@@ -303,5 +304,24 @@ func TestMeteredCacheEviction(t *testing.T) {
 	c.add([32]byte{4}, make([]byte, 11)) // larger than the cache: ignored
 	if c.size != 8 {
 		t.Fatalf("size %d, want 8", c.size)
+	}
+}
+
+func TestSearchModule(t *testing.T) {
+	const secret = 123_456
+	in := make([]byte, 12)
+	binary.LittleEndian.PutUint32(in[0:], 100_000)
+	binary.LittleEndian.PutUint32(in[4:], 50_000)
+	binary.LittleEndian.PutUint32(in[8:], w.Mix32(secret))
+	res, err := run(t, w.Search(), in, DefaultLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ExitCode != 0 || binary.LittleEndian.Uint32(res.Output) != secret {
+		t.Fatalf("exit %d output %x", res.ExitCode, res.Output)
+	}
+	binary.LittleEndian.PutUint32(in[0:], 0) // range without the secret
+	if res, err = run(t, w.Search(), in, DefaultLimits()); err != nil || res.ExitCode != 1 {
+		t.Fatalf("exit %d err %v, want 1", res.ExitCode, err)
 	}
 }

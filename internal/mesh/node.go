@@ -336,6 +336,15 @@ func (n *Node) NewStream(ctx context.Context, p peer.ID, pid protocol.ID) (netwo
 	return n.gated.NewStream(ctx, p, pid)
 }
 
+// IsMember reports whether p is currently an authenticated member.
+func (n *Node) IsMember(p peer.ID) bool { return n.isMember(p) }
+
+// JoinTopic joins a gossip topic scoped to this network. Only members take
+// part, and messages are signed by their authors.
+func (n *Node) JoinTopic(name string) (*pubsub.Topic, error) {
+	return n.ps.Join("/rakkan/" + n.tag() + "/" + name)
+}
+
 // Connect dials a peer; it becomes usable once it authenticates.
 func (n *Node) Connect(ctx context.Context, ai peer.AddrInfo) error {
 	n.addDialTarget(ai)

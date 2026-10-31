@@ -2,9 +2,15 @@ package main
 
 import (
 	"context"
+	"runtime"
+
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/optimist3301/rakkan-mesh/internal/api"
+	"github.com/optimist3301/rakkan-mesh/internal/exec"
+	"github.com/optimist3301/rakkan-mesh/internal/isolate"
+	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -33,6 +39,10 @@ func daemonCmd(args []string) int {
 	relay := flags.Bool("relay", false, "relay traffic for members; enable on publicly reachable nodes")
 	reach := flags.String("reachability", "auto", "auto (from interface addresses), public, or private (behind NAT)")
 	verbose := flags.Bool("v", false, "debug logging")
+	workers := flags.Int("workers", runtime.GOMAXPROCS(0), "tasks this node runs for the network at once; 0 only submits tasks")
+	isolation := flags.String("isolation", "strict", "worker isolation: strict, ns or process")
+	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
+	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
@@ -87,8 +97,43 @@ func daemonCmd(args []string) int {
 		fmt.Printf("listening on %s/p2p/%s\n", a, node.ID())
 	}
 
+	ceiling := sandbox.DefaultLimits()
+	svcCfg := exec.Config{Node: node, Ceiling: ceiling, Logger: cfg.Logger}
+	if *workers > 0 {
+		iso, err := parseIsolation(*isolation)
+		if err != nil {
+			return fail(err)
+		}
+		iso.Cgroup = *cgroup
+		pool, err := isolate.NewPool(isolate.Config{Ceiling: ceiling, Workers: *workers, Isolation: iso})
+		if err != nil {
+			return fail(err)
+		}
+		defer pool.Close()
+		svcCfg.Pool, svcCfg.Slots = pool, *workers
+	}
+	svc, err := exec.New(svcCfg)
+	if err != nil {
+		return fail(err)
+	}
+	defer svc.Close()
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	if *apiPath != "" {
+		l, err := api.Listen(*apiPath)
+		if err != nil {
+			return fail(fmt.Errorf("api: %w", err))
+		}
+		defer os.Remove(*apiPath)
+		srv := &api.Server{Service: svc, Node: node, Network: n.ID}
+		go func() {
+			if err := srv.Serve(ctx, l); err != nil {
+				slog.Error("api", "err", err)
+			}
+		}()
+		fmt.Printf("api on %s\n", *apiPath)
+	}
 	status := time.NewTicker(*statusEvery)
 	defer status.Stop()
 	reload := time.NewTicker(5 * time.Second)
@@ -105,6 +150,18 @@ func daemonCmd(args []string) int {
 			}
 		}
 	}
+}
+
+func parseIsolation(s string) (isolate.Isolation, error) {
+	switch s {
+	case "strict":
+		return isolate.StrictIsolation(), nil
+	case "ns":
+		return isolate.Isolation{Namespaces: true}, nil
+	case "process":
+		return isolate.Isolation{}, nil
+	}
+	return isolate.Isolation{}, fmt.Errorf("unknown isolation %q", s)
 }
 
 // publishIfNewer spreads the revocation list file when the operator has

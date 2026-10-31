@@ -1,2 +1,3 @@
 /rakkan-node
 *.wasm
+!sdk/js/test/fixtures/*.wasm

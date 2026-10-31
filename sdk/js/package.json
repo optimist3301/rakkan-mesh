@@ -1,0 +1,20 @@
+{
+  "name": "@rakkan/sdk",
+  "version": "0.1.0",
+  "description": "Run WebAssembly tasks on a Rakkan mesh from Node.js",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": ["index.js", "index.d.ts"],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "license": "UNLICENSED"
+}
