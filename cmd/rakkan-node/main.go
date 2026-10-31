@@ -1,5 +1,5 @@
-// Command rakkan-node is the Rakkan mesh node. For now it only executes
-// WebAssembly tasks locally; networking and the SDK API come next.
+// Command rakkan-node is the Rakkan mesh node: it joins a closed network,
+// manages its membership, and executes WebAssembly tasks in the sandbox.
 package main
 
 import (
@@ -18,6 +18,12 @@ import (
 const usage = `usage: rakkan-node <command> [flags]
 
 commands:
+  daemon            join a network and keep running
+  id                print this node's peer ID, creating its key if needed
+  network init      create a network: its root key and ID
+  network issue     issue a node certificate
+  network revoke    revoke certificates
+  network show      print a certificate or revocation list
   run <task.wasm>   execute a task locally in the sandbox
 `
 
@@ -37,6 +43,12 @@ func main() {
 	switch os.Args[1] {
 	case "run":
 		os.Exit(runCmd(os.Args[2:]))
+	case "id":
+		os.Exit(idCmd(os.Args[2:]))
+	case "daemon":
+		os.Exit(daemonCmd(os.Args[2:]))
+	case "network":
+		os.Exit(networkCmd(os.Args[2:]))
 	default:
 		fmt.Fprint(os.Stderr, usage)
 		os.Exit(2)
