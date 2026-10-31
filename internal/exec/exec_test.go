@@ -7,7 +7,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"image/png"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +72,10 @@ func (tn *testNode) close() {
 }
 
 // add starts a member; slots > 0 makes it an executor.
-func (c *cluster) add(slots int) *testNode {
+func (c *cluster) add(slots int) *testNode { return c.addWith(slots, nil) }
+
+// addWith starts a member offering the given capabilities (nil: all).
+func (c *cluster) addWith(slots int, caps []string) *testNode {
 	t := c.t
 	t.Helper()
 	sk, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -98,7 +106,7 @@ func (c *cluster) add(slots int) *testNode {
 		t.Fatal(err)
 	}
 	tn := &testNode{node: node, blobs: blob.NewService(node, store, nil)}
-	cfg := Config{Node: node, Blobs: tn.blobs, LoadInterval: 200 * time.Millisecond}
+	cfg := Config{Node: node, Blobs: tn.blobs, LoadInterval: 200 * time.Millisecond, Capabilities: caps}
 	if slots > 0 {
 		tn.pool, err = isolate.NewPool(isolate.Config{Ceiling: sandbox.DefaultLimits(), Workers: slots, Isolation: isolate.StrictIsolation()})
 		if err != nil {
@@ -398,5 +406,93 @@ func TestReplicasAgreeOnBlobOutputs(t *testing.T) {
 	}
 	if res.OutputBlob != blob.IDOf(in) || !res.Replicas[0].Agreed || !res.Replicas[1].Agreed {
 		t.Fatalf("output %s, replicas %+v", res.OutputBlob, res.Replicas)
+	}
+}
+
+func gradientPNG(width, height int) []byte {
+	img := image.NewNRGBA(image.Rect(0, 0, width, height))
+	for y := range height {
+		for x := range width {
+			img.Set(x, y, color.NRGBA{uint8(x), uint8(y), 128, 255})
+		}
+	}
+	var buf bytes.Buffer
+	png.Encode(&buf, img)
+	return buf.Bytes()
+}
+
+func TestImageTaskRunsRemotely(t *testing.T) {
+	c := newCluster(t)
+	exe := c.add(1)
+	req := c.add(0)
+	settle(t, req, exe)
+	res, err := req.svc.Run(t.Context(), Request{Module: w.Thumbnail(256, 256, 1, 85), Input: gradientPNG(1000, 600), Limits: bigLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := jpeg.Decode(bytes.NewReader(res.Output))
+	if err != nil || res.ExitCode != 0 {
+		t.Fatalf("exit %d, decode %v", res.ExitCode, err)
+	}
+	if b := img.Bounds(); b.Dx() != 256 || b.Dy() != 153 {
+		t.Fatalf("thumbnail %dx%d", b.Dx(), b.Dy())
+	}
+}
+
+func TestCapabilityAwareScheduling(t *testing.T) {
+	c := newCluster(t)
+	plain := c.addWith(2, []string{}) // offers no image kernels
+	imaging := c.add(1)
+	req := c.add(0)
+	settle(t, req, plain, imaging)
+	for range 4 {
+		res, err := req.svc.Run(t.Context(), Request{Module: w.Thumbnail(64, 64, 0, 0), Input: gradientPNG(200, 100), Limits: bigLimits()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Node != imaging.node.ID() {
+			t.Fatalf("image task ran on a node without image/1")
+		}
+	}
+	// Plain tasks still use the plain node.
+	if _, err := req.svc.Run(t.Context(), Request{Module: w.Echo(), Input: []byte("x"), Limits: limits()}); err != nil {
+		t.Fatal(err)
+	}
+
+	imaging.close()
+	_, err := req.svc.Run(t.Context(), Request{Module: w.Thumbnail(64, 64, 0, 0), Input: gradientPNG(10, 10), Limits: bigLimits()})
+	if !errors.Is(err, ErrNoCapacity) || !strings.Contains(err.Error(), `capability "image/1"`) {
+		t.Fatalf("got %v, want no capacity naming image/1", err)
+	}
+}
+
+func TestMapSharesAnAttachedBlob(t *testing.T) {
+	c := newCluster(t)
+	e1, e2 := c.add(2), c.add(2)
+	req := c.add(0)
+	settle(t, req, e1, e2)
+	shared := make([]byte, 3<<20)
+	rand.Read(shared)
+	id, _ := req.blobs.Store().PutBytes(shared)
+
+	n := 0
+	for item := range req.svc.Map(t.Context(), MapRequest{
+		Module: w.BlobEcho(), Inputs: make([][]byte, 8), Blobs: []blob.ID{id}, Limits: bigLimits(),
+	}) {
+		if item.Err != nil {
+			t.Fatal(item.Err)
+		}
+		if item.Result.OutputBlob != id {
+			t.Fatalf("task %d read something else", item.Index)
+		}
+		n++
+	}
+	if n != 8 {
+		t.Fatalf("%d results", n)
+	}
+	for _, e := range []*testNode{e1, e2} {
+		if !e.blobs.Store().Has(id) {
+			t.Fatalf("executor %s did not keep the shared blob", e.node.ID().ShortString())
+		}
 	}
 }

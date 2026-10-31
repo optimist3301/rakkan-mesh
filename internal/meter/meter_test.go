@@ -257,3 +257,13 @@ func FuzzInstrument(f *testing.F) {
 		}
 	})
 }
+
+func TestImportModules(t *testing.T) {
+	got, err := ImportModules(w.Thumbnail(10, 10, 0, 0))
+	if err != nil || len(got) != 1 || got[0] != "rakkan_image_v1" {
+		t.Fatalf("got %v, %v", got, err)
+	}
+	if _, err := ImportModules([]byte("junk")); err == nil {
+		t.Fatal("junk accepted")
+	}
+}

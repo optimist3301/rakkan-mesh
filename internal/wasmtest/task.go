@@ -140,3 +140,56 @@ func Mix32(x uint32) uint32 {
 	x ^= x >> 13
 	return x
 }
+
+// Thumbnail decodes its input image, fits it in maxW x maxH and outputs
+// it encoded (format 0 PNG, 1 JPEG). Exit codes: 0 ok, 1 decode failed,
+// 2 resize failed, 3 encode failed.
+func Thumbnail(maxW, maxH, format, quality int32) []byte {
+	const img = "rakkan_image_v1"
+	const ltS, ret = 0x48, 0x0f // i32.lt_s, return
+	fail := func(code int32) []byte {
+		return Cat(I32Const(0), []byte{ltS, OpIf, BlockEmpty}, I32Const(code), []byte{ret, OpEnd})
+	}
+	return Module{
+		Imports: []Import{
+			{Module: img, Name: "decode_input", Results: []byte{I32}},
+			{Module: img, Name: "fit", Params: []byte{I32, I32, I32}, Results: []byte{I32}},
+			{Module: img, Name: "encode_output", Params: []byte{I32, I32, I32}, Results: []byte{I32}},
+		},
+		Funcs: []Func{{Results: []byte{I32}, Locals: []byte{I32}, Export: "run", Body: Cat(
+			Call(0), []byte{OpLocalTee, 0}, fail(1),
+			[]byte{OpLocalGet, 0}, I32Const(maxW), I32Const(maxH), Call(1), []byte{OpLocalTee, 0}, fail(2),
+			[]byte{OpLocalGet, 0}, I32Const(format), I32Const(quality), Call(2), fail(3),
+			I32Const(0),
+		)}},
+		Memory: true, MemMin: 1, ExportMemory: true,
+	}.Encode()
+}
+
+// BlobEcho copies attached blob 0 to its output, 64 KiB at a time.
+func BlobEcho() []byte {
+	const (
+		geS, add64, ext, eqz = 0x59, 0x7c, 0xad, 0x45
+		size, off, n         = 0, 1, 2
+	)
+	return Module{
+		Imports: []Import{
+			{Module: "rakkan", Name: "blob_size", Params: []byte{I32}, Results: []byte{I64}},
+			{Module: "rakkan", Name: "blob_read", Params: []byte{I32, I32, I64, I32}, Results: []byte{I32}},
+			{Module: "rakkan", Name: "output_write", Params: []byte{I32, I32}},
+		},
+		Funcs: []Func{{Results: []byte{I32}, Locals: []byte{I64, I64, I32}, Export: "run", Body: Cat(
+			I32Const(0), Call(0), []byte{OpLocalSet, size},
+			I64Const(0), []byte{OpLocalSet, off},
+			[]byte{0x02, BlockEmpty, OpLoop, BlockEmpty},
+			[]byte{OpLocalGet, off, OpLocalGet, size, geS, OpBrIf, 1},
+			I32Const(0), I32Const(0), []byte{OpLocalGet, off}, I32Const(65536), Call(1), []byte{OpLocalTee, n},
+			[]byte{eqz, OpBrIf, 1},
+			I32Const(0), []byte{OpLocalGet, n}, Call(2),
+			[]byte{OpLocalGet, off, OpLocalGet, n, ext, add64, OpLocalSet, off},
+			[]byte{OpBr, 0, OpEnd, OpEnd},
+			I32Const(0),
+		)}},
+		Memory: true, MemMin: 2, ExportMemory: true,
+	}.Encode()
+}

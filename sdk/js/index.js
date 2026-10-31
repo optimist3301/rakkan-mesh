@@ -88,15 +88,18 @@ export class Mesh {
   /**
    * Runs a task on the best available member and resolves to its result.
    * Rejects with a TaskError if the task fails. Large inputs travel as
-   * blobs; give `inputBlob` for data already stored with putBlob(). A large
+   * blobs; give `inputBlob` for data already stored with putBlob(). `blobs`
+   * attaches stored blobs the task reads in pieces (blob_read): executors
+   * fetch only what it reads. A large
    * output arrives as a blob and is downloaded into `output` unless
    * `outputAsBlob` is set, in which case only `outputBlob` is given.
    */
-  async run({ module, entry, input, json, inputBlob, limits, replicas, outputAsBlob, signal } = {}) {
+  async run({ module, entry, input, json, inputBlob, blobs, limits, replicas, outputAsBlob, signal } = {}) {
     const hash = await this.#moduleHash(module);
     const body = {
       module_hash: hash,
       entry,
+      blobs,
       limits: wireLimits(limits),
       replicas,
       ...(await this.#inputField(input, json, inputBlob, signal)),
@@ -138,11 +141,12 @@ export class Mesh {
    * `stopOnExitCode`, the map ends at the first task exiting with that code.
    * Breaking out of the loop or aborting `signal` cancels the remaining tasks.
    */
-  async *map({ module, inputs, inputBlobs, entry, limits, concurrency, stopOnExitCode, outputAsBlob, signal } = {}) {
+  async *map({ module, inputs, inputBlobs, blobs, entry, limits, concurrency, stopOnExitCode, outputAsBlob, signal } = {}) {
     const hash = await this.#moduleHash(module);
     const body = {
       module_hash: hash,
       entry,
+      blobs,
       limits: wireLimits(limits),
       concurrency,
       stop_on_exit_code: stopOnExitCode,

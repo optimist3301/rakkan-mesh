@@ -14,4 +14,7 @@ var (
 	ErrOutOfGas        = errors.New("out of gas")
 	ErrTimeout         = errors.New("task timed out")
 	ErrTrap            = errors.New("task trapped")
+	// ErrBlobUnavailable means an attached blob could not be read, for
+	// example because no provider could be reached: not the task's fault.
+	ErrBlobUnavailable = errors.New("attached blob unavailable")
 )

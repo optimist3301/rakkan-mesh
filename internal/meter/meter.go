@@ -135,7 +135,20 @@ type module struct {
 	numImportedGlobals int
 	numGlobals         int // imported + defined
 	exportNames        map[string]bool
-	start              int64 // -1 when absent
+	importModules      []string // distinct import namespaces
+	start              int64    // -1 when absent
+}
+
+// ImportModules returns the distinct namespaces a module imports from,
+// after validating its structure as Instrument would. Schedulers use it to
+// match a task to nodes offering the host APIs it needs, without compiling
+// untrusted code.
+func ImportModules(wasm []byte) ([]string, error) {
+	m, err := parse(wasm)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
+	}
+	return m.importModules, nil
 }
 
 // Instrument returns a metered copy of a WebAssembly binary.
@@ -311,8 +324,12 @@ func (m *module) parseImports(r *reader) error {
 		return err
 	}
 	for range n {
-		if _, err := r.name(); err != nil {
+		mod, err := r.name()
+		if err != nil {
 			return err
+		}
+		if !slices.Contains(m.importModules, mod) {
+			m.importModules = append(m.importModules, mod)
 		}
 		if _, err := r.name(); err != nil {
 			return err

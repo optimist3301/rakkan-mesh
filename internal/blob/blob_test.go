@@ -338,3 +338,42 @@ func TestFetchResumesAfterProviderDies(t *testing.T) {
 }
 
 func sha(b []byte) Hash { return Hash(sha256.Sum256(b)) }
+
+func TestOpenRemoteFetchesOnlyWhatIsRead(t *testing.T) {
+	c := newCluster(t)
+	src, dst := c.add(), c.add()
+	connect(t, dst, src)
+	data := randomBytes(40 << 20) // 40 chunks
+	id, _ := src.blobs.Store().PutBytes(data)
+
+	r, err := dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Read 100 bytes straddling chunks 20 and 21.
+	buf := make([]byte, 100)
+	off := int64(21*ChunkSize - 50)
+	if n, err := r.ReadAt(buf, off); n != 100 || err != nil || !bytes.Equal(buf, data[off:off+100]) {
+		t.Fatalf("read %d, %v", n, err)
+	}
+	m, _ := src.blobs.Store().Manifest(id)
+	fetched := len(m.Chunks) - len(dst.blobs.Store().Missing(m))
+	if fetched > 2+readAhead {
+		t.Fatalf("fetched %d chunks for a 100-byte read", fetched)
+	}
+	r.Close()
+	if dst.blobs.Store().Has(id) {
+		t.Fatal("partially read blob recorded as complete")
+	}
+
+	// Reading everything completes the blob in the store.
+	r, _ = dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()})
+	all := make([]byte, len(data))
+	if n, err := r.ReadAt(all, 0); n != len(data) || err != nil || !bytes.Equal(all, data) {
+		t.Fatalf("full read %d, %v", n, err)
+	}
+	r.Close()
+	if !dst.blobs.Store().Has(id) {
+		t.Fatal("fully read blob not recorded")
+	}
+}

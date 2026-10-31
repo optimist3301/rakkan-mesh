@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/meter"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
 
@@ -28,8 +30,12 @@ type Request struct {
 	// the executor in verified chunks.
 	Input     []byte
 	InputBlob blob.ID
-	// Providers are other members holding InputBlob, which executors may
-	// fetch it from in parallel with this node.
+	// Blobs are attached read-only data the task reads in pieces with
+	// blob_read; executors fetch only the chunks read. At most
+	// sandbox.MaxBlobs.
+	Blobs []blob.ID
+	// Providers are other members holding InputBlob or Blobs, which
+	// executors may fetch from in parallel with this node.
 	Providers []peer.ID
 	Limits    sandbox.Limits
 	// Replicas > 1 runs the task on that many distinct members and accepts
@@ -78,9 +84,13 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 
 // prepareInput turns a large inline input into a blob, so retries and
 // replicas share one stored copy and executors fetch it in verified chunks,
-// and pins the input blob while the task runs.
+// and pins the task's blobs held here while it runs. Attached blobs may
+// instead be held only by Providers.
 func (s *Service) prepareInput(req Request) (Request, func(), error) {
 	store := s.cfg.Blobs.Store()
+	if len(req.Blobs) > sandbox.MaxBlobs {
+		return req, nil, fmt.Errorf("%w: %d blobs attached, limit %d", sandbox.ErrLimitPolicy, len(req.Blobs), sandbox.MaxBlobs)
+	}
 	if req.InputBlob.IsZero() && len(req.Input) > inlineMax {
 		id, err := store.PutBytes(req.Input)
 		if err != nil {
@@ -88,14 +98,60 @@ func (s *Service) prepareInput(req Request) (Request, func(), error) {
 		}
 		req.InputBlob, req.Input = id, nil
 	}
-	if req.InputBlob.IsZero() {
-		return req, func() {}, nil
+	var unpins []func()
+	unpinAll := func() {
+		for _, u := range unpins {
+			u()
+		}
 	}
-	unpin, ok := store.Pin(req.InputBlob)
-	if !ok {
-		return req, nil, fmt.Errorf("%w: input blob %s", blob.ErrNotFound, req.InputBlob)
+	if !req.InputBlob.IsZero() {
+		unpin, ok := store.Pin(req.InputBlob)
+		if !ok {
+			return req, nil, fmt.Errorf("%w: input blob %s", blob.ErrNotFound, req.InputBlob)
+		}
+		unpins = append(unpins, unpin)
 	}
-	return req, unpin, nil
+	for _, id := range req.Blobs {
+		if unpin, ok := store.Pin(id); ok {
+			unpins = append(unpins, unpin)
+		} else if len(req.Providers) == 0 {
+			unpinAll()
+			return req, nil, fmt.Errorf("%w: attached blob %s, and no providers", blob.ErrNotFound, id)
+		}
+	}
+	return req, unpinAll, nil
+}
+
+// capabilities returns the host APIs a module needs, cached by hash.
+func (s *Service) capabilities(hash Hash, module []byte) ([]string, error) {
+	s.mu.Lock()
+	caps, ok := s.caps[hash]
+	s.mu.Unlock()
+	if ok {
+		return caps, nil
+	}
+	mods, err := meter.ImportModules(module)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", sandbox.ErrInvalidModule, err)
+	}
+	caps = sandbox.CapabilitiesFor(mods)
+	s.mu.Lock()
+	if len(s.caps) > 4096 {
+		clear(s.caps)
+	}
+	s.caps[hash] = caps
+	s.mu.Unlock()
+	return caps, nil
+}
+
+// missingCapability returns the first capability in need that have lacks.
+func missingCapability(need, have []string) string {
+	for _, c := range need {
+		if !slices.Contains(have, c) {
+			return c
+		}
+	}
+	return ""
 }
 
 // placement tracks executors already used by a task, so retries and
@@ -112,16 +168,20 @@ func newPlacement() *placement { return &placement{used: map[peer.ID]bool{}} }
 // attempt; the context bounds the wait.
 func (s *Service) runOnce(ctx context.Context, req Request, pl *placement) (*Result, error) {
 	hash := HashOf(req.Module)
+	caps, err := s.capabilities(hash, req.Module)
+	if err != nil {
+		return nil, err
+	}
 	var lastErr error
 	for attempt := 1; attempt <= s.cfg.MaxAttempts; {
-		target, anyCandidate, limitErr := s.pick(hash, req.Limits, pl)
+		target, anyCandidate, limitErr := s.pick(hash, req.Limits, caps, pl)
 		if target == "" {
 			if !anyCandidate {
 				switch {
 				case lastErr != nil:
 					return nil, fmt.Errorf("%w (last attempt: %v)", ErrNoCapacity, lastErr)
 				case limitErr != nil:
-					return nil, fmt.Errorf("%w: the task's limits exceed every executor's policy (%v)", ErrNoCapacity, limitErr)
+					return nil, fmt.Errorf("%w: %v", ErrNoCapacity, limitErr)
 				}
 				return nil, ErrNoCapacity
 			}
@@ -162,7 +222,7 @@ func retryable(err error) bool {
 		switch re.Kind {
 		// "canceled" here means the executor gave up on its own (shutting
 		// down): our own cancellations never reach the wire.
-		case "worker_crashed", "worker_protocol", "internal", "canceled":
+		case "worker_crashed", "worker_protocol", "internal", "canceled", "blob_unavailable":
 			return true
 		}
 		return false
@@ -171,7 +231,11 @@ func retryable(err error) bool {
 		return true // another node may have a higher ceiling
 	}
 	// Local sandbox errors are deterministic; anything else is transport.
-	return ErrorKind(err) == "internal" || ErrorKind(err) == "worker_crashed" || ErrorKind(err) == "worker_protocol"
+	switch ErrorKind(err) {
+	case "internal", "worker_crashed", "worker_protocol", "blob_unavailable":
+		return true
+	}
+	return false
 }
 
 func (s *Service) waitCapacity(ctx context.Context) error {
@@ -206,7 +270,7 @@ func (s *Service) release1(pl *placement, p peer.ID) {
 // returns "" when nobody has room; anyCandidate tells whether anybody
 // could run the task at all, and limitErr why an executor's policy refused
 // the task's limits, if one did.
-func (s *Service) pick(hash Hash, lim sandbox.Limits, pl *placement) (target peer.ID, anyCandidate bool, limitErr error) {
+func (s *Service) pick(hash Hash, lim sandbox.Limits, caps []string, pl *placement) (target peer.ID, anyCandidate bool, limitErr error) {
 	type cand struct {
 		id    peer.ID
 		score float64
@@ -217,8 +281,18 @@ func (s *Service) pick(hash Hash, lim sandbox.Limits, pl *placement) (target pee
 	pl.mu.Lock()
 	defer pl.mu.Unlock()
 
+	// refuse records why an executor cannot take the task at all.
+	refuse := func(load Load) error {
+		if c := missingCapability(caps, load.Capabilities); c != "" {
+			return fmt.Errorf("no executor offers capability %q", c)
+		}
+		if err := lim.Within(load.Ceiling); err != nil {
+			return fmt.Errorf("the task's limits exceed every executor's policy (%v)", err)
+		}
+		return nil
+	}
 	if s.cfg.Pool != nil && !pl.used[self] {
-		limitErr = lim.Within(s.cfg.Ceiling)
+		limitErr = refuse(s.LocalLoad())
 	}
 	if s.cfg.Pool != nil && !pl.used[self] && limitErr == nil {
 		anyCandidate = true
@@ -235,7 +309,7 @@ func (s *Service) pick(hash Hash, lim sandbox.Limits, pl *placement) (target pee
 		if !m.Connected || !ok || !s.fresh(l) || l.Slots == 0 || pl.used[m.ID] {
 			continue
 		}
-		if err := lim.Within(l.Ceiling); err != nil {
+		if err := refuse(l); err != nil {
 			limitErr = err
 			continue
 		}
@@ -271,9 +345,13 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 			return nil, ErrBusy
 		}
 		defer s.release()
+		sources, closeSources, err := s.openBlobs(ctx, req.Blobs, req.Providers)
+		if err != nil {
+			return nil, err
+		}
+		defer closeSources()
 		input := req.Input
 		if !req.InputBlob.IsZero() {
-			var err error
 			if input, err = s.cfg.Blobs.Store().ReadAll(req.InputBlob, int64(req.Limits.MaxInputBytes)); err != nil {
 				if errors.Is(err, blob.ErrTooLarge) {
 					return nil, fmt.Errorf("%w: %v", sandbox.ErrInputTooLarge, err)
@@ -281,7 +359,7 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 				return nil, err
 			}
 		}
-		res, err := s.cfg.Pool.Run(ctx, string(target), sandbox.Task{Module: req.Module, Entry: req.Entry, Input: input, Limits: req.Limits})
+		res, err := s.cfg.Pool.Run(ctx, string(target), sandbox.Task{Module: req.Module, Entry: req.Entry, Input: input, Blobs: sources, Limits: req.Limits})
 		if err != nil {
 			return nil, err
 		}
@@ -318,9 +396,12 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 	h := header{Version: 1, ModuleHash: hash.String(), ModuleSize: len(req.Module), Entry: req.Entry, InputSize: len(req.Input), Limits: req.Limits}
 	if !req.InputBlob.IsZero() {
 		h.InputBlob, h.InputSize = req.InputBlob.String(), 0
-		for _, p := range req.Providers {
-			h.Providers = append(h.Providers, p.String())
-		}
+	}
+	for _, id := range req.Blobs {
+		h.Blobs = append(h.Blobs, id.String())
+	}
+	for _, p := range req.Providers {
+		h.Providers = append(h.Providers, p.String())
 	}
 	if err := writeJSON(st, h); err != nil {
 		return nil, err
@@ -493,7 +574,11 @@ type MapRequest struct {
 	// Inputs, or InputBlobs naming stored blobs.
 	Inputs     [][]byte
 	InputBlobs []blob.ID
-	Limits     sandbox.Limits
+	// Blobs are attached to every task: shared data such as a model or a
+	// dictionary, fetched once per executor.
+	Blobs     []blob.ID
+	Providers []peer.ID
+	Limits    sandbox.Limits
 	// Concurrency bounds tasks in flight. Default: the free slots of all
 	// known executors.
 	Concurrency int
@@ -536,7 +621,7 @@ func (s *Service) Map(ctx context.Context, mr MapRequest) <-chan MapItem {
 	for range conc {
 		wg.Go(func() {
 			for i := range jobs {
-				req := Request{Module: mr.Module, Entry: mr.Entry, Limits: mr.Limits}
+				req := Request{Module: mr.Module, Entry: mr.Entry, Limits: mr.Limits, Blobs: mr.Blobs, Providers: mr.Providers}
 				if len(mr.Inputs) > 0 {
 					req.Input = mr.Inputs[i]
 				} else {

@@ -49,6 +49,22 @@ const res = await mesh.run({ module, inputBlob: id, outputAsBlob: true });
 for await (const item of mesh.map({ module, inputBlobs: [id1, id2, id3] })) { ... }
 ```
 
+Прикреплённые блобы задача читает кусками (`blob_read`), и исполнитель
+скачивает только прочитанное — так один большой блоб (словарь, модель) служит
+всем задачам map и скачивается один раз на узел:
+
+```js
+const { id: dict } = await mesh.putBlob({ path: 'dictionary.bin' });
+for await (const item of mesh.map({ module, inputs, blobs: [dict] })) { ... }
+```
+
+## Изображения
+
+Узлы с capability `image/1` (видно в `status()`) обрабатывают изображения
+нативными kernels внутри изолированных воркеров: модуль задачи вызывает
+`decode_input`, `fit`, `encode_output` и т. д. (см. ABI в корневом README).
+Пример `examples/thumbnails.js` делает JPEG-миниатюры пачки фото по сети.
+
 Предел размера задаёт политика узлов: `rakkan-node daemon -max-input-mb 256
 -max-output-mb 256`.
 

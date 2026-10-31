@@ -30,7 +30,21 @@ type Task struct {
 	Module []byte
 	Entry  string // defaults to DefaultEntry
 	Input  []byte
+	// Blobs are read-only data the task reads in pieces with blob_read,
+	// without copying them whole: shared data, or inputs too large for
+	// memory. At most MaxBlobs.
+	Blobs  []BlobSource
 	Limits Limits
+}
+
+// MaxBlobs bounds the blobs attached to one task.
+const MaxBlobs = 16
+
+// BlobSource is data attached to a task. ReadAt follows io.ReaderAt; an
+// error other than io.EOF aborts the task with ErrBlobUnavailable.
+type BlobSource interface {
+	Size() int64
+	ReadAt(p []byte, off int64) (int, error)
 }
 
 // Result is the outcome of a task that ran to completion.
@@ -90,6 +104,9 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 	if len(t.Input) > lim.MaxInputBytes {
 		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrInputTooLarge, len(t.Input), lim.MaxInputBytes)
 	}
+	if len(t.Blobs) > MaxBlobs {
+		return nil, fmt.Errorf("%w: %d blobs attached, limit %d", ErrLimitPolicy, len(t.Blobs), MaxBlobs)
+	}
 	entry := t.Entry
 	if entry == "" {
 		entry = DefaultEntry
@@ -111,7 +128,7 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
 	defer rt.Close(context.Background())
 
-	st := &execState{input: t.Input, lim: lim}
+	st := &execState{input: t.Input, blobs: t.Blobs, lim: lim}
 	if err := st.instantiateHost(ctx, rt); err != nil {
 		return nil, fmt.Errorf("instantiate host module: %w", err)
 	}
@@ -174,6 +191,8 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 // execState is the per-task state behind the host ABI.
 type execState struct {
 	input        []byte
+	blobs        []BlobSource
+	images       imageTable
 	lim          Limits
 	output       []byte
 	logs         []byte
@@ -216,11 +235,29 @@ func (s *execState) outOfGas() error {
 // charge bills a host call transferring n bytes, trapping when the balance
 // goes negative.
 func (s *execState) charge(n uint32) {
-	rem := int64(s.gas.Get()) - meter.HostCallCost - int64(n>>meter.BytesPerGasShift)
+	s.chargeUnits(meter.HostCallCost + int64(n>>meter.BytesPerGasShift))
+}
+
+// chargeUnits bills host work in gas units, trapping when the balance goes
+// negative. Host work is charged before it is done.
+func (s *execState) chargeUnits(units int64) {
+	rem := int64(s.gas.Get()) - units
 	s.gas.Set(api.EncodeI64(rem))
 	if rem < 0 {
 		s.trap(s.outOfGas())
 	}
+}
+
+func errBlob(index uint32, err error) error {
+	return fmt.Errorf("%w: blob %d: %v", ErrBlobUnavailable, index, err)
+}
+
+func errMemory(fn string, ptr, n uint32) error {
+	return fmt.Errorf("%w: %s ptr=%d len=%d", ErrMemoryAccess, fn, ptr, n)
+}
+
+func errOutput(limit int) error {
+	return fmt.Errorf("%w: limit %d bytes", ErrOutputLimit, limit)
 }
 
 // classify maps a runtime error to a sandbox error.
@@ -246,8 +283,49 @@ func (s *execState) instantiateHost(ctx context.Context, rt wazero.Runtime) erro
 		NewFunctionBuilder().WithFunc(s.inputRead).Export("input_read").
 		NewFunctionBuilder().WithFunc(s.outputWrite).Export("output_write").
 		NewFunctionBuilder().WithFunc(s.log).Export("log").
+		NewFunctionBuilder().WithFunc(s.blobCount).Export("blob_count").
+		NewFunctionBuilder().WithFunc(s.blobSize).Export("blob_size").
+		NewFunctionBuilder().WithFunc(s.blobRead).Export("blob_read").
 		Instantiate(ctx)
-	return err
+	if err != nil {
+		return err
+	}
+	return s.instantiateImage(ctx, rt)
+}
+
+func (s *execState) blobCount() uint32 {
+	s.charge(0)
+	return uint32(len(s.blobs))
+}
+
+func (s *execState) blobSize(index uint32) int64 {
+	s.charge(0)
+	if index >= uint32(len(s.blobs)) {
+		return -1
+	}
+	return s.blobs[index].Size()
+}
+
+func (s *execState) blobRead(_ context.Context, m api.Module, index, dst uint32, offset int64, n uint32) int32 {
+	s.charge(n)
+	if index >= uint32(len(s.blobs)) {
+		return -1
+	}
+	b := s.blobs[index]
+	if offset < 0 || offset >= b.Size() {
+		return 0
+	}
+	n = uint32(min(int64(n), b.Size()-offset))
+	// Read straight into guest memory.
+	buf, ok := m.Memory().Read(dst, n)
+	if !ok {
+		s.trap(fmt.Errorf("%w: blob_read dst=%d len=%d", ErrMemoryAccess, dst, n))
+	}
+	// n stops at the blob's end, so a short read is a failure.
+	if got, err := b.ReadAt(buf, offset); uint32(got) < n {
+		s.trap(errBlob(index, err))
+	}
+	return int32(n)
 }
 
 func (s *execState) inputLen() uint32 {

@@ -8,6 +8,9 @@
 //	POST /v1/map         {module_hash, inputs, ...}  -> NDJSON stream of results
 //	GET  /v1/status                                  -> node, load and members
 //
+// Tasks may attach up to 16 stored blobs ("blobs"), which they read in
+// pieces with blob_read; a map attaches them to every task.
+//
 // Binary fields (module, input, output) are base64 strings in JSON. Large
 // data goes through /v1/blobs instead: tasks take "input_blob" (or
 // "input_blobs" for a map) and return outputs over 1 MiB as "output_blob". Task
@@ -102,13 +105,14 @@ func (l *Limits) sandbox() sandbox.Limits {
 }
 
 type runRequest struct {
-	Module     []byte  `json:"module,omitempty"`
-	ModuleHash string  `json:"module_hash,omitempty"`
-	Entry      string  `json:"entry,omitempty"`
-	Input      []byte  `json:"input,omitempty"`
-	InputBlob  string  `json:"input_blob,omitempty"`
-	Limits     *Limits `json:"limits,omitempty"`
-	Replicas   int     `json:"replicas,omitempty"`
+	Module     []byte   `json:"module,omitempty"`
+	ModuleHash string   `json:"module_hash,omitempty"`
+	Entry      string   `json:"entry,omitempty"`
+	Input      []byte   `json:"input,omitempty"`
+	InputBlob  string   `json:"input_blob,omitempty"`
+	Blobs      []string `json:"blobs,omitempty"`
+	Limits     *Limits  `json:"limits,omitempty"`
+	Replicas   int      `json:"replicas,omitempty"`
 }
 
 type mapRequest struct {
@@ -116,6 +120,7 @@ type mapRequest struct {
 	Entry       string   `json:"entry,omitempty"`
 	Inputs      [][]byte `json:"inputs,omitempty"`
 	InputBlobs  []string `json:"input_blobs,omitempty"`
+	Blobs       []string `json:"blobs,omitempty"`
 	Limits      *Limits  `json:"limits,omitempty"`
 	Concurrency int      `json:"concurrency,omitempty"`
 	// StopOnExitCode ends the map at the first task exiting with this code.
@@ -267,6 +272,19 @@ func (s *Server) blobSize(idStr string) (blob.ID, int, error) {
 	return id, int(m.Size), nil
 }
 
+// attached resolves attached blob IDs, which must be stored locally.
+func (s *Server) attached(ids []string) ([]blob.ID, error) {
+	var out []blob.ID
+	for _, x := range ids {
+		id, _, err := s.blobSize(x)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, nil
+}
+
 // fitInput raises the default input limit to the input's size; executors
 // still enforce their own ceilings.
 func fitInput(l *Limits, lim *sandbox.Limits, size int) {
@@ -312,6 +330,10 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	fitInput(req.Limits, &er.Limits, size)
+	if er.Blobs, err = s.attached(req.Blobs); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
 	res, err := s.Service.Run(r.Context(), er)
 	if err != nil {
 		code, e := errorOf(err)
@@ -338,6 +360,10 @@ func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Inputs) > 0 && len(req.InputBlobs) > 0 {
 		badRequest(w, "give inputs or input_blobs, not both")
+		return
+	}
+	if mr.Blobs, err = s.attached(req.Blobs); err != nil {
+		badRequest(w, "%v", err)
 		return
 	}
 	for _, x := range req.InputBlobs {
@@ -378,9 +404,10 @@ func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
 }
 
 type loadJSON struct {
-	Slots  int `json:"slots"`
-	Busy   int `json:"busy"`
-	Queued int `json:"queued"`
+	Slots        int      `json:"slots"`
+	Busy         int      `json:"busy"`
+	Queued       int      `json:"queued"`
+	Capabilities []string `json:"capabilities"`
 }
 
 type memberJSON struct {
@@ -400,11 +427,11 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 		Network string       `json:"network"`
 		Load    loadJSON     `json:"load"`
 		Members []memberJSON `json:"members"`
-	}{ID: s.Node.ID().String(), Network: s.Network, Load: loadJSON{local.Slots, local.Busy, local.Queued}, Members: []memberJSON{}}
+	}{ID: s.Node.ID().String(), Network: s.Network, Load: loadJSON{local.Slots, local.Busy, local.Queued, local.Capabilities}, Members: []memberJSON{}}
 	for _, m := range s.Node.Members() {
 		mj := memberJSON{ID: m.ID.String(), Roles: m.Roles, Connected: m.Connected, Relayed: m.Relayed, RTTMs: float64(m.RTT.Microseconds()) / 1000}
 		if l, ok := loads[m.ID]; ok {
-			mj.Load = &loadJSON{l.Slots, l.Busy, l.Queued}
+			mj.Load = &loadJSON{l.Slots, l.Busy, l.Queued, l.Capabilities}
 		}
 		out.Members = append(out.Members, mj)
 	}

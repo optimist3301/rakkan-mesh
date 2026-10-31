@@ -142,6 +142,23 @@ test('large inputs and outputs travel as blobs', async () => {
   assert.equal(kept.outputBlob, res.outputBlob, 'same content, same blob ID');
 });
 
+test('image kernels make thumbnails on the network', async () => {
+  const res = await mesh.run({ module: fixture('thumbnail-png.wasm'), input: fixture('sample.png'), limits: { memoryMB: 16 } });
+  assert.equal(res.exitCode, 0);
+  // PNG IHDR: width and height at bytes 16 and 20.
+  assert.equal(res.output.readUInt32BE(16), 256);
+  assert.equal(res.output.readUInt32BE(20), 160);
+  const st = await mesh.status();
+  assert.ok(st.load.capabilities.includes('image/1'));
+});
+
+test('attached blobs are read in pieces', async () => {
+  const data = randomBytes(2 * 1024 * 1024 + 5);
+  const { id } = await mesh.putBlob(data);
+  const res = await mesh.run({ module: fixture('blob-echo.wasm'), blobs: [id] });
+  assert.deepEqual(res.output, data);
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

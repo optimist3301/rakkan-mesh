@@ -39,6 +39,7 @@ type header struct {
 	Entry      string         `json:"entry"`
 	InputSize  int            `json:"input_size"`
 	InputBlob  string         `json:"input_blob,omitempty"`
+	Blobs      []string       `json:"blobs,omitempty"` // attached, read on demand
 	Providers  []string       `json:"providers,omitempty"`
 	Limits     sandbox.Limits `json:"limits"`
 }
@@ -124,6 +125,7 @@ var errorKinds = map[string]error{
 	"out_of_gas":       sandbox.ErrOutOfGas,
 	"timeout":          sandbox.ErrTimeout,
 	"trap":             sandbox.ErrTrap,
+	"blob_unavailable": sandbox.ErrBlobUnavailable,
 	"worker_oom":       isolate.ErrWorkerOOM,
 	"worker_crashed":   isolate.ErrWorkerCrashed,
 	"worker_protocol":  isolate.ErrWorkerProtocol,

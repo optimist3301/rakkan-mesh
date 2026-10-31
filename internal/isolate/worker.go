@@ -3,6 +3,7 @@ package isolate
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
@@ -147,6 +149,63 @@ func runTask(runner *sandbox.Runner, task sandbox.Task) (*sandbox.Result, error)
 	return runner.Run(context.Background(), task)
 }
 
+// blobPipe asks the node for pieces of attached blobs during a task.
+type blobPipe struct {
+	mu sync.Mutex
+	r  *bufio.Reader
+	w  *bufio.Writer
+}
+
+type pipeBlob struct {
+	pipe  *blobPipe
+	index uint32
+	size  int64
+}
+
+func (b *pipeBlob) Size() int64 { return b.size }
+
+func (b *pipeBlob) ReadAt(p []byte, off int64) (int, error) {
+	n := 0
+	for n < len(p) {
+		if off+int64(n) >= b.size {
+			return n, io.EOF
+		}
+		want := min(len(p)-n, maxBlobRead)
+		got, err := b.pipe.read(b.index, off+int64(n), p[n:n+want])
+		n += got
+		if err != nil {
+			return n, err
+		}
+		if got == 0 {
+			return n, io.ErrUnexpectedEOF
+		}
+	}
+	return n, nil
+}
+
+func (p *blobPipe) read(index uint32, off int64, dst []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	req := []byte{msgBlobRead}
+	req = binary.BigEndian.AppendUint32(req, index)
+	req = binary.BigEndian.AppendUint64(req, uint64(off))
+	req = binary.BigEndian.AppendUint32(req, uint32(len(dst)))
+	if err := writeFrame(p.w, req); err != nil {
+		return 0, err
+	}
+	if err := p.w.Flush(); err != nil {
+		return 0, err
+	}
+	reply, err := readFrame(p.r, maxBlobRead+1)
+	if err != nil {
+		return 0, err
+	}
+	if len(reply) == 0 || reply[0] != readOK {
+		return 0, fmt.Errorf("node could not read blob %d: %s", index, reply[min(1, len(reply)):])
+	}
+	return copy(dst, reply[1:]), nil
+}
+
 func serve(r io.Reader, w io.Writer) error {
 	br := bufio.NewReader(r)
 	bw := bufio.NewWriter(w)
@@ -175,9 +234,13 @@ func serve(r io.Reader, w io.Writer) error {
 		if err != nil {
 			return err
 		}
-		task, err := decodeRequest(frame)
+		task, sizes, err := decodeRequest(frame)
 		if err != nil {
 			return err
+		}
+		pipe := &blobPipe{r: br, w: bw}
+		for i, size := range sizes {
+			task.Blobs = append(task.Blobs, &pipeBlob{pipe: pipe, index: uint32(i), size: size})
 		}
 		res, err := runTask(runner, task)
 		if err := writeFrame(bw, encodeResponse(res, err)); err != nil {

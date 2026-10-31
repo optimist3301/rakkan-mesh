@@ -44,6 +44,8 @@ export interface RunOptions {
   json?: unknown;
   /** A blob from putBlob() as the input. */
   inputBlob?: string;
+  /** Up to 16 stored blobs the task reads in pieces with blob_read. */
+  blobs?: string[];
   /** Leave a large output in the node's store instead of downloading it. */
   outputAsBlob?: boolean;
   limits?: Limits;
@@ -57,6 +59,8 @@ export interface MapOptions {
   inputs?: Bytes[];
   /** Blobs from putBlob(), instead of `inputs`. */
   inputBlobs?: string[];
+  /** Blobs attached to every task: shared data, fetched once per executor. */
+  blobs?: string[];
   outputAsBlob?: boolean;
   entry?: string;
   limits?: Limits;
@@ -74,13 +78,21 @@ export interface Member {
   connected: boolean;
   relayed: boolean;
   rtt_ms: number;
-  load?: { slots: number; busy: number; queued: number };
+  load?: Load;
+}
+
+export interface Load {
+  slots: number;
+  busy: number;
+  queued: number;
+  /** Optional host APIs, e.g. "image/1". */
+  capabilities: string[];
 }
 
 export interface Status {
   id: string;
   network: string;
-  load: { slots: number; busy: number; queued: number };
+  load: Load;
   members: Member[];
 }
 

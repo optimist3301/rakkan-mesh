@@ -12,10 +12,27 @@ import (
 )
 
 // Wire protocol between the node and a worker over the worker's stdin and
-// stdout: length-prefixed frames, one request followed by one response.
-// The node treats responses as untrusted: a worker may be compromised.
+// stdout: length-prefixed frames. For each task the node sends a request;
+// the worker may then send blob read requests, each answered by the node,
+// before it sends the result. Worker frames start with their kind. The
+// node treats everything from a worker as untrusted: it may be compromised.
 
-const protoVersion = 1
+const protoVersion = 2
+
+// Kinds of worker frames during a task.
+const (
+	msgResult   = 1
+	msgBlobRead = 2 // index u32, offset u64, length u32
+)
+
+// maxBlobRead bounds the bytes one blob read request may ask for.
+const maxBlobRead = 1 << 20
+
+// Blob read reply status.
+const (
+	readOK   = 0
+	readFail = 1
+)
 
 // maxErrorMessage bounds error text accepted from a worker.
 const maxErrorMessage = 4 << 10
@@ -60,6 +77,7 @@ var errorKinds = []error{
 	sandbox.ErrTimeout,
 	sandbox.ErrTrap,
 	context.Canceled,
+	sandbox.ErrBlobUnavailable,
 }
 
 const codeInternal = 255
@@ -158,13 +176,19 @@ func encodeRequest(t sandbox.Task) []byte {
 	e.bytes([]byte(t.Entry))
 	e.bytes(t.Module)
 	e.bytes(t.Input)
+	e.u32(uint32(len(t.Blobs)))
+	for _, b := range t.Blobs {
+		e.u64(uint64(b.Size()))
+	}
 	return e.b
 }
 
-func decodeRequest(b []byte) (sandbox.Task, error) {
+// decodeRequest parses a request; the attached blobs' sizes are returned
+// for the worker to build readers over the pipe.
+func decodeRequest(b []byte) (sandbox.Task, []int64, error) {
 	d := &decoder{b: b}
 	if v := d.u8(); d.err == nil && v != protoVersion {
-		return sandbox.Task{}, fmt.Errorf("protocol version %d, want %d", v, protoVersion)
+		return sandbox.Task{}, nil, fmt.Errorf("protocol version %d, want %d", v, protoVersion)
 	}
 	var t sandbox.Task
 	t.Limits = sandbox.Limits{
@@ -179,11 +203,20 @@ func decodeRequest(b []byte) (sandbox.Task, error) {
 	t.Entry = string(d.bytes(1 << 10))
 	t.Module = d.bytes(len(b))
 	t.Input = d.bytes(len(b))
-	return t, d.finish()
+	n := d.u32()
+	if d.err == nil && n > sandbox.MaxBlobs {
+		return t, nil, fmt.Errorf("%d blobs attached", n)
+	}
+	sizes := make([]int64, 0, n)
+	for range n {
+		sizes = append(sizes, int64(d.u64()))
+	}
+	return t, sizes, d.finish()
 }
 
 func encodeResponse(res *sandbox.Result, err error) []byte {
 	e := &encoder{}
+	e.u8(msgResult)
 	e.u8(protoVersion)
 	if err != nil {
 		msg := err.Error()

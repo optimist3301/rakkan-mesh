@@ -13,6 +13,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -179,6 +180,9 @@ func (p *Pool) Run(ctx context.Context, owner string, t sandbox.Task) (*sandbox.
 	}
 	if len(t.Input) > t.Limits.MaxInputBytes {
 		return nil, fmt.Errorf("%w: %d bytes, limit %d", sandbox.ErrInputTooLarge, len(t.Input), t.Limits.MaxInputBytes)
+	}
+	if len(t.Blobs) > sandbox.MaxBlobs {
+		return nil, fmt.Errorf("%w: %d blobs attached, limit %d", sandbox.ErrLimitPolicy, len(t.Blobs), sandbox.MaxBlobs)
 	}
 
 	select {
@@ -381,16 +385,30 @@ func (w *worker) run(ctx context.Context, t sandbox.Task) (res *sandbox.Result, 
 			return
 		}
 		limit := t.Limits.MaxOutputBytes + t.Limits.MaxLogBytes + maxErrorMessage + 64
-		frame, err := readFrame(w.stdout, limit)
-		if err != nil {
-			done <- reply{err: err}
+		for {
+			frame, err := readFrame(w.stdout, limit)
+			if err != nil {
+				done <- reply{err: err}
+				return
+			}
+			if len(frame) > 0 && frame[0] == msgBlobRead {
+				if err := serveBlobRead(w.stdin, frame, t.Blobs); err != nil {
+					done <- reply{err: err}
+					return
+				}
+				continue
+			}
+			if len(frame) == 0 || frame[0] != msgResult {
+				done <- reply{err: fmt.Errorf("%w: unexpected frame", ErrWorkerProtocol)}
+				return
+			}
+			res, taskErr, err := decodeResponse(frame[1:], t.Limits)
+			if err != nil {
+				err = fmt.Errorf("%w: %v", ErrWorkerProtocol, err)
+			}
+			done <- reply{res, taskErr, err}
 			return
 		}
-		res, taskErr, err := decodeResponse(frame, t.Limits)
-		if err != nil {
-			err = fmt.Errorf("%w: %v", ErrWorkerProtocol, err)
-		}
-		done <- reply{res, taskErr, err}
 	}()
 
 	timer := time.NewTimer(t.Limits.Timeout + workerGrace)
@@ -410,6 +428,28 @@ func (w *worker) run(ctx context.Context, t sandbox.Task) (res *sandbox.Result, 
 		w.kill()
 		return nil, false, ctx.Err()
 	}
+}
+
+// serveBlobRead answers a worker's request for a piece of an attached blob.
+// Malformed requests are protocol violations.
+func serveBlobRead(w io.Writer, frame []byte, blobs []sandbox.BlobSource) error {
+	if len(frame) != 1+4+8+4 {
+		return fmt.Errorf("%w: malformed blob read", ErrWorkerProtocol)
+	}
+	index := binary.BigEndian.Uint32(frame[1:])
+	off := int64(binary.BigEndian.Uint64(frame[5:]))
+	n := binary.BigEndian.Uint32(frame[13:])
+	if index >= uint32(len(blobs)) || off < 0 || n > maxBlobRead {
+		return fmt.Errorf("%w: blob read index=%d offset=%d len=%d", ErrWorkerProtocol, index, off, n)
+	}
+	buf := make([]byte, 1+n)
+	got, err := blobs[index].ReadAt(buf[1:], off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		msg := []byte{readFail}
+		return writeFrame(w, append(msg, err.Error()...))
+	}
+	buf[0] = readOK
+	return writeFrame(w, buf[:1+got])
 }
 
 // failure classifies an I/O or protocol error once the worker has exited.

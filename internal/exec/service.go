@@ -60,6 +60,10 @@ type Config struct {
 	Slots, MaxQueue int
 	// ModuleCacheBytes bounds modules kept for future tasks. Default 256 MiB.
 	ModuleCacheBytes int
+	// Capabilities are the optional host APIs this node offers; nil offers
+	// all the sandbox provides (sandbox.Capabilities). Tasks needing others
+	// are not scheduled here and are refused if sent anyway.
+	Capabilities []string
 	// MaxAttempts bounds executors tried per task. Default 3.
 	MaxAttempts int
 	// LoadInterval is how often load is gossiped. Default 3s.
@@ -75,6 +79,9 @@ type Load struct {
 	Ceiling sandbox.Limits `json:"ceiling"`
 	CPUs    int            `json:"cpus"`
 	Arch    string         `json:"arch"`
+	// Capabilities are the optional host APIs the node offers (see
+	// sandbox.Capabilities).
+	Capabilities []string `json:"capabilities,omitempty"`
 
 	received time.Time
 }
@@ -98,6 +105,7 @@ type Service struct {
 	loads   map[peer.ID]Load
 	pending map[peer.ID]int           // our tasks in flight at each executor
 	placed  map[peer.ID]map[Hash]bool // modules an executor is known to hold
+	caps    map[Hash][]string         // capabilities each module needs
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -127,6 +135,9 @@ func New(cfg Config) (*Service, error) {
 	if cfg.Ceiling == (sandbox.Limits{}) {
 		cfg.Ceiling = sandbox.DefaultLimits()
 	}
+	if cfg.Capabilities == nil {
+		cfg.Capabilities = sandbox.Capabilities()
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -139,6 +150,7 @@ func New(cfg Config) (*Service, error) {
 		loads:   map[peer.ID]Load{},
 		pending: map[peer.ID]int{},
 		placed:  map[peer.ID]map[Hash]bool{},
+		caps:    map[Hash][]string{},
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
@@ -174,6 +186,7 @@ func (s *Service) LocalLoad() Load {
 		return l
 	}
 	n := int(s.inflight.Load())
+	l.Capabilities = s.cfg.Capabilities
 	l.Slots = s.cfg.Slots
 	l.Busy = min(n, s.cfg.Slots)
 	l.Queued = max(n-s.cfg.Slots, 0)
@@ -270,10 +283,13 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		return
 	}
 	hash, ok := ParseHash(h.ModuleHash)
-	if h.InputBlob != "" {
-		if _, err := blob.ParseID(h.InputBlob); err != nil {
+	for _, b := range append([]string{h.InputBlob}, h.Blobs...) {
+		if _, err := blob.ParseID(b); b != "" && err != nil {
 			ok = false
 		}
+	}
+	if len(h.Blobs) > sandbox.MaxBlobs {
+		ok = false
 	}
 	switch {
 	case !ok || h.Version != 1:
@@ -310,6 +326,15 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		s.modules.Put(module)
 		s.modulesReceived.Add(1)
 	}
+	if caps, err := s.capabilities(hash, module); err != nil {
+		writeResult(st, nil, err, s.cfg.Blobs.Store())
+		return
+	} else if c := missingCapability(caps, s.cfg.Capabilities); c != "" {
+		// Misrouted, perhaps on stale load information: not the task's
+		// fault, so the requester tries elsewhere.
+		writeResult(st, nil, fmt.Errorf("%w: capability %q not offered by this node", ErrRejected, c), s.cfg.Blobs.Store())
+		return
+	}
 	input, err := readFrame(st, h.InputSize)
 	if err != nil || len(input) != h.InputSize {
 		st.Reset()
@@ -319,25 +344,36 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 
 	ctx, cancel := context.WithTimeout(s.ctx, h.Limits.Timeout+taskGrace)
 	defer cancel()
-	if h.InputBlob != "" {
-		providers := []peer.ID{c.Subject}
-		for _, p := range h.Providers {
-			if id, err := peer.Decode(p); err == nil && id != c.Subject {
-				providers = append(providers, id)
-			}
+	providers := []peer.ID{c.Subject}
+	for _, p := range h.Providers {
+		if id, err := peer.Decode(p); err == nil && id != c.Subject {
+			providers = append(providers, id)
 		}
+	}
+	if h.InputBlob != "" {
 		if input, err = s.readInputBlob(ctx, h.InputBlob, providers, h.Limits); err != nil {
 			writeResult(st, nil, err, s.cfg.Blobs.Store())
 			return
 		}
 	}
+	var attached []blob.ID
+	for _, b := range h.Blobs {
+		id, _ := blob.ParseID(b) // validated with the header
+		attached = append(attached, id)
+	}
+	sources, closeSources, err := s.openBlobs(ctx, attached, providers)
+	if err != nil {
+		writeResult(st, nil, err, s.cfg.Blobs.Store())
+		return
+	}
+	defer closeSources()
 	// The requester resets the stream to cancel; it reads to EOF only after
 	// receiving the result.
 	go func() {
 		st.Read(make([]byte, 1))
 		cancel()
 	}()
-	res, err := s.cfg.Pool.Run(ctx, c.Subject.String(), sandbox.Task{Module: module, Entry: h.Entry, Input: input, Limits: h.Limits})
+	res, err := s.cfg.Pool.Run(ctx, c.Subject.String(), sandbox.Task{Module: module, Entry: h.Entry, Input: input, Blobs: sources, Limits: h.Limits})
 	if ctx.Err() != nil {
 		// Cancelled by the requester, or this node is shutting down: no
 		// verdict on the task. Resetting tells the requester to go elsewhere.
@@ -348,6 +384,27 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		s.tamper(res)
 	}
 	writeResult(st, res, err, s.cfg.Blobs.Store())
+}
+
+// openBlobs opens a task's attached blobs for reading on demand.
+func (s *Service) openBlobs(ctx context.Context, ids []blob.ID, providers []peer.ID) ([]sandbox.BlobSource, func(), error) {
+	var opened []blob.Source
+	closeAll := func() {
+		for _, o := range opened {
+			o.Close()
+		}
+	}
+	var sources []sandbox.BlobSource
+	for _, id := range ids {
+		src, err := s.cfg.Blobs.OpenRemote(ctx, id, providers)
+		if err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("%w: %v", sandbox.ErrBlobUnavailable, err)
+		}
+		opened = append(opened, src)
+		sources = append(sources, src)
+	}
+	return sources, closeAll, nil
 }
 
 // readInputBlob fetches a task's input blob and reads it whole: the worker

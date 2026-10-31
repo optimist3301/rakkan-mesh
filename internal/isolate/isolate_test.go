@@ -122,6 +122,11 @@ func misbehave(mode string) {
 		os.Exit(1)
 	}
 	switch mode {
+	case "badread":
+		// Ask for a blob that was never attached.
+		writeFrame(out, []byte{msgBlobRead, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16})
+		out.Flush()
+		time.Sleep(time.Hour)
 	case "crash":
 		os.Exit(3)
 	case "hang":
@@ -434,9 +439,10 @@ func TestPoolMisbehavingWorkers(t *testing.T) {
 	lim.Timeout = 100 * time.Millisecond
 
 	cases := map[string]error{
-		"crash": ErrWorkerCrashed,
-		"hang":  sandbox.ErrTimeout,
-		"lie":   ErrWorkerProtocol,
+		"crash":   ErrWorkerCrashed,
+		"hang":    sandbox.ErrTimeout,
+		"lie":     ErrWorkerProtocol,
+		"badread": ErrWorkerProtocol,
 	}
 	for mode, want := range cases {
 		t.Run(mode, func(t *testing.T) {
@@ -552,5 +558,36 @@ func TestAddressSpaceLimit(t *testing.T) {
 	iso.MemoryBytes = 128 << 20
 	if got := runProbe(t, iso, "alloc"); !strings.HasPrefix(got, "exited") {
 		t.Fatalf("1 GiB allocation under a 128 MiB limit: %s", got)
+	}
+}
+
+type memBlob struct {
+	data []byte
+	fail bool
+}
+
+func (m memBlob) Size() int64 { return int64(len(m.data)) }
+
+func (m memBlob) ReadAt(p []byte, off int64) (int, error) {
+	if m.fail {
+		return 0, errors.New("provider gone")
+	}
+	return bytes.NewReader(m.data).ReadAt(p, off)
+}
+
+func TestPoolBlobReads(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation(), TasksPerWorker: 10})
+	data := bytes.Repeat([]byte("rakkan blob "), 250_000) // 3 MB: several pipe round trips
+	res, err := p.Run(t.Context(), "alice", sandbox.Task{Module: w.BlobEcho(), Blobs: []sandbox.BlobSource{memBlob{data: data}}, Limits: testLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(res.Output, data) {
+		t.Fatalf("read back %d of %d bytes", len(res.Output), len(data))
+	}
+	// A failing source on the node's side reaches the task as such.
+	_, err = p.Run(t.Context(), "alice", sandbox.Task{Module: w.BlobEcho(), Blobs: []sandbox.BlobSource{memBlob{data: data, fail: true}}, Limits: testLimits()})
+	if !errors.Is(err, sandbox.ErrBlobUnavailable) {
+		t.Fatalf("got %v, want ErrBlobUnavailable", err)
 	}
 }
