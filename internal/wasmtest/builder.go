@@ -234,3 +234,31 @@ func sleb(v int64) []byte {
 		}
 	}
 }
+
+// I64Const encodes an i64.const instruction.
+func I64Const(v int64) []byte {
+	return append([]byte{0x42}, sleb(v)...)
+}
+
+// F32Const encodes an f32.const instruction with the given bit pattern.
+func F32Const(bits uint32) []byte {
+	return []byte{0x43, byte(bits), byte(bits >> 8), byte(bits >> 16), byte(bits >> 24)}
+}
+
+// F64Const encodes an f64.const instruction with the given bit pattern.
+func F64Const(bits uint64) []byte {
+	out := []byte{0x44}
+	for i := range 8 {
+		out = append(out, byte(bits>>(8*i)))
+	}
+	return out
+}
+
+// V128Const encodes a v128.const instruction from four 32-bit lanes.
+func V128Const(lanes [4]uint32) []byte {
+	out := []byte{0xfd, 0x0c}
+	for _, l := range lanes {
+		out = append(out, byte(l), byte(l>>8), byte(l>>16), byte(l>>24))
+	}
+	return out
+}

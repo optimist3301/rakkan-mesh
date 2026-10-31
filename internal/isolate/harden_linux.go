@@ -86,6 +86,11 @@ func harden(iso Isolation, stage int) error {
 		if err := setRlimits(); err != nil {
 			return err
 		}
+		// no_new_privs is per thread and seccomp checks it on the calling
+		// thread, so both must run on the same one; TSYNC then propagates
+		// the filter and the flag to every other thread.
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 			return fmt.Errorf("no_new_privs: %w", err)
 		}

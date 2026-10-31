@@ -18,6 +18,15 @@
 // negative balance after the guest returns as exhaustion. The outcome is a
 // pure function of the module and input, so replicas agree on it.
 //
+// Floating-point results are NaN-canonicalized. WebAssembly leaves the sign
+// and payload of a NaN produced by arithmetic nondeterministic, and hardware
+// differs (x86 produces 0xffc00000 for 0/0, ARM 0x7fc00000), so the same
+// task could produce different bytes on different nodes. After every
+// operator that can produce such a NaN, the result x is replaced by
+// isnan(x) ? canonical : x, lane-wise for SIMD, with the canonical quiet
+// NaNs 0x7fc00000 and 0x7ff8000000000000. Bitwise operators (abs, neg,
+// copysign, loads, stores, reinterpretations) are already deterministic.
+//
 // Custom sections (names, debug info) carry no semantics and are dropped.
 //
 // The interrupt flag exists because the gas counter cannot carry the signal:
@@ -662,7 +671,8 @@ func (m *module) rewriteBody(body []byte, params int, gas uint32) ([]byte, error
 
 	var code []instr
 	needScratch := false
-	depth := 1 // the function body is a block
+	var needCanon [5]bool // by canonKind
+	depth := 1            // the function body is a block
 	for !r.done() {
 		in, err := decode(r)
 		if err != nil {
@@ -683,16 +693,42 @@ func (m *module) rewriteBody(body []byte, params int, gas uint32) ([]byte, error
 			return nil, fmt.Errorf("local %d out of range", in.local)
 		}
 		needScratch = needScratch || in.dyn != nil
+		needCanon[in.canon] = true
 		code = append(code, in)
 	}
 
-	// Locals: append one i32 scratch local for dynamic charges.
-	var out []byte
+	// Locals: append scratch locals after the declared ones: i32 for
+	// dynamic charges, and one per value type that canonicalization needs.
+	var extra []byte // value type per scratch local
 	scratch := uint32(totalLocals)
 	if needScratch {
-		out = appendUleb(out, uint64(groups)+1)
+		extra = append(extra, 0x7f)
+	}
+	var canonLocal [5]uint32
+	for _, c := range []struct {
+		kinds []canonKind
+		vt    byte
+	}{{[]canonKind{canonF32}, 0x7d}, {[]canonKind{canonF64}, 0x7c}, {[]canonKind{canonF32x4, canonF64x2}, 0x7b}} {
+		used := false
+		for _, k := range c.kinds {
+			used = used || needCanon[k]
+		}
+		if !used {
+			continue
+		}
+		idx := uint32(totalLocals) + uint32(len(extra))
+		for _, k := range c.kinds {
+			canonLocal[k] = idx
+		}
+		extra = append(extra, c.vt)
+	}
+	var out []byte
+	if len(extra) > 0 {
+		out = appendUleb(out, uint64(groups)+uint64(len(extra)))
 		out = append(out, body[groupsStart:localsEnd]...)
-		out = append(out, 0x01, 0x7f)
+		for _, vt := range extra {
+			out = append(out, 0x01, vt)
+		}
 	} else {
 		out = append(out, body[:localsEnd]...)
 	}
@@ -718,6 +754,9 @@ func (m *module) rewriteBody(body []byte, params int, gas uint32) ([]byte, error
 			out = emitDynCharge(out, gas, scratch, in.dyn)
 		}
 		out = append(out, body[in.start:in.end]...)
+		if in.canon != canonNone {
+			out = emitCanon(out, in.canon, canonLocal[in.canon])
+		}
 		if in.split {
 			segStart, check = true, in.loop
 		}
@@ -740,6 +779,50 @@ func emitCheck(out []byte, gas uint32) []byte {
 	out = append(out, opI64Const, 0x00, opI64LtS)
 	out = appendUleb(append(out, opGlobalGet), uint64(gas+1))
 	return append(out, opI32Or, opIf, blockEmpty, opUnreachable, opEnd)
+}
+
+// Canonical quiet NaNs, little-endian.
+var (
+	canonNaN32 = []byte{0x00, 0x00, 0xc0, 0x7f}
+	canonNaN64 = []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf8, 0x7f}
+)
+
+// emitCanon replaces the float result on top of the stack with the
+// canonical NaN if it is a NaN, using local t as scratch.
+func emitCanon(out []byte, kind canonKind, t uint32) []byte {
+	set := appendUleb([]byte{opLocalSet}, uint64(t))
+	get := appendUleb([]byte{opLocalGet}, uint64(t))
+	switch kind {
+	case canonF32, canonF64:
+		// select(canonical, x, x != x)
+		konst, ne, nan := byte(0x43), byte(0x5c), canonNaN32
+		if kind == canonF64 {
+			konst, ne, nan = 0x44, 0x62, canonNaN64
+		}
+		out = append(out, set...)
+		out = append(append(out, konst), nan...)
+		out = append(out, get...)
+		out = append(out, get...)
+		out = append(out, get...)
+		return append(out, ne, opSelect)
+	default:
+		// bitselect(x, canonical, x == x): lanes equal to themselves are not NaN.
+		lane, eq := canonNaN32, byte(0x41)
+		if kind == canonF64x2 {
+			lane, eq = canonNaN64, 0x47
+		}
+		var splat []byte
+		for len(splat) < 16 {
+			splat = append(splat, lane...)
+		}
+		out = append(out, set...)
+		out = append(out, get...)
+		out = append(append(out, prefixSIMD, 0x0c), splat...)
+		out = append(out, get...)
+		out = append(out, get...)
+		out = append(out, prefixSIMD, eq)
+		return append(out, prefixSIMD, 0x52)
+	}
 }
 
 // emitDynCharge charges for the i32 operand on top of the stack, leaving it

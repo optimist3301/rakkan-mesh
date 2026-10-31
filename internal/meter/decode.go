@@ -19,6 +19,7 @@ const (
 	opLocalGet    = 0x20
 	opLocalSet    = 0x21
 	opLocalTee    = 0x22
+	opSelect      = 0x1b
 	opGlobalGet   = 0x23
 	opGlobalSet   = 0x24
 	opMemoryGrow  = 0x40
@@ -35,6 +36,44 @@ const (
 	blockEmpty    = 0x40
 )
 
+// canonKind selects how a result is NaN-canonicalized (see meter.go).
+type canonKind uint8
+
+const (
+	canonNone canonKind = iota
+	canonF32
+	canonF64
+	canonF32x4
+	canonF64x2
+)
+
+// scalarCanon lists scalar operators whose NaN results have nondeterministic
+// sign and payload: arithmetic, rounding and precision conversions. abs, neg,
+// copysign and reinterpretations operate on bits and are deterministic.
+var scalarCanon = map[byte]canonKind{
+	0x8d: canonF32, 0x8e: canonF32, 0x8f: canonF32, 0x90: canonF32, // ceil floor trunc nearest
+	0x91: canonF32, 0x92: canonF32, 0x93: canonF32, 0x94: canonF32, // sqrt add sub mul
+	0x95: canonF32, 0x96: canonF32, 0x97: canonF32, // div min max
+	0x9b: canonF64, 0x9c: canonF64, 0x9d: canonF64, 0x9e: canonF64,
+	0x9f: canonF64, 0xa0: canonF64, 0xa1: canonF64, 0xa2: canonF64,
+	0xa3: canonF64, 0xa4: canonF64, 0xa5: canonF64,
+	0xb6: canonF32, // f32.demote_f64
+	0xbb: canonF64, // f64.promote_f32
+}
+
+// simdCanon is the same for SIMD operators (after the 0xfd prefix). pmin
+// and pmax return one of their operands unchanged and need nothing.
+var simdCanon = map[uint32]canonKind{
+	0x67: canonF32x4, 0x68: canonF32x4, 0x69: canonF32x4, 0x6a: canonF32x4, // ceil floor trunc nearest
+	0xe3: canonF32x4, 0xe4: canonF32x4, 0xe5: canonF32x4, 0xe6: canonF32x4, // sqrt add sub mul
+	0xe7: canonF32x4, 0xe8: canonF32x4, 0xe9: canonF32x4, // div min max
+	0x74: canonF64x2, 0x75: canonF64x2, 0x7a: canonF64x2, 0x94: canonF64x2,
+	0xef: canonF64x2, 0xf0: canonF64x2, 0xf1: canonF64x2, 0xf2: canonF64x2,
+	0xf3: canonF64x2, 0xf4: canonF64x2, 0xf5: canonF64x2,
+	0x5e: canonF32x4, // f32x4.demote_f64x2_zero
+	0x5f: canonF64x2, // f64x2.promote_low_f32x4
+}
+
 // dynCost describes a charge proportional to the i32 operand on top of the
 // stack: (n * mul) >> shift.
 type dynCost struct {
@@ -49,6 +88,7 @@ type instr struct {
 	split      bool     // a new metering segment starts after this instruction
 	loop       bool     // the segment after this instruction is a loop header
 	dyn        *dynCost // charged before the instruction executes
+	canon      canonKind
 
 	// Index immediates the rewriter must bounds-check against the original
 	// module, because metering adds a global and a local at the next index.
@@ -127,6 +167,7 @@ func decode(r *reader) (instr, error) {
 	case op == 0x44:
 		err = r.skip(8)
 	case op >= 0x45 && op <= 0xc4: // numeric, no immediates
+		in.canon = scalarCanon[op]
 	case op == 0xd0: // ref.null t
 		err = valType(r)
 	case op == 0xd2: // ref.func
@@ -134,7 +175,7 @@ func decode(r *reader) (instr, error) {
 	case op == prefixFC:
 		err = decodeFC(r, &in)
 	case op == prefixSIMD:
-		err = decodeSIMD(r)
+		err = decodeSIMD(r, &in)
 	default:
 		err = fmt.Errorf("unsupported opcode 0x%02x", op)
 	}
@@ -182,11 +223,12 @@ func decodeFC(r *reader, in *instr) error {
 	return err
 }
 
-func decodeSIMD(r *reader) error {
+func decodeSIMD(r *reader, in *instr) error {
 	sub, err := r.u32()
 	if err != nil {
 		return err
 	}
+	in.canon = simdCanon[sub]
 	switch {
 	case sub <= 11 || sub == 92 || sub == 93: // loads, stores, load_zero
 		return skipMemarg(r)
