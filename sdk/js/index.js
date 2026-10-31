@@ -230,7 +230,7 @@ export class Mesh {
               done: true,
               stats: {
                 promptTokens: s.prompt_tokens, tokens: s.tokens, elapsedMs: s.elapsed_ms,
-                tokensPerSecond: s.tokens_per_s, stages: s.stages, failovers: s.failovers,
+                tokensPerSecond: s.tokens_per_s, stages: s.stages, failovers: s.failovers, caught: s.caught ?? 0,
               },
             };
             return;
@@ -247,6 +247,20 @@ export class Mesh {
   /** The node's identity, load and view of the network. */
   async status() {
     return this.#call('GET', '/v1/status');
+  }
+
+  /**
+   * The peers this node has dealt with: the work each did for it and it for
+   * them, results verified, failures, cheating caught, and reputation.
+   */
+  async trust() {
+    const { peers } = await this.#call('GET', '/v1/trust');
+    return peers.map((p) => ({
+      id: p.id, member: p.member, score: p.score,
+      served: p.served, consumed: p.consumed,
+      verified: p.verified, failed: p.failed, cheated: p.cheated,
+      lastCheated: p.last_cheated ? new Date(p.last_cheated) : undefined,
+    }));
   }
 
   async #moduleHash(module) {
@@ -319,6 +333,7 @@ function toResult(r) {
     node: r.node,
     attempts: r.attempts,
     replicas: (r.replicas ?? []).map((x) => ({ node: x.node, agreed: x.agreed, error: x.error })),
+    checked: !!r.checked,
   };
 }
 

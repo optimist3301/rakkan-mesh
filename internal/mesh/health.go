@@ -22,8 +22,10 @@ const maxPingFailures = 3
 
 // Member describes a peer that has authenticated at least once.
 type Member struct {
-	ID        peer.ID
-	Roles     []string
+	ID    peer.ID
+	Roles []string
+	// Guest is set for a peer admitted by proof of work, not certificate.
+	Guest     bool
 	Connected bool
 	// Relayed is set when every connection to the member goes through a
 	// relay; Addr is the remote address of the preferred connection.
@@ -41,7 +43,7 @@ func (n *Node) Members() []Member {
 		if st.cert == nil {
 			continue
 		}
-		out = append(out, Member{ID: p, Roles: st.cert.Roles, Connected: st.authed, RTT: st.rtt, LastSeen: st.lastSeen})
+		out = append(out, Member{ID: p, Roles: st.cert.Roles, Guest: st.signed == nil, Connected: st.authed, RTT: st.rtt, LastSeen: st.lastSeen})
 	}
 	n.mu.Unlock()
 	for i := range out {
@@ -94,9 +96,9 @@ func (n *Node) healthLoop() {
 
 func (n *Node) checkMember(p peer.ID) {
 	n.mu.Lock()
-	signed := n.peers[p].signed
+	err := n.recheck(n.peers[p], p)
 	n.mu.Unlock()
-	if _, err := n.cfg.Network.Verify(signed, time.Now(), n.revs.Revoked); err != nil {
+	if err != nil {
 		n.deny(p, denyAfterFailure, err) // expired or revoked since admission
 		return
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/meter"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
@@ -52,8 +53,11 @@ type Result struct {
 	Node       peer.ID
 	Attempts   int
 	// Replicas lists every replica's node and whether it agreed with the
-	// accepted outcome, when the task was replicated.
+	// accepted outcome, when the task was replicated or its result checked.
 	Replicas []Replica
+	// Checked is set when an untrusted guest's result was confirmed by an
+	// independent run (see Config.Trust).
+	Checked bool
 }
 
 type Replica struct {
@@ -75,11 +79,7 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	if req.Replicas > 1 {
 		return s.runReplicated(ctx, req)
 	}
-	res, err := s.runOnce(ctx, req, newPlacement())
-	if err != nil {
-		return nil, err
-	}
-	return res, nil
+	return s.runChecked(ctx, req, newPlacement())
 }
 
 // prepareInput turns a large inline input into a blob, so retries and
@@ -159,6 +159,9 @@ func missingCapability(need, have []string) string {
 type placement struct {
 	mu   sync.Mutex
 	used map[peer.ID]bool
+	// trusted limits executors to this node and members, while any are
+	// able to run the task.
+	trusted bool
 }
 
 func newPlacement() *placement { return &placement{used: map[peer.ID]bool{}} }
@@ -208,6 +211,9 @@ func (s *Service) runOnce(ctx context.Context, req Request, pl *placement) (*Res
 			return nil, err
 		}
 		s.log.Info("executor failed, retrying elsewhere", "peer", target.ShortString(), "err", err)
+		if s.cfg.Trust != nil && !errors.Is(err, ErrRejected) {
+			s.cfg.Trust.Failed(target)
+		}
 		lastErr = err
 		attempt++
 	}
@@ -303,6 +309,26 @@ func (s *Service) pick(hash Hash, lim sandbox.Limits, caps []string, pl *placeme
 		}
 	}
 	members := s.node.Members()
+	if tr := s.cfg.Trust; tr != nil {
+		// Leave out peers caught cheating, and guests when a trusted
+		// executor is wanted and one is able to run the task.
+		keep := members[:0:0]
+		trustedAble := false
+		for _, m := range members {
+			if tr.Suspect(m.ID) {
+				continue
+			}
+			keep = append(keep, m)
+			if !m.Guest {
+				trustedAble = trustedAble || s.able(m.ID, caps, lim)
+			}
+		}
+		if pl.trusted && (trustedAble || s.cfg.Pool != nil && limitErr == nil && !pl.used[self]) {
+			members = slices.DeleteFunc(keep, func(m mesh.Member) bool { return m.Guest })
+		} else {
+			members = keep
+		}
+	}
 	s.mu.Lock()
 	for _, m := range members {
 		l, ok := s.loads[m.ID]
@@ -321,6 +347,11 @@ func (s *Service) pick(hash Hash, lim sandbox.Limits, caps []string, pl *placeme
 		score := float64(free)
 		if s.placed[m.ID][hash] {
 			score += 0.5
+		}
+		if m.Guest && s.cfg.Trust != nil {
+			// Prefer members, then reputable guests, at equal capacity:
+			// their results need fewer checks.
+			score -= 0.5 * (1 - s.cfg.Trust.Score(m.ID))
 		}
 		cands = append(cands, cand{id: m.ID, score: score, rtt: m.RTT})
 	}
@@ -441,10 +472,16 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 		return nil, err
 	}
 	if rh.ErrorKind != "" {
-		return nil, &RemoteError{Kind: rh.ErrorKind, Msg: fmt.Sprintf("%s (on %s)", rh.Error, target.ShortString())}
+		if s.cfg.Trust != nil && rh.ErrorKind == ErrorKind(sandbox.ErrOutOfGas) {
+			s.cfg.Trust.Consumed(target, req.Limits.MaxGas)
+		}
+		return nil, &RemoteError{Kind: rh.ErrorKind, Msg: fmt.Sprintf("%s (on %s)", rh.Error, target.ShortString()), Node: target}
 	}
 	if rh.GasUsed < 0 || rh.GasUsed > req.Limits.MaxGas {
 		return nil, fmt.Errorf("%w: reported gas %d outside budget", ErrExecutorInternal, rh.GasUsed)
+	}
+	if s.cfg.Trust != nil {
+		s.cfg.Trust.Consumed(target, rh.GasUsed)
 	}
 	res := &Result{Node: target, Result: sandbox.Result{
 		ExitCode: rh.ExitCode, Output: output, Logs: logs, LogTruncated: rh.LogTruncated,
@@ -518,7 +555,7 @@ func (s *Service) runReplicated(ctx context.Context, req Request) (*Result, erro
 	counts := map[outcome]int{}
 	ran := 0
 	for _, r := range results {
-		if r.err != nil && (errors.Is(r.err, ErrNoCapacity) || retryable(r.err) || ctx.Err() != nil) {
+		if !verdict(ctx, r.err) {
 			continue
 		}
 		counts[outcomeOf(r.res, r.err)]++
@@ -536,11 +573,7 @@ func (s *Service) runReplicated(ctx context.Context, req Request) (*Result, erro
 	var reps []Replica
 	for _, r := range results {
 		agreed := outcomeOf(r.res, r.err) == winner
-		node := peer.ID("")
-		if r.res != nil {
-			node = r.res.Node
-		}
-		reps = append(reps, Replica{Node: node, Agreed: agreed, Err: r.err})
+		reps = append(reps, Replica{Node: executorOf(r.res, r.err), Agreed: agreed, Err: r.err})
 		if agreed && accepted == nil && acceptedErr == nil {
 			accepted, acceptedErr = r.res, r.err
 		}
@@ -559,12 +592,126 @@ func (s *Service) runReplicated(ctx context.Context, req Request) (*Result, erro
 	if best < req.Replicas {
 		s.log.Warn("replica disagreed with the majority", "replicas", req.Replicas, "agreeing", best)
 	}
+	if s.cfg.Trust != nil {
+		for i, r := range results {
+			if !verdict(ctx, r.err) {
+				continue
+			}
+			s.judge(executorOf(r.res, r.err), reps[i].Agreed)
+		}
+	}
 	if acceptedErr != nil {
 		return nil, acceptedErr // the task itself fails, consistently
 	}
 	out := *accepted
 	out.Replicas = reps
 	return &out, nil
+}
+
+// verdict reports whether a run's outcome is a verdict on the task: it
+// succeeded or failed deterministically, rather than finding no executor or
+// losing it.
+func verdict(ctx context.Context, err error) bool {
+	return err == nil || !(errors.Is(err, ErrNoCapacity) || retryable(err) || ctx.Err() != nil)
+}
+
+// executorOf returns the node that produced a result or a task error.
+func executorOf(res *Result, err error) peer.ID {
+	if res != nil {
+		return res.Node
+	}
+	var re *RemoteError
+	if errors.As(err, &re) {
+		return re.Node
+	}
+	return ""
+}
+
+// judge records whether an executor's outcome agreed with the accepted one.
+func (s *Service) judge(p peer.ID, agreed bool) {
+	switch {
+	case p == "":
+	case agreed:
+		s.cfg.Trust.Verified(p)
+	default:
+		s.cfg.Trust.Cheated(p, "task outcome disagreed with independent runs")
+	}
+}
+
+// able reports whether a member's gossiped load says it can run a task.
+func (s *Service) able(p peer.ID, caps []string, lim sandbox.Limits) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.loads[p]
+	return ok && s.fresh(l) && l.Slots > 0 && missingCapability(caps, l.Capabilities) == "" && lim.Within(l.Ceiling) == nil
+}
+
+// runChecked runs a task once and, when an untrusted guest produced the
+// outcome, has it checked (see trust.Service.ShouldVerify): the task runs
+// again elsewhere, on a trusted executor where possible, and a third run
+// breaks a tie between untrusted ones. Whoever disagrees with the accepted
+// outcome is reported as cheating. Determinism makes this exact: honest
+// executors agree byte for byte, gas included.
+func (s *Service) runChecked(ctx context.Context, req Request, pl *placement) (*Result, error) {
+	res, err := s.runOnce(ctx, req, pl)
+	first := executorOf(res, err)
+	tr := s.cfg.Trust
+	if tr == nil || first == "" || !verdict(ctx, err) || !tr.ShouldVerify(first) {
+		return res, err
+	}
+	type run struct {
+		node peer.ID
+		res  *Result
+		err  error
+	}
+	runs := []run{{first, res, err}}
+	pl.mu.Lock()
+	pl.trusted = true
+	pl.mu.Unlock()
+	for len(runs) < 3 {
+		r, e := s.runOnce(ctx, req, pl)
+		if !verdict(ctx, e) {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			// Nobody else could run it: the result stands unchecked.
+			s.log.Warn("could not check a guest's result", "peer", first.ShortString(), "err", e)
+			return res, err
+		}
+		runs = append(runs, run{executorOf(r, e), r, e})
+		// Agreement, or a trusted dissent, settles it.
+		a, b := runs[0], runs[len(runs)-1]
+		if outcomeOf(a.res, a.err) == outcomeOf(b.res, b.err) || tr.Trusted(b.node) {
+			break
+		}
+	}
+	counts := map[outcome]int{}
+	for _, r := range runs {
+		counts[outcomeOf(r.res, r.err)]++
+	}
+	last := runs[len(runs)-1]
+	accepted := outcomeOf(last.res, last.err)
+	if !tr.Trusted(last.node) && counts[accepted] < 2 {
+		// Three untrusted runs, three outcomes.
+		return nil, fmt.Errorf("%w: three executors returned different results", ErrNoConsensus)
+	}
+	var reps []Replica
+	var out *Result
+	var outErr error
+	for _, r := range runs {
+		agreed := outcomeOf(r.res, r.err) == accepted
+		s.judge(r.node, agreed)
+		reps = append(reps, Replica{Node: r.node, Agreed: agreed, Err: r.err})
+		if agreed && out == nil && outErr == nil {
+			out, outErr = r.res, r.err
+		}
+	}
+	if outErr != nil {
+		return nil, outErr
+	}
+	o := *out
+	o.Replicas, o.Checked, o.Attempts = reps, true, len(runs)
+	return &o, nil
 }
 
 // MapRequest runs one module over many inputs.
@@ -630,7 +777,7 @@ func (s *Service) Map(ctx context.Context, mr MapRequest) <-chan MapItem {
 				var res *Result
 				prepared, unpin, err := s.prepareInput(req)
 				if err == nil {
-					res, err = s.runOnce(ctx, prepared, newPlacement())
+					res, err = s.runChecked(ctx, prepared, newPlacement())
 					unpin()
 				}
 				if ctx.Err() != nil {

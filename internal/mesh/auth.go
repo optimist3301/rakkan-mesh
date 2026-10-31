@@ -31,8 +31,11 @@ const denyAfterFailure = time.Minute
 var errNotMember = errors.New("peer is not an authenticated member")
 
 type hello struct {
-	Cert *membership.SignedCert `json:"cert"`
-	CRL  *membership.SignedCRL  `json:"crl,omitempty"`
+	// Cert is a member's certificate; a guest sends Proof instead.
+	Cert   *membership.SignedCert   `json:"cert,omitempty"`
+	Proof  *membership.Proof        `json:"proof,omitempty"`
+	CRL    *membership.SignedCRL    `json:"crl,omitempty"`
+	Policy *membership.SignedPolicy `json:"policy,omitempty"`
 	// Observed is the address the sender sees the receiver connect from,
 	// on direct connections. A node behind NAT learns its external address
 	// this way, from members only (see advertisedAddrs).
@@ -43,8 +46,9 @@ type hello struct {
 type peerState struct {
 	cert   *membership.Cert // set once authenticated, kept across disconnects
 	signed *membership.SignedCert
-	authed bool          // authenticated on a live connection
-	ready  chan struct{} // closed when authed becomes true
+	proof  *membership.Proof // a guest's, instead of signed
+	authed bool              // authenticated on a live connection
+	ready  chan struct{}     // closed when authed becomes true
 
 	rtt      time.Duration
 	lastSeen time.Time
@@ -69,6 +73,15 @@ func (n *Node) isMember(p peer.ID) bool {
 	defer n.mu.Unlock()
 	st, ok := n.peers[p]
 	return ok && st.authed
+}
+
+// isCertified reports whether p is an authenticated member holding a
+// certificate, as opposed to a guest.
+func (n *Node) isCertified(p peer.ID) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	st, ok := n.peers[p]
+	return ok && st.authed && st.signed != nil
 }
 
 func (n *Node) memberCert(p peer.ID) *membership.Cert {
@@ -115,6 +128,17 @@ func (n *Node) deny(p peer.ID, d time.Duration, reason error) {
 	n.mu.Unlock()
 	n.log.Warn("denying peer", "peer", p.ShortString(), "for", d, "reason", reason)
 	n.host.Network().ClosePeer(p)
+}
+
+// Ban refuses p for d and drops its connections; a member is redialled
+// only after d.
+func (n *Node) Ban(p peer.ID, d time.Duration, reason error) {
+	n.mu.Lock()
+	if st, ok := n.peers[p]; ok {
+		st.nextDial = time.Now().Add(d)
+	}
+	n.mu.Unlock()
+	n.deny(p, d, reason)
 }
 
 func (n *Node) onConnected(c network.Conn) {
@@ -204,7 +228,14 @@ func (n *Node) handleAuth(s network.Stream) {
 
 func (n *Node) writeHello(s network.Stream) error {
 	crl, _ := n.revs.Current()
-	h := hello{Cert: n.cfg.Cert, CRL: crl}
+	policy, _ := n.policies.Current()
+	h := hello{Cert: n.cfg.Cert, CRL: crl, Policy: policy}
+	if h.Cert == nil {
+		n.mu.Lock()
+		pr := n.proof
+		n.mu.Unlock()
+		h.Proof = &pr
+	}
 	if !isRelayed(s.Conn()) {
 		h.Observed = s.Conn().RemoteMultiaddr().String()
 	}
@@ -243,13 +274,27 @@ func (n *Node) readHello(r network.Stream, p peer.ID) bool {
 		n.deny(p, denyAfterFailure, err)
 		return false
 	}
-	// A newer revocation list may revoke the peer itself, so apply it first.
+	// A newer revocation list may revoke the peer itself, and a newer
+	// policy may admit or exclude guests, so apply them first. Only the
+	// root's signatures make them count.
 	if h.CRL != nil {
 		n.applyCRL(h.CRL)
 	}
-	cert, err := n.cfg.Network.Verify(h.Cert, time.Now(), n.revs.Revoked)
-	if err == nil && cert.Subject != p {
-		err = fmt.Errorf("certificate is for %s", cert.Subject)
+	if h.Policy != nil {
+		n.applyPolicy(h.Policy)
+	}
+	var cert *membership.Cert
+	var err error
+	switch {
+	case h.Cert != nil:
+		cert, err = n.cfg.Network.Verify(h.Cert, time.Now(), n.revs.Revoked)
+		if err == nil && cert.Subject != p {
+			err = fmt.Errorf("certificate is for %s", cert.Subject)
+		}
+	case h.Proof != nil:
+		cert, err = n.checkGuest(p, *h.Proof)
+	default:
+		err = errors.New("neither a certificate nor a proof of work")
 	}
 	if err != nil {
 		d := denyAfterFailure
@@ -259,9 +304,65 @@ func (n *Node) readHello(r network.Stream, p peer.ID) bool {
 		n.deny(p, d, err)
 		return false
 	}
-	n.admit(p, cert, h.Cert)
+	if h.Cert == nil {
+		n.admitGuest(p, cert, *h.Proof)
+		return true
+	}
+	n.admit(p, cert, h.Cert, nil)
+	// A guest could report any address; members only.
 	n.observe(p, h.Observed)
 	return true
+}
+
+// errClosed refuses guests while the network's policy does not admit them.
+var errClosed = errors.New("the network does not admit guests")
+
+// checkGuest checks a guest's proof of work against the current policy.
+// A guest's certificate is synthesized: it carries the guest role and no
+// issuer or validity, and lasts as long as the policy admits the proof.
+func (n *Node) checkGuest(p peer.ID, pr membership.Proof) (*membership.Cert, error) {
+	_, pol := n.policies.Current()
+	switch {
+	case !pol.Open:
+		return nil, errClosed
+	case n.revs.Revoked(p.String()):
+		return nil, fmt.Errorf("%w: peer %s", membership.ErrRevoked, p)
+	}
+	if w := n.cfg.Network.Work(p, pr); w < pol.PowBits {
+		return nil, fmt.Errorf("proof of work of %d bits, the network wants %d", w, pol.PowBits)
+	}
+	return &membership.Cert{Version: 1, Network: n.cfg.Network.ID, Subject: p, Roles: []string{membership.RoleGuest}}, nil
+}
+
+// admitGuest admits a guest unless MaxGuests are already connected.
+func (n *Node) admitGuest(p peer.ID, cert *membership.Cert, pr membership.Proof) {
+	n.mu.Lock()
+	guests := 0
+	for q, st := range n.peers {
+		if st.authed && st.signed == nil && q != p {
+			guests++
+		}
+	}
+	n.mu.Unlock()
+	if guests >= n.cfg.MaxGuests {
+		n.deny(p, denyAfterFailure, fmt.Errorf("%d guests already connected", guests))
+		return
+	}
+	n.admit(p, cert, nil, &pr)
+}
+
+// recheck reports why an admitted peer may no longer stay: its certificate
+// expired or was revoked, or the policy stopped admitting its proof.
+func (n *Node) recheck(st *peerState, p peer.ID) error {
+	if st.signed != nil {
+		_, err := n.cfg.Network.Verify(st.signed, time.Now(), n.revs.Revoked)
+		return err
+	}
+	if st.proof != nil {
+		_, err := n.checkGuest(p, *st.proof)
+		return err
+	}
+	return nil
 }
 
 // observe records the external address a member reports for this node.
@@ -287,11 +388,11 @@ func (n *Node) observe(p peer.ID, addr string) {
 	n.observed[p] = a
 }
 
-func (n *Node) admit(p peer.ID, cert *membership.Cert, signed *membership.SignedCert) {
+func (n *Node) admit(p peer.ID, cert *membership.Cert, signed *membership.SignedCert, proof *membership.Proof) {
 	n.mu.Lock()
 	st := n.state(p)
 	wasAuthed := st.authed
-	st.cert, st.signed = cert, signed
+	st.cert, st.signed, st.proof = cert, signed, proof
 	st.authed, st.dial = true, true
 	st.lastSeen, st.backoff, st.failures = time.Now(), 0, 0
 	if !wasAuthed {
@@ -301,7 +402,11 @@ func (n *Node) admit(p peer.ID, cert *membership.Cert, signed *membership.Signed
 	if wasAuthed {
 		return
 	}
-	n.host.ConnManager().TagPeer(p, "rakkan-member", 100)
+	weight := 100
+	if signed == nil {
+		weight = 10 // guests go first when connections are trimmed
+	}
+	n.host.ConnManager().TagPeer(p, "rakkan-member", weight)
 	if n.dht != nil {
 		n.dht.RoutingTable().TryAddPeer(p, true, false)
 	}

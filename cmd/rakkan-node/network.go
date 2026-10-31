@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -50,6 +51,10 @@ func networkCmd(args []string) int {
 		return networkRevoke(args[1:])
 	case "show":
 		return networkShow(args[1:])
+	case "open":
+		return networkPolicy(args[1:], true)
+	case "close":
+		return networkPolicy(args[1:], false)
 	}
 	fmt.Fprint(os.Stderr, usage)
 	return 2
@@ -152,7 +157,7 @@ func networkRevoke(args []string) int {
 	flags.Parse(args)
 	serials := flags.Args()
 	if len(serials) == 0 {
-		return fail(errors.New("usage: rakkan-node network revoke [-key root.key] [-crl crl.json] <serial>..."))
+		return fail(errors.New("usage: rakkan-node network revoke [-key root.key] [-crl crl.json] <serial or peer ID>..."))
 	}
 	sk, err := membership.LoadKey(*keyPath)
 	if err != nil {
@@ -189,7 +194,59 @@ func networkRevoke(args []string) int {
 	if err := os.WriteFile(*crlPath, signed.Encode(), 0o644); err != nil {
 		return fail(err)
 	}
-	fmt.Fprintf(os.Stderr, "revocation list %d (%d serials) written to %s\n", next.Seq, len(next.Revoked), *crlPath)
+	fmt.Fprintf(os.Stderr, "revocation list %d (%d entries) written to %s\n", next.Seq, len(next.Revoked), *crlPath)
+	return 0
+}
+
+// networkPolicy opens or closes the network to guests. The policy file is
+// handed to a daemon with -policy, which spreads it.
+func networkPolicy(args []string, open bool) int {
+	name := "network close"
+	if open {
+		name = "network open"
+	}
+	flags := flag.NewFlagSet(name, flag.ExitOnError)
+	keyPath := flags.String("key", "root.key", "root key")
+	policyPath := flags.String("policy", "policy.json", "policy file; rewritten in place")
+	pow := flags.Int("pow", 24, "proof of work a guest must show, in bits; each bit doubles it (24: about 6 CPU-seconds)")
+	flags.Parse(args)
+	sk, err := membership.LoadKey(*keyPath)
+	if err != nil {
+		return fail(err)
+	}
+	rootID, err := peer.IDFromPrivateKey(sk)
+	if err != nil {
+		return fail(err)
+	}
+	n, err := membership.ParseNetwork(rootID.String())
+	if err != nil {
+		return fail(err)
+	}
+	next := membership.Policy{Network: n.ID, Seq: 1, Open: open, IssuedAt: time.Now()}
+	if open {
+		next.PowBits = *pow
+	}
+	if old, err := membership.LoadPolicy(*policyPath); err == nil {
+		p, err := n.VerifyPolicy(old)
+		if err != nil {
+			return fail(err)
+		}
+		next.Seq = p.Seq + 1
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fail(err)
+	}
+	signed, err := membership.IssuePolicy(sk, next)
+	if err != nil {
+		return fail(err)
+	}
+	if err := os.WriteFile(*policyPath, signed.Encode(), 0o644); err != nil {
+		return fail(err)
+	}
+	state := "closed"
+	if open {
+		state = fmt.Sprintf("open to guests proving %d bits of work", next.PowBits)
+	}
+	fmt.Fprintf(os.Stderr, "policy %d: network %s; written to %s\n", next.Seq, state, *policyPath)
 	return 0
 }
 
@@ -204,10 +261,18 @@ func networkShow(args []string) int {
 		}
 		return 0
 	}
-	crl, err := membership.LoadCRL(args[0])
+	b, err := os.ReadFile(args[0])
 	if err != nil {
 		return fail(err)
 	}
-	fmt.Printf("%s\n", crl.Body)
+	// A revocation list and a policy share a format; the body tells them
+	// apart.
+	var body struct {
+		Body []byte `json:"body"`
+	}
+	if err := json.Unmarshal(b, &body); err != nil || body.Body == nil {
+		return fail(fmt.Errorf("%s: not a certificate, revocation list or policy", args[0]))
+	}
+	fmt.Printf("%s\n", body.Body)
 	return 0
 }

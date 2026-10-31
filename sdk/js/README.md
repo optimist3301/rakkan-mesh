@@ -76,12 +76,38 @@ llama2.c/tinyllamas) делится по слоям между узлами, з�
 ```js
 const { model } = await mesh.importModel({ checkpoint: { path: 'stories15M.bin' }, tokenizer: { path: 'tokenizer.bin' } });
 for await (const e of mesh.generate({ model, prompt: 'Once upon a time', maxTokens: 200, stages: 3 })) {
-  if (e.done) console.log(e.stats); // tokensPerSecond, stages, failovers
+  if (e.done) console.log(e.stats); // tokensPerSecond, stages, failovers, caught
   else process.stdout.write(e.text);
 }
 ```
 
 Пример: `examples/story.js`.
+
+## Открытая сеть
+
+Владелец корневого ключа открывает сеть командой
+`rakkan-node network open -pow 24` и передаёт файл политики демону
+(`-policy policy.json`). После этого узел без сертификата входит гостем.
+Ему нужны только ID сети и адрес любого узла:
+
+```sh
+rakkan-node id -key node.key
+rakkan-node daemon -network <ID сети> -key node.key -bootstrap <multiaddr>
+# no certificate: joining as a guest; proving 24 bits of work...
+```
+
+Результаты гостей перепроверяются на независимом узле, и `run()` сообщает
+об этом полем `checked: true`. Стадии LLM на гостях дублирует свидетель
+(`stats.stages[i].witness`; `stats.caught` считает пойманные расхождения).
+Гость может просить у узла вычислений в пределах кредита, который зарабатывает,
+вычисляя для других. Что узел знает о пирах:
+
+```js
+for (const p of await mesh.trust()) {
+  console.log(p.id, p.member ? 'member' : `guest, score ${p.score.toFixed(2)}`,
+    `verified ${p.verified}, cheated ${p.cheated}, owes ${p.served - p.consumed} gas`);
+}
+```
 
 Предел размера задаёт политика узлов: `rakkan-node daemon -max-input-mb 256
 -max-output-mb 256`.

@@ -83,16 +83,17 @@ func (n *Node) applyCRL(s *membership.SignedCRL) (bool, error) {
 	}
 	_, seq := n.revs.Current()
 	n.log.Info("revocation list updated", "seq", seq)
-	if _, err := n.cfg.Network.Verify(n.cfg.Cert, time.Now(), n.revs.Revoked); err != nil {
-		n.log.Error("this node's certificate is revoked", "err", err)
+	if n.cfg.Cert != nil {
+		if _, err := n.cfg.Network.Verify(n.cfg.Cert, time.Now(), n.revs.Revoked); err != nil {
+			n.log.Error("this node's certificate is revoked", "err", err)
+		}
+	} else if n.revs.Revoked(n.host.ID().String()) {
+		n.log.Error("this node is revoked")
 	}
 	n.mu.Lock()
 	var revoked []peer.ID
 	for p, st := range n.peers {
-		if st.signed == nil {
-			continue
-		}
-		if _, err := n.cfg.Network.Verify(st.signed, time.Now(), n.revs.Revoked); errors.Is(err, membership.ErrRevoked) {
+		if err := n.recheck(st, p); errors.Is(err, membership.ErrRevoked) {
 			revoked = append(revoked, p)
 			st.dial = false
 		}

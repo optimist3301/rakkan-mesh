@@ -6,7 +6,11 @@
 // peer ID to roles for a validity period. A node holding the admin role may
 // in turn sign member certificates, so admission can be delegated without
 // handing out the root key; admins cannot create admins, which bounds chains
-// to two links. The root publishes revocations as a signed, sequenced list.
+// to two links. The root publishes revocations as a signed, sequenced list
+// of certificate serials and peer IDs.
+//
+// The root may open the network to guests, nodes without a certificate
+// that prove work on their identity, by signing a policy (see Policy).
 //
 // A certificate proves membership only together with the connection it
 // arrives on: libp2p authenticates the remote peer ID, and the certificate
@@ -199,6 +203,9 @@ func (n *Network) verify(sc *SignedCert, now time.Time, revoked func(string) boo
 	}
 	if revoked != nil && revoked(c.Serial) {
 		return nil, fmt.Errorf("%w: serial %s", ErrRevoked, c.Serial)
+	}
+	if revoked != nil && revoked(c.Subject.String()) {
+		return nil, fmt.Errorf("%w: peer %s", ErrRevoked, c.Subject)
 	}
 	return &c, nil
 }

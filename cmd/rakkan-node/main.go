@@ -22,8 +22,10 @@ commands:
   id                print this node's peer ID, creating its key if needed
   network init      create a network: its root key and ID
   network issue     issue a node certificate
-  network revoke    revoke certificates
-  network show      print a certificate or revocation list
+  network revoke    revoke certificates or peers
+  network open      admit guests that prove work on their identity
+  network close     stop admitting guests
+  network show      print a certificate, revocation list or policy
   run <task.wasm>   execute a task locally in the sandbox
 `
 

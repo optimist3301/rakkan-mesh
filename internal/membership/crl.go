@@ -20,7 +20,7 @@ type CRL struct {
 	Network  string    `json:"network"`
 	Seq      uint64    `json:"seq"`
 	IssuedAt time.Time `json:"issued_at"`
-	Revoked  []string  `json:"revoked"` // certificate serials
+	Revoked  []string  `json:"revoked"` // certificate serials and peer IDs
 }
 
 // SignedCRL is a revocation list as stored and transmitted.
@@ -125,7 +125,7 @@ func (r *Revocations) Update(s *SignedCRL) (changed bool, err error) {
 	return true, nil
 }
 
-// Revoked reports whether a certificate serial is revoked.
+// Revoked reports whether a certificate serial or a peer ID is revoked.
 func (r *Revocations) Revoked(serial string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

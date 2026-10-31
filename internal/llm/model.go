@@ -67,6 +67,17 @@ func (c Config) layerSizes() []int {
 	return []int{d, d * d, d * kv, d * kv, d * d, d, d * h, h * d, d * h}
 }
 
+// StageGas prices a forward through layers for tokens in gas units, for
+// credit accounting: eight per weight per token, as tensor kernels charge
+// per multiply-add (package sandbox).
+func StageGas(c Config, layers, tokens int) int64 {
+	var weights int64
+	for _, s := range c.layerSizes() {
+		weights += int64(s)
+	}
+	return 8 * weights * int64(layers) * int64(tokens)
+}
+
 func (l *Layer) tensors() []*[]float32 {
 	return []*[]float32{&l.RmsAtt, &l.Wq, &l.Wk, &l.Wv, &l.Wo, &l.RmsFfn, &l.W1, &l.W2, &l.W3}
 }

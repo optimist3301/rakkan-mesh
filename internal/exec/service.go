@@ -33,6 +33,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 )
 
 var (
@@ -64,6 +65,10 @@ type Config struct {
 	// all the sandbox provides (sandbox.Capabilities). Tasks needing others
 	// are not scheduled here and are refused if sent anyway.
 	Capabilities []string
+	// Trust, when set, bounds the work guests of an open network may ask of
+	// this node by their credit, and has results from guests checked
+	// against independent runs. Without it every peer is trusted.
+	Trust *trust.Service
 	// MaxAttempts bounds executors tried per task. Default 3.
 	MaxAttempts int
 	// LoadInterval is how often load is gossiped. Default 3s.
@@ -303,11 +308,22 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		writeJSON(st, offer{Status: offerRejected, Reason: "module or input exceeds the requested limits"})
 		return
 	}
+	settle := func(int64) {}
+	if s.cfg.Trust != nil {
+		var err error
+		if settle, err = s.cfg.Trust.Reserve(c.Subject, h.Limits.MaxGas); err != nil {
+			writeJSON(st, offer{Status: offerRejected, Reason: err.Error()})
+			return
+		}
+	}
 	if !s.admit() {
+		settle(0)
 		writeJSON(st, offer{Status: offerBusy})
 		return
 	}
 	defer s.release()
+	var gasUsed int64 // charged to the requester's credit
+	defer func() { settle(gasUsed) }()
 
 	module, have := s.modules.Get(hash)
 	status := offerReady
@@ -379,6 +395,12 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		// verdict on the task. Resetting tells the requester to go elsewhere.
 		st.Reset()
 		return
+	}
+	switch {
+	case err == nil:
+		gasUsed = res.GasUsed
+	case errors.Is(err, sandbox.ErrOutOfGas):
+		gasUsed = h.Limits.MaxGas
 	}
 	if err == nil && s.tamper != nil {
 		s.tamper(res)

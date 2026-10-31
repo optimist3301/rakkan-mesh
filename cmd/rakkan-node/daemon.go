@@ -13,10 +13,12 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 	"io/fs"
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -31,7 +33,11 @@ func daemonCmd(args []string) int {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	network := flags.String("network", "", "network ID (required)")
 	keyPath := flags.String("key", "node.key", "node private key")
-	certPath := flags.String("cert", "node.cert", "node certificate")
+	certPath := flags.String("cert", "node.cert", "node certificate; without one the node joins an open network as a guest")
+	proofPath := flags.String("proof", "node.proof", "a guest's proof of work, solved and saved when missing")
+	policyPath := flags.String("policy", "", "network policy from 'network open'; reloaded and published to the network when it changes")
+	trustPath := flags.String("trust", "", "ledger of peers' credit and reputation (default <data>/trust.json)")
+	freeCredit := flags.Float64("free-credit", 50, "work a guest may ask of this node beyond what it did for it, in billions of gas")
 	crlPath := flags.String("crl", "", "revocation list; reloaded and published to the network when it changes")
 	listen := flags.String("listen", "", "comma-separated listen multiaddrs (default: QUIC and TCP on all interfaces)")
 	bootstrap := flags.String("bootstrap", "", "comma-separated multiaddrs of known members, ending in /p2p/<peer ID>")
@@ -63,7 +69,7 @@ func daemonCmd(args []string) int {
 		return fail(err)
 	}
 	cert, err := membership.LoadCert(*certPath)
-	if err != nil {
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fail(err)
 	}
 	reachability, err := mesh.ParseReachability(*reach)
@@ -71,6 +77,11 @@ func daemonCmd(args []string) int {
 		return fail(err)
 	}
 	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, NAT: *nat, RelayService: *relay, Reachability: reachability, PeerCache: *peerCache}
+	if *policyPath != "" {
+		if cfg.Policy, err = membership.LoadPolicy(*policyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fail(err)
+		}
+	}
 	if *crlPath != "" {
 		// A missing file is fine: it is picked up once the operator creates it.
 		if cfg.CRL, err = membership.LoadCRL(*crlPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -89,6 +100,18 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("-bootstrap %s: %w", s, err))
 		}
 		cfg.Bootstrap = append(cfg.Bootstrap, *ai)
+	}
+	if cert == nil {
+		id, err := peer.IDFromPrivateKey(key)
+		if err != nil {
+			return fail(err)
+		}
+		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *proofPath)
+		if err != nil {
+			return fail(err)
+		}
+		cfg.Proof, cfg.Policy = &pr, policy
+		cfg.OnProof = func(pr membership.Proof) { membership.SaveProof(*proofPath, pr) }
 	}
 	level := slog.LevelInfo
 	if *verbose {
@@ -110,11 +133,19 @@ func daemonCmd(args []string) int {
 		return fail(fmt.Errorf("blob store: %w", err))
 	}
 	blobs := blob.NewService(node, store, cfg.Logger)
+	if *trustPath == "" {
+		*trustPath = filepath.Join(*dataDir, "trust.json")
+	}
+	tr, err := trust.New(trust.Config{Node: node, Path: *trustPath, FreeCredit: int64(*freeCredit * 1e9), Logger: cfg.Logger})
+	if err != nil {
+		return fail(fmt.Errorf("trust: %w", err))
+	}
+	defer tr.Close()
 
 	ceiling := sandbox.DefaultLimits()
 	ceiling.MaxInputBytes = *maxInputMB << 20
 	ceiling.MaxOutputBytes = *maxOutputMB << 20
-	svcCfg := exec.Config{Node: node, Blobs: blobs, Ceiling: ceiling, Logger: cfg.Logger}
+	svcCfg := exec.Config{Node: node, Blobs: blobs, Ceiling: ceiling, Trust: tr, Logger: cfg.Logger}
 	if *workers > 0 {
 		iso, err := parseIsolation(*isolation)
 		if err != nil {
@@ -134,7 +165,7 @@ func daemonCmd(args []string) int {
 	}
 	defer svc.Close()
 	lm, err := llm.NewService(llm.ServiceConfig{Node: node, Blobs: blobs, Serve: *serveLLM,
-		MemoryBytes: int64(*llmMemGB * (1 << 30)), Logger: cfg.Logger})
+		MemoryBytes: int64(*llmMemGB * (1 << 30)), Trust: tr, Logger: cfg.Logger})
 	if err != nil {
 		return fail(err)
 	}
@@ -148,7 +179,7 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("api: %w", err))
 		}
 		defer os.Remove(*apiPath)
-		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Network: n.ID}
+		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID}
 		go func() {
 			if err := srv.Serve(ctx, l); err != nil {
 				slog.Error("api", "err", err)
@@ -165,10 +196,13 @@ func daemonCmd(args []string) int {
 		case <-ctx.Done():
 			return 0
 		case <-status.C:
-			printMembers(node)
+			printMembers(node, tr)
 		case <-reload.C:
 			if *crlPath != "" {
 				publishIfNewer(ctx, node, n, *crlPath)
+			}
+			if *policyPath != "" {
+				publishPolicyIfNewer(ctx, node, n, *policyPath)
 			}
 		}
 	}
@@ -204,7 +238,25 @@ func publishIfNewer(ctx context.Context, node *mesh.Node, n *membership.Network,
 	fmt.Printf("published revocation list %d\n", c.Seq)
 }
 
-func printMembers(node *mesh.Node) {
+// publishPolicyIfNewer spreads the policy file when the operator has
+// replaced it with a newer one.
+func publishPolicyIfNewer(ctx context.Context, node *mesh.Node, n *membership.Network, path string) {
+	s, err := membership.LoadPolicy(path)
+	if err != nil {
+		return
+	}
+	p, err := n.VerifyPolicy(s)
+	if cur := node.Policy(); err != nil || cur.Network != "" && p.Seq <= cur.Seq {
+		return
+	}
+	if err := node.PublishPolicy(ctx, s); err != nil {
+		slog.Warn("publishing policy", "err", err)
+		return
+	}
+	fmt.Printf("published policy %d (open: %v)\n", p.Seq, p.Open)
+}
+
+func printMembers(node *mesh.Node, tr *trust.Service) {
 	ms := node.Members()
 	connected := 0
 	for _, m := range ms {
@@ -221,6 +273,9 @@ func printMembers(node *mesh.Node) {
 				path = "relayed"
 			}
 			state = fmt.Sprintf("%s rtt %s via %s", path, m.RTT.Round(100*time.Microsecond), m.Addr)
+		}
+		if m.Guest {
+			state += fmt.Sprintf(", score %.2f", tr.Score(m.ID))
 		}
 		fmt.Printf("  %s %-24s %s\n", m.ID, strings.Join(m.Roles, ","), state)
 	}

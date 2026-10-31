@@ -36,6 +36,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 )
 
 // Server is the local API.
@@ -44,6 +45,7 @@ type Server struct {
 	Blobs   *blob.Store
 	LLM     *llm.Service // nil disables /v1/llm
 	Node    *mesh.Node
+	Trust   *trust.Service // nil disables /v1/trust
 	Network string
 }
 
@@ -73,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/run", s.run)
 	mux.HandleFunc("POST /v1/map", s.mapTasks)
 	mux.HandleFunc("GET /v1/status", s.status)
+	mux.HandleFunc("GET /v1/trust", s.trust)
 	mux.HandleFunc("POST /v1/llm/models", s.importModel)
 	mux.HandleFunc("POST /v1/llm/generate", s.generate)
 	return mux
@@ -152,6 +155,7 @@ type resultJSON struct {
 	Node         string        `json:"node"`
 	Attempts     int           `json:"attempts"`
 	Replicas     []replicaJSON `json:"replicas,omitempty"`
+	Checked      bool          `json:"checked,omitempty"`
 }
 
 type errorJSON struct {
@@ -166,7 +170,7 @@ func (s *Server) toJSON(res *exec.Result) resultJSON {
 	out := resultJSON{
 		ExitCode: res.ExitCode, Output: res.Output, Logs: string(res.Logs), LogTruncated: res.LogTruncated,
 		GasUsed: res.GasUsed, ElapsedMs: float64(res.Elapsed.Microseconds()) / 1000,
-		Node: res.Node.String(), Attempts: res.Attempts,
+		Node: res.Node.String(), Attempts: res.Attempts, Checked: res.Checked,
 	}
 	out.OutputSize = len(res.Output)
 	if !res.OutputBlob.IsZero() {
@@ -419,6 +423,8 @@ type loadJSON struct {
 type memberJSON struct {
 	ID        string    `json:"id"`
 	Roles     []string  `json:"roles"`
+	Guest     bool      `json:"guest,omitempty"`
+	Score     *float64  `json:"score,omitempty"`
 	Connected bool      `json:"connected"`
 	Relayed   bool      `json:"relayed"`
 	RTTMs     float64   `json:"rtt_ms"`
@@ -428,20 +434,42 @@ type memberJSON struct {
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	loads := s.Service.Loads()
 	local := s.Service.LocalLoad()
+	pol := s.Node.Policy()
 	out := struct {
 		ID      string       `json:"id"`
 		Network string       `json:"network"`
+		Guest   bool         `json:"guest"`
+		Open    bool         `json:"open"`
+		PowBits int          `json:"pow_bits,omitempty"`
 		Load    loadJSON     `json:"load"`
 		Members []memberJSON `json:"members"`
-	}{ID: s.Node.ID().String(), Network: s.Network, Load: loadJSON{local.Slots, local.Busy, local.Queued, local.Capabilities}, Members: []memberJSON{}}
+	}{ID: s.Node.ID().String(), Network: s.Network, Guest: !s.Node.Certified(), Open: pol.Open, PowBits: pol.PowBits,
+		Load: loadJSON{local.Slots, local.Busy, local.Queued, local.Capabilities}, Members: []memberJSON{}}
 	for _, m := range s.Node.Members() {
-		mj := memberJSON{ID: m.ID.String(), Roles: m.Roles, Connected: m.Connected, Relayed: m.Relayed, RTTMs: float64(m.RTT.Microseconds()) / 1000}
+		mj := memberJSON{ID: m.ID.String(), Roles: m.Roles, Guest: m.Guest, Connected: m.Connected, Relayed: m.Relayed, RTTMs: float64(m.RTT.Microseconds()) / 1000}
+		if m.Guest && s.Trust != nil {
+			sc := s.Trust.Score(m.ID)
+			mj.Score = &sc
+		}
 		if l, ok := loads[m.ID]; ok {
 			mj.Load = &loadJSON{l.Slots, l.Busy, l.Queued, l.Capabilities}
 		}
 		out.Members = append(out.Members, mj)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// trust lists the peers this node has dealt with: credit and reputation.
+func (s *Server) trust(w http.ResponseWriter, _ *http.Request) {
+	if s.Trust == nil {
+		badRequest(w, "trust is not enabled on this node")
+		return
+	}
+	peers := s.Trust.Peers()
+	if peers == nil {
+		peers = []trust.PeerInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"peers": peers})
 }
 
 type importRequest struct {
@@ -546,13 +574,17 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	}
 	var stages []map[string]any
 	for _, st := range stats.Stages {
-		stages = append(stages, map[string]any{"from": st.From, "to": st.To, "node": st.Node.String()})
+		sj := map[string]any{"from": st.From, "to": st.To, "node": st.Node.String()}
+		if st.Witness != "" {
+			sj["witness"] = st.Witness.String()
+		}
+		stages = append(stages, sj)
 	}
 	enc.Encode(map[string]any{"done": true, "stats": map[string]any{
 		"prompt_tokens": stats.PromptTokens, "tokens": stats.Tokens,
 		"elapsed_ms":   stats.Elapsed.Milliseconds(),
 		"tokens_per_s": float64(stats.Tokens) / stats.Elapsed.Seconds(),
-		"stages":       stages, "failovers": stats.Failovers,
+		"stages":       stages, "failovers": stats.Failovers, "caught": stats.Caught,
 	}})
 }
 

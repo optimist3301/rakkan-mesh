@@ -16,6 +16,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 )
 
 // tokenizerBytes builds a tokenizer in llama2.c's format.
@@ -43,6 +44,7 @@ type llmNode struct {
 	node  *mesh.Node
 	blobs *blob.Service
 	llm   *Service
+	trust *trust.Service
 }
 
 type cluster struct {
@@ -51,6 +53,8 @@ type cluster struct {
 	net  *membership.Network
 	base time.Time
 	boot []peer.AddrInfo
+	// open admits guests and gives every node a trust service.
+	open *membership.SignedPolicy
 }
 
 func newCluster(t *testing.T) *cluster {
@@ -61,15 +65,28 @@ func newCluster(t *testing.T) *cluster {
 	return &cluster{t: t, root: root, net: n, base: time.Now()}
 }
 
-func (c *cluster) add(serve bool) *llmNode {
+func (c *cluster) add(serve bool) *llmNode { return c.addNode(serve, false, 0) }
+
+// addNode starts a member, or a guest proving work, serving stages with mem
+// bytes (0: the default) if serve is set.
+func (c *cluster) addNode(serve, guest bool, mem int64) *llmNode {
 	t := c.t
 	sk, _, _ := crypto.GenerateEd25519Key(rand.Reader)
 	id, _ := peer.IDFromPrivateKey(sk)
-	cert, _ := membership.Issue(c.root, nil, membership.Cert{Network: c.net.ID, Subject: id, Roles: []string{membership.RoleMember},
-		NotBefore: c.base.Add(-time.Minute), NotAfter: c.base.Add(time.Hour)})
-	node, err := mesh.New(mesh.Config{Key: sk, Network: c.net, Cert: cert, Bootstrap: c.boot,
+	cfg := mesh.Config{Key: sk, Network: c.net, Bootstrap: c.boot, Policy: c.open,
 		ListenAddrs: []string{"/ip4/127.0.0.1/udp/0/quic-v1"}, AuthTimeout: 2 * time.Second,
-		HealthInterval: 300 * time.Millisecond, DiscoveryInterval: 500 * time.Millisecond, MaxBackoff: time.Second})
+		HealthInterval: 300 * time.Millisecond, DiscoveryInterval: 500 * time.Millisecond, MaxBackoff: time.Second}
+	if guest {
+		pr, err := c.net.Solve(t.Context(), id, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Proof = &pr
+	} else {
+		cfg.Cert, _ = membership.Issue(c.root, nil, membership.Cert{Network: c.net.ID, Subject: id, Roles: []string{membership.RoleMember},
+			NotBefore: c.base.Add(-time.Minute), NotAfter: c.base.Add(time.Hour)})
+	}
+	node, err := mesh.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +95,12 @@ func (c *cluster) add(serve bool) *llmNode {
 		t.Fatal(err)
 	}
 	n := &llmNode{node: node, blobs: blob.NewService(node, store, nil)}
-	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve}); err != nil {
+	if c.open != nil {
+		if n.trust, err = trust.New(trust.Config{Node: node}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve, MemoryBytes: mem, Trust: n.trust}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { n.close() })
@@ -90,6 +112,9 @@ func (c *cluster) add(serve bool) *llmNode {
 
 func (n *llmNode) close() {
 	n.llm.Close()
+	if n.trust != nil {
+		n.trust.Close()
+	}
 	n.node.Close()
 }
 
@@ -296,4 +321,65 @@ func TestRealModelOverThreeNodes(t *testing.T) {
 		t.Fatalf("distributed text differs from local:\n%q", text.String())
 	}
 	t.Logf("%d tokens over %d stages in %s: %q", stats.Tokens, len(stats.Stages), stats.Elapsed.Round(time.Millisecond), text.String())
+}
+
+func TestGuestStageIsWitnessed(t *testing.T) {
+	c := newCluster(t)
+	var err error
+	if c.open, err = membership.IssuePolicy(c.root, membership.Policy{Network: c.net.ID, Seq: 1, Open: true, PowBits: 8}); err != nil {
+		t.Fatal(err)
+	}
+	coord := c.add(false)
+	member := c.addNode(true, false, 1<<30)
+	// The guest offers more memory, so the stage goes to it first.
+	guest := c.addNode(true, true, 2<<30)
+	ck, tokData, tok := talkative(t, "abc", 18)
+	model, _, _ := Import(coord.blobs.Store(), ck, tokData, "synthetic")
+	waitServers(t, coord, 2)
+	want := localTokens(ck, tok, "abc", 18)
+	// Once cheating, the guest corrupts one activation on its 6th forward.
+	var cheating atomic.Bool
+	var forwards atomic.Int64
+	guest.llm.tamper = func(_ Shard, xs []float32) {
+		if cheating.Load() && forwards.Add(1) == 6 {
+			xs[0] += 1e-6
+		}
+	}
+
+	got, stats := generate(t, coord, GenerateRequest{Model: model, Prompt: "abc", MaxTokens: 18, Stages: 1}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("tokens %v, local %v", got, want)
+	}
+	if st := stats.Stages[0]; st.Node != guest.node.ID() || st.Witness != member.node.ID() || stats.Caught != 0 {
+		t.Fatalf("stage %+v, caught %d", st, stats.Caught)
+	}
+	if coord.trust.Score(guest.node.ID()) == 0 {
+		t.Fatal("witnessed stages earned the guest no trust")
+	}
+
+	// The witness catches the corruption and takes over, and the text is
+	// unaffected.
+	cheating.Store(true)
+	got, stats = generate(t, coord, GenerateRequest{Model: model, Prompt: "abc", MaxTokens: 18, Stages: 1}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("after cheating: tokens %v, local %v", got, want)
+	}
+	if st := stats.Stages[0]; stats.Caught != 1 || st.Node != member.node.ID() {
+		t.Fatalf("stage %+v, caught %d", st, stats.Caught)
+	}
+	if !coord.trust.Suspect(guest.node.ID()) {
+		t.Fatal("cheater not marked")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for coord.node.IsMember(guest.node.ID()) {
+		if time.Now().After(deadline) {
+			t.Fatal("cheater still connected")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// And gets no more stages.
+	_, stats = generate(t, coord, GenerateRequest{Model: model, Prompt: "abc", MaxTokens: 5, Stages: 1}, nil)
+	if stats.Stages[0].Node == guest.node.ID() {
+		t.Fatal("cheater given a stage again")
+	}
 }

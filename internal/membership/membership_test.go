@@ -1,8 +1,10 @@
 package membership
 
 import (
+	"context"
 	"crypto/rand"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -166,3 +168,77 @@ func must[T any](v T, err error) T {
 	}
 	return v
 }
+
+func TestPolicy(t *testing.T) {
+	root, n := mustRoot(t)
+	otherRoot, _ := mustRoot(t)
+	ps := NewPolicies(n)
+	if s, p := ps.Current(); s != nil || p.Open {
+		t.Fatal("a network without a policy must be closed")
+	}
+	open := must(IssuePolicy(root, Policy{Network: n.ID, Seq: 2, Open: true, PowBits: 12}))
+	if changed, err := ps.Update(open); err != nil || !changed {
+		t.Fatalf("update: %v %v", changed, err)
+	}
+	if _, p := ps.Current(); !p.Open || p.PowBits != 12 {
+		t.Fatalf("policy %+v", p)
+	}
+	older := must(IssuePolicy(root, Policy{Network: n.ID, Seq: 1}))
+	if changed, _ := ps.Update(older); changed {
+		t.Fatal("an older policy replaced a newer one")
+	}
+	forged := must(IssuePolicy(otherRoot, Policy{Network: n.ID, Seq: 3}))
+	if _, err := ps.Update(forged); err == nil {
+		t.Fatal("accepted a policy not signed by the root")
+	}
+	tampered := *open
+	tampered.Body = []byte(`{"v":1,"network":"` + n.ID + `","seq":9,"issued_at":"2026-01-01T00:00:00Z","open":true}`)
+	if _, err := ps.Update(&tampered); err == nil {
+		t.Fatal("accepted a tampered policy")
+	}
+	if _, err := IssuePolicy(root, Policy{Network: n.ID, PowBits: MaxPowBits + 1}); err == nil {
+		t.Fatal("issued an impossible policy")
+	}
+	path := filepath.Join(t.TempDir(), "policy.json")
+	if err := writeFile(path, open.Encode()); err != nil {
+		t.Fatal(err)
+	}
+	if back, err := LoadPolicy(path); err != nil || string(back.Body) != string(open.Body) {
+		t.Fatalf("round trip: %v", err)
+	}
+}
+
+func TestProofOfWork(t *testing.T) {
+	_, n := mustRoot(t)
+	_, other := mustRoot(t)
+	_, id := newKey(t)
+	_, id2 := newKey(t)
+	pr, err := n.Solve(t.Context(), id, 14)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := n.Work(id, pr); w < 14 {
+		t.Fatalf("proof has %d bits", w)
+	}
+	// Bound to the peer and the network: elsewhere it is almost surely weak.
+	if n.Work(id2, pr) >= 14 && other.Work(id, pr) >= 14 {
+		t.Fatal("proof is not bound to its peer and network")
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := n.Solve(ctx, id, MaxPowBits); err == nil {
+		t.Fatal("a cancelled solve succeeded")
+	}
+	root, n2 := mustRoot(t)
+	_, member := newKey(t)
+	c := must(Issue(root, nil, cert(n2, member, RoleMember)))
+	revs := NewRevocations(n2)
+	if _, err := revs.Update(must(IssueCRL(root, CRL{Network: n2.ID, Seq: 1, Revoked: []string{member.String()}}))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := n2.Verify(c, base, revs.Revoked); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("revoking the peer ID did not revoke its certificate: %v", err)
+	}
+}
+
+func writeFile(path string, b []byte) error { return os.WriteFile(path, b, 0o644) }

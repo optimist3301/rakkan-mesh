@@ -33,6 +33,11 @@ export interface Result {
   /** Executors tried; more than 1 means failover happened. */
   attempts: number;
   replicas: Replica[];
+  /**
+   * In an open network: the task ran on a guest, and an independent run
+   * (on a member where possible) confirmed the outcome.
+   */
+  checked: boolean;
 }
 
 export interface RunOptions {
@@ -75,6 +80,10 @@ export type MapItem = ({ index: number; error?: undefined } & Result) | { index:
 export interface Member {
   id: string;
   roles: string[];
+  /** Admitted by proof of work rather than certificate. */
+  guest?: boolean;
+  /** A guest's reputation, 0 to 1. */
+  score?: number;
   connected: boolean;
   relayed: boolean;
   rtt_ms: number;
@@ -92,6 +101,11 @@ export interface Load {
 export interface Status {
   id: string;
   network: string;
+  /** This node joined by proof of work, without a certificate. */
+  guest: boolean;
+  /** The network admits guests, proving `pow_bits` of work. */
+  open: boolean;
+  pow_bits?: number;
   load: Load;
   members: Member[];
 }
@@ -112,8 +126,27 @@ export class Mesh {
   run(options: RunOptions): Promise<Result>;
   map(options: MapOptions): AsyncGenerator<MapItem, void, undefined>;
   status(): Promise<Status>;
+  trust(): Promise<TrustPeer[]>;
   importModel(options: { checkpoint: BlobSource; tokenizer: BlobSource; name?: string; signal?: AbortSignal }): Promise<{ model: string; config: ModelConfig }>;
   generate(options: GenerateOptions): AsyncGenerator<GenerateEvent, void, undefined>;
+}
+
+export interface TrustPeer {
+  id: string;
+  /** This node or a certified member: trusted without checks. */
+  member: boolean;
+  /** Reputation from 0 to 1 (EigenTrust); 1 for members. */
+  score: number;
+  /** Gas this node spent for the peer. */
+  served: number;
+  /** Gas the peer spent for this node. */
+  consumed: number;
+  /** Results confirmed by independent runs. */
+  verified: number;
+  failed: number;
+  /** Wrong results caught. */
+  cheated: number;
+  lastCheated?: Date;
 }
 
 export interface ModelConfig {
@@ -144,9 +177,12 @@ export interface GenerateStats {
   tokens: number;
   elapsedMs: number;
   tokensPerSecond: number;
-  stages: { from: number; to: number; node: string }[];
+  /** `witness` is the trusted node checking a stage that ran on a guest. */
+  stages: { from: number; to: number; node: string; witness?: string }[];
   /** Stages moved to another node after a failure, mid-generation. */
   failovers: number;
+  /** Guests caught returning wrong activations; their witness took over. */
+  caught: number;
 }
 
 export type GenerateEvent = { token: number; text: string; done?: undefined } | { done: true; stats: GenerateStats };

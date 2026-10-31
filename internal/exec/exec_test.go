@@ -25,6 +25,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 	w "github.com/optimist3301/rakkan-mesh/internal/wasmtest"
 )
 
@@ -41,11 +42,12 @@ func TestMain(m *testing.M) {
 }
 
 type cluster struct {
-	t    *testing.T
-	root crypto.PrivKey
-	net  *membership.Network
-	base time.Time
-	boot []peer.AddrInfo
+	t      *testing.T
+	root   crypto.PrivKey
+	net    *membership.Network
+	base   time.Time
+	boot   []peer.AddrInfo
+	policy *membership.SignedPolicy
 }
 
 func newCluster(t *testing.T) *cluster {
@@ -61,10 +63,14 @@ type testNode struct {
 	svc   *Service
 	pool  *isolate.Pool
 	blobs *blob.Service
+	trust *trust.Service
 }
 
 func (tn *testNode) close() {
 	tn.svc.Close()
+	if tn.trust != nil {
+		tn.trust.Close()
+	}
 	tn.node.Close()
 	if tn.pool != nil {
 		tn.pool.Close()
@@ -76,6 +82,19 @@ func (c *cluster) add(slots int) *testNode { return c.addWith(slots, nil) }
 
 // addWith starts a member offering the given capabilities (nil: all).
 func (c *cluster) addWith(slots int, caps []string) *testNode {
+	return c.addNode(nodeSpec{slots: slots, caps: caps})
+}
+
+type nodeSpec struct {
+	slots int
+	caps  []string
+	// guest joins by proof of work instead of a certificate.
+	guest bool
+	// trust, when set, configures the node's trust service.
+	trust *trust.Config
+}
+
+func (c *cluster) addNode(spec nodeSpec) *testNode {
 	t := c.t
 	t.Helper()
 	sk, _, err := crypto.GenerateEd25519Key(rand.Reader)
@@ -83,21 +102,27 @@ func (c *cluster) addWith(slots int, caps []string) *testNode {
 		t.Fatal(err)
 	}
 	id, _ := peer.IDFromPrivateKey(sk)
-	cert, err := membership.Issue(c.root, nil, membership.Cert{
-		Network: c.net.ID, Subject: id, Roles: []string{membership.RoleMember},
-		NotBefore: c.base.Add(-time.Minute), NotAfter: c.base.Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	node, err := mesh.New(mesh.Config{
-		Key: sk, Network: c.net, Cert: cert, Bootstrap: c.boot,
+	cfg := mesh.Config{
+		Key: sk, Network: c.net, Bootstrap: c.boot, Policy: c.policy,
 		ListenAddrs:       []string{"/ip4/127.0.0.1/udp/0/quic-v1"},
 		AuthTimeout:       2 * time.Second,
 		HealthInterval:    300 * time.Millisecond,
 		DiscoveryInterval: 500 * time.Millisecond,
 		MaxBackoff:        time.Second,
-	})
+	}
+	if spec.guest {
+		pr, err := c.net.Solve(t.Context(), id, 8)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Proof = &pr
+	} else if cfg.Cert, err = membership.Issue(c.root, nil, membership.Cert{
+		Network: c.net.ID, Subject: id, Roles: []string{membership.RoleMember},
+		NotBefore: c.base.Add(-time.Minute), NotAfter: c.base.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, err := mesh.New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,15 +131,23 @@ func (c *cluster) addWith(slots int, caps []string) *testNode {
 		t.Fatal(err)
 	}
 	tn := &testNode{node: node, blobs: blob.NewService(node, store, nil)}
-	cfg := Config{Node: node, Blobs: tn.blobs, LoadInterval: 200 * time.Millisecond, Capabilities: caps}
-	if slots > 0 {
-		tn.pool, err = isolate.NewPool(isolate.Config{Ceiling: sandbox.DefaultLimits(), Workers: slots, Isolation: isolate.StrictIsolation()})
+	scfg := Config{Node: node, Blobs: tn.blobs, LoadInterval: 200 * time.Millisecond, Capabilities: spec.caps}
+	if spec.trust != nil {
+		tc := *spec.trust
+		tc.Node = node
+		if tn.trust, err = trust.New(tc); err != nil {
+			t.Fatal(err)
+		}
+		scfg.Trust = tn.trust
+	}
+	if spec.slots > 0 {
+		tn.pool, err = isolate.NewPool(isolate.Config{Ceiling: sandbox.DefaultLimits(), Workers: spec.slots, Isolation: isolate.StrictIsolation()})
 		if err != nil {
 			t.Skipf("isolated workers unavailable: %v", err)
 		}
-		cfg.Pool, cfg.Slots, cfg.MaxQueue = tn.pool, slots, 1
+		scfg.Pool, scfg.Slots, scfg.MaxQueue = tn.pool, spec.slots, 1
 	}
-	if tn.svc, err = New(cfg); err != nil {
+	if tn.svc, err = New(scfg); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(tn.close)

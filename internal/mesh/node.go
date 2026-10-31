@@ -1,6 +1,8 @@
 // Package mesh is the Rakkan network layer: a libp2p host admitting only
-// members of a closed network, with discovery, failure detection and
-// recovery.
+// members of a network, with discovery, failure detection and recovery.
+// When the root opens the network (membership.Policy), it also admits
+// guests proving work on their identity; Member.Guest and IsCertified tell
+// them apart, so services can trust members and verify guests.
 //
 // Admission: right after a connection is established, both sides exchange
 // certificates (see package membership) over the auth protocol. Peers that
@@ -56,9 +58,20 @@ import (
 type Config struct {
 	Key     crypto.PrivKey
 	Network *membership.Network
-	Cert    *membership.SignedCert
+	// Cert makes the node a member. A node without one joins an open
+	// network as a guest with Proof, which must satisfy the policy.
+	Cert  *membership.SignedCert
+	Proof *membership.Proof
+	// OnProof is called with a new proof the node solved because the
+	// policy raised the difficulty, so it can be saved.
+	OnProof func(membership.Proof)
 	// CRL is the newest revocation list known at start, if any.
 	CRL *membership.SignedCRL
+	// Policy is the newest network policy known at start, if any; without
+	// one the network is closed until a policy arrives from the network.
+	Policy *membership.SignedPolicy
+	// MaxGuests bounds guests connected at once. Default 256.
+	MaxGuests int
 
 	// ListenAddrs default to QUIC and TCP on all interfaces, random ports.
 	ListenAddrs []string
@@ -103,6 +116,9 @@ func (c *Config) setDefaults() {
 	if c.MaxBackoff <= 0 {
 		c.MaxBackoff = 5 * time.Minute
 	}
+	if c.MaxGuests <= 0 {
+		c.MaxGuests = 256
+	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -133,17 +149,19 @@ func ParseReachability(s string) (Reachability, error) {
 
 // Node is a member of a Rakkan network.
 type Node struct {
-	cfg   Config
-	log   *slog.Logger
-	host  host.Host
-	gated *gatedHost
-	dht   *dht.IpfsDHT
-	ps    *pubsub.PubSub
-	crl   *pubsub.Topic
-	mdns  mdns.Service
-	relay *relayv2.Relay
-	revs  *membership.Revocations
-	self  *membership.Cert
+	cfg      Config
+	log      *slog.Logger
+	host     host.Host
+	gated    *gatedHost
+	dht      *dht.IpfsDHT
+	ps       *pubsub.PubSub
+	crl      *pubsub.Topic
+	policy   *pubsub.Topic
+	mdns     mdns.Service
+	relay    *relayv2.Relay
+	revs     *membership.Revocations
+	policies *membership.Policies
+	self     *membership.Cert
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -156,13 +174,14 @@ type Node struct {
 	observed map[peer.ID]ma.Multiaddr // our address as members see it
 	denied   map[peer.ID]time.Time
 	authing  map[peer.ID]bool
+	proof    membership.Proof // a guest's own
 }
 
 // New starts a node.
 func New(cfg Config) (*Node, error) {
 	cfg.setDefaults()
-	if cfg.Key == nil || cfg.Network == nil || cfg.Cert == nil {
-		return nil, errors.New("mesh: key, network and certificate are required")
+	if cfg.Key == nil || cfg.Network == nil || (cfg.Cert == nil && cfg.Proof == nil) {
+		return nil, errors.New("mesh: key, network, and a certificate or proof of work are required")
 	}
 	id, err := peer.IDFromPrivateKey(cfg.Key)
 	if err != nil {
@@ -172,6 +191,7 @@ func New(cfg Config) (*Node, error) {
 		cfg:      cfg,
 		log:      cfg.Logger.With("node", id.ShortString()),
 		revs:     membership.NewRevocations(cfg.Network),
+		policies: membership.NewPolicies(cfg.Network),
 		peers:    map[peer.ID]*peerState{},
 		denied:   map[peer.ID]time.Time{},
 		authing:  map[peer.ID]bool{},
@@ -183,11 +203,23 @@ func New(cfg Config) (*Node, error) {
 			return nil, fmt.Errorf("mesh: %w", err)
 		}
 	}
-	if n.self, err = cfg.Network.Verify(cfg.Cert, time.Now(), n.revs.Revoked); err != nil {
-		return nil, fmt.Errorf("mesh: own certificate: %w", err)
+	if cfg.Policy != nil {
+		if _, err := n.policies.Update(cfg.Policy); err != nil {
+			return nil, fmt.Errorf("mesh: %w", err)
+		}
 	}
-	if n.self.Subject != id {
-		return nil, fmt.Errorf("mesh: certificate is for %s, but the key is %s", n.self.Subject, id)
+	if cfg.Cert != nil {
+		if n.self, err = cfg.Network.Verify(cfg.Cert, time.Now(), n.revs.Revoked); err != nil {
+			return nil, fmt.Errorf("mesh: own certificate: %w", err)
+		}
+		if n.self.Subject != id {
+			return nil, fmt.Errorf("mesh: certificate is for %s, but the key is %s", n.self.Subject, id)
+		}
+	} else {
+		// Peers judge the proof against the newest policy they know; this
+		// node's may be older, so it is not checked here.
+		n.proof = *cfg.Proof
+		n.self = &membership.Cert{Version: 1, Network: cfg.Network.ID, Subject: id, Roles: []string{membership.RoleGuest}}
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
 
@@ -236,6 +268,7 @@ func New(cfg Config) (*Node, error) {
 	}
 	n.gated = &gatedHost{Host: n.host, n: n}
 	n.host.SetStreamHandler(authProtocol, n.handleAuth)
+	n.host.SetStreamHandler(policyProtocol, n.handlePolicy)
 	n.host.Network().Notify(&network.NotifyBundle{
 		ConnectedF:    func(_ network.Network, c network.Conn) { n.onConnected(c) },
 		DisconnectedF: func(_ network.Network, c network.Conn) { n.onDisconnected(c) },
@@ -268,6 +301,9 @@ func (n *Node) startServices() error {
 		return fmt.Errorf("mesh: pubsub: %w", err)
 	}
 	if err := n.startCRLGossip(); err != nil {
+		return err
+	}
+	if err := n.startPolicyGossip(); err != nil {
 		return err
 	}
 	if n.cfg.MDNS {
@@ -318,7 +354,8 @@ func (n *Node) AddrInfo() peer.AddrInfo {
 }
 
 // Handle registers a handler for an application protocol. Only
-// authenticated members reach it; their certificate is passed along.
+// authenticated peers reach it; their certificate is passed along, which
+// for a guest is synthesized and carries membership.RoleGuest.
 func (n *Node) Handle(pid protocol.ID, h func(network.Stream, *membership.Cert)) {
 	n.gated.SetStreamHandler(pid, func(s network.Stream) {
 		c := n.memberCert(s.Conn().RemotePeer())
@@ -336,8 +373,16 @@ func (n *Node) NewStream(ctx context.Context, p peer.ID, pid protocol.ID) (netwo
 	return n.gated.NewStream(ctx, p, pid)
 }
 
-// IsMember reports whether p is currently an authenticated member.
+// IsMember reports whether p is currently authenticated, as a member or a
+// guest.
 func (n *Node) IsMember(p peer.ID) bool { return n.isMember(p) }
+
+// IsCertified reports whether p is currently authenticated with a
+// certificate: a member, not a guest.
+func (n *Node) IsCertified(p peer.ID) bool { return n.isCertified(p) }
+
+// Certified reports whether this node holds a certificate.
+func (n *Node) Certified() bool { return n.cfg.Cert != nil }
 
 // JoinTopic joins a gossip topic scoped to this network. Only members take
 // part, and messages are signed by their authors.
@@ -446,13 +491,16 @@ func (m mdnsNotifee) HandlePeerFound(ai peer.AddrInfo) {
 	m.n.addDialTarget(ai)
 }
 
-// relayACL admits only members to this node's relay service.
+// relayACL admits members to this node's relay service: they may reserve
+// a slot and be reached through it. Guests may reach members through it,
+// not hold slots, so a relay's bandwidth serves the members its operator
+// vouched for.
 type relayACL struct{ n *Node }
 
-func (r relayACL) AllowReserve(p peer.ID, _ ma.Multiaddr) bool { return r.n.isMember(p) }
+func (r relayACL) AllowReserve(p peer.ID, _ ma.Multiaddr) bool { return r.n.isCertified(p) }
 
 func (r relayACL) AllowConnect(src peer.ID, _ ma.Multiaddr, dest peer.ID) bool {
-	return r.n.isMember(src) && r.n.isMember(dest)
+	return r.n.isMember(src) && r.n.isCertified(dest)
 }
 
 // relayCandidates offers connected members running a relay to AutoRelay.

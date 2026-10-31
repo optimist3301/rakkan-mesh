@@ -19,6 +19,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 )
 
 // Protocol serves pipeline stages. One stream is one stage of one
@@ -74,7 +75,11 @@ type ServiceConfig struct {
 	// the weights and caches held for them. Default 4 GiB.
 	Serve       bool
 	MemoryBytes int64
-	Logger      *slog.Logger
+	// Trust, when set, charges guests' credit for the stages this node
+	// serves them, and has stages on guests checked by a witness (see
+	// Generate). Without it every peer is trusted.
+	Trust  *trust.Service
+	Logger *slog.Logger
 }
 
 // Service serves pipeline stages and coordinates generations.
@@ -94,7 +99,8 @@ type Service struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	changed  chan struct{}
-	failNext func(Shard) bool // for tests: fail a stage's next forward
+	failNext func(Shard) bool       // for tests: fail a stage's next forward
+	tamper   func(Shard, []float32) // for tests: alter a stage's outputs
 }
 
 type loaded struct {
@@ -458,9 +464,21 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 			st.Reset() // simulated crash
 			return
 		}
+		settle := func(int64) {}
+		gas := StageGas(cfg, req.To-req.From, req.Tokens)
+		if s.cfg.Trust != nil {
+			if settle, err = s.cfg.Trust.Reserve(c.Subject, gas); err != nil {
+				writeStatus(st, err)
+				return
+			}
+		}
 		xs := decodeActs(acts)
 		for t := range req.Tokens {
 			stage.Forward(xs[t*cfg.Dim:(t+1)*cfg.Dim], req.Pos+t)
+		}
+		settle(gas)
+		if s.tamper != nil {
+			s.tamper(shard, xs)
 		}
 		if writeStatus(st, nil) != nil || writeFrame(st, encodeActs(xs)) != nil {
 			return

@@ -1,11 +1,14 @@
 package llm
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p/core/network"
@@ -38,6 +41,8 @@ type Event struct {
 type StageInfo struct {
 	From, To int
 	Node     peer.ID
+	// Witness is the trusted node checking a stage on a guest, if any.
+	Witness peer.ID
 }
 
 // Stats summarizes a generation.
@@ -47,6 +52,9 @@ type Stats struct {
 	Stages               []StageInfo
 	// Failovers counts stages moved to another node mid-generation.
 	Failovers int
+	// Caught counts stages whose node returned outputs differing from its
+	// witness's; the witness took over each.
+	Caught int
 }
 
 // coordModel is what a coordinator holds of a model: the parts it runs
@@ -223,7 +231,19 @@ type planned struct {
 	from, to int
 	node     peer.ID
 	conn     stageConn
-	inputs   []float32 // activations entering the stage, every position so far
+	witness  *witness
+	// unwitnessed is set when no trusted node could witness the stage on
+	// its current node; it is not looked for again until the stage moves.
+	unwitnessed bool
+	inputs      []float32 // activations entering the stage, every position so far
+}
+
+// witness runs a stage placed on an untrusted guest a second time, on a
+// trusted node: the engine is deterministic, so an honest guest's outputs
+// match the witness's bit for bit.
+type witness struct {
+	node peer.ID
+	conn stageConn
 }
 
 // candidates lists nodes able to serve stages, preferring those already
@@ -247,7 +267,14 @@ func (s *Service) candidates(model blob.ID, from, to int, exclude map[peer.ID]bo
 		others = append(others, s.node.ID())
 		byMem[s.node.ID()] = s.cfg.MemoryBytes
 	}
-	slices.SortFunc(others, func(a, b peer.ID) int { return int(min(max(byMem[b]-byMem[a], -1), 1)) })
+	byFree := func(a, b peer.ID) int {
+		if c := cmp.Compare(byMem[b], byMem[a]); c != 0 {
+			return c
+		}
+		return cmp.Compare(a, b)
+	}
+	slices.SortFunc(loaded, byFree)
+	slices.SortFunc(others, byFree)
 	return append(loaded, others...)
 }
 
@@ -281,6 +308,9 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		for _, st := range stages {
 			if st != nil && st.conn != nil {
 				st.conn.close()
+			}
+			if st != nil && st.witness != nil {
+				st.witness.conn.close()
 			}
 		}
 	}()
@@ -332,7 +362,11 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	}
 	stats.Elapsed = time.Since(started)
 	for _, st := range stages {
-		stats.Stages = append(stats.Stages, StageInfo{From: st.from, To: st.to, Node: st.node})
+		info := StageInfo{From: st.from, To: st.to, Node: st.node}
+		if st.witness != nil {
+			info.Witness = st.witness.node
+		}
+		stats.Stages = append(stats.Stages, info)
 	}
 	return stats, nil
 }
@@ -341,13 +375,16 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude map[peer.ID]bool, providers []peer.ID) error {
 	var lastErr error = ErrNoStages
 	for _, node := range s.candidates(model, st.from, st.to, exclude) {
+		if s.cfg.Trust != nil && s.cfg.Trust.Suspect(node) {
+			continue
+		}
 		conn, err := s.openStage(ctx, node, model, st.from, st.to, providers)
 		if err != nil {
 			lastErr = err
 			s.log.Info("stage refused", "node", node.ShortString(), "err", err)
 			continue
 		}
-		st.node, st.conn = node, conn
+		st.node, st.conn, st.unwitnessed = node, conn, false
 		return nil
 	}
 	return fmt.Errorf("layers %d..%d: %w", st.from, st.to, lastErr)
@@ -355,12 +392,55 @@ func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude
 
 // runStage forwards activations through a stage, moving it to another
 // node if its node fails: the replacement's cache is rebuilt by replaying
-// the inputs the stage received so far, which the coordinator keeps.
+// the inputs the stage received so far, which the coordinator keeps. A
+// stage on an untrusted guest runs on a witness too, and the outputs are
+// compared; on a mismatch the witness takes the stage over and the guest
+// is reported as cheating.
 func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs []float32, pos, count int, all []*planned, providers []peer.ID, stats *Stats) error {
 	in := slices.Clone(xs)
+	gas := StageGas(s.manifestConfig(model), st.to-st.from, count)
 	for attempt := 0; ; attempt++ {
+		s.ensureWitness(ctx, model, st, pos, providers)
+		var check []float32
+		var checkErr error
+		var wg sync.WaitGroup
+		w := st.witness
+		if w != nil {
+			check = slices.Clone(in)
+			wg.Go(func() { checkErr = w.conn.forward(check, pos, count) })
+		}
 		err := st.conn.forward(xs, pos, count)
+		wg.Wait()
+		if w != nil {
+			switch {
+			case checkErr != nil:
+				// A new witness replays the inputs on the next forward.
+				s.log.Warn("stage witness failed", "node", w.node.ShortString(), "err", checkErr)
+				w.conn.close()
+				st.witness = nil
+			case err != nil:
+				// The witness has this step done: it takes over.
+				s.log.Warn("stage failed, its witness takes over", "node", st.node.ShortString(), "err", err)
+				st.conn.close()
+				st.node, st.conn, st.witness = w.node, w.conn, nil
+				copy(xs, check)
+				stats.Failovers++
+				err = nil
+			case !bytes.Equal(encodeActs(xs), encodeActs(check)):
+				s.cfg.Trust.Cheated(st.node, fmt.Sprintf("layers %d..%d: outputs differ from a trusted witness", st.from, st.to))
+				st.conn.close()
+				st.node, st.conn, st.witness = w.node, w.conn, nil
+				copy(xs, check)
+				stats.Caught++
+			default:
+				s.cfg.Trust.Verified(st.node)
+				s.cfg.Trust.Consumed(w.node, gas)
+			}
+		}
 		if err == nil {
+			if s.cfg.Trust != nil {
+				s.cfg.Trust.Consumed(st.node, gas)
+			}
 			st.inputs = append(st.inputs, in...)
 			return nil
 		}
@@ -371,6 +451,9 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs [
 			return fmt.Errorf("layers %d..%d: %w", st.from, st.to, err)
 		}
 		s.log.Warn("stage failed, moving it", "node", st.node.ShortString(), "from", st.from, "to", st.to, "err", err)
+		if s.cfg.Trust != nil {
+			s.cfg.Trust.Failed(st.node)
+		}
 		st.conn.close()
 		exclude := map[peer.ID]bool{st.node: true}
 		for _, o := range all {
@@ -393,4 +476,44 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs [
 		stats.Failovers++
 		copy(xs, in)
 	}
+}
+
+// ensureWitness gives a stage on an untrusted guest a witness on a trusted
+// node, replaying the stage's inputs so far into it. Without a trusted node
+// able to serve the layers, the stage runs unchecked.
+func (s *Service) ensureWitness(ctx context.Context, model blob.ID, st *planned, pos int, providers []peer.ID) {
+	tr := s.cfg.Trust
+	if tr == nil || st.witness != nil || st.unwitnessed || tr.Trusted(st.node) {
+		if st.witness != nil && tr.Trusted(st.node) {
+			st.witness.conn.close()
+			st.witness = nil
+		}
+		return
+	}
+	for _, node := range s.candidates(model, st.from, st.to, map[peer.ID]bool{st.node: true}) {
+		if !tr.Trusted(node) {
+			continue
+		}
+		conn, err := s.openStage(ctx, node, model, st.from, st.to, providers)
+		if err != nil {
+			continue
+		}
+		if pos > 0 {
+			if err := conn.forward(slices.Clone(st.inputs), 0, pos); err != nil {
+				conn.close()
+				continue
+			}
+		}
+		st.witness = &witness{node: node, conn: conn}
+		return
+	}
+	st.unwitnessed = true
+	s.log.Warn("no trusted node to witness a guest's stage; it runs unchecked", "node", st.node.ShortString(), "from", st.from, "to", st.to)
+}
+
+// manifestConfig returns the configuration of a model being coordinated.
+func (s *Service) manifestConfig(model blob.ID) Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.coords[model].manifest.Config
 }
