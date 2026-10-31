@@ -22,12 +22,13 @@ func Checkpoint(seed uint64) []byte {
 		}
 		return v
 	}
+	m := func(n int, scale float64) llm.Matrix { return llm.Matrix{F32: r(n, scale)} }
 	d, kv, h := c.Dim, c.KVDim(), c.Hidden
-	ck := &llm.Checkpoint{Config: c, Embed: r(c.Vocab*d, 1), Head: &llm.Head{RmsFinal: r(d, 1), Wcls: r(c.Vocab*d, 0.2)}}
+	ck := &llm.Checkpoint{Config: c, Embed: m(c.Vocab*d, 1), Head: &llm.Head{RmsFinal: r(d, 1), Wcls: m(c.Vocab*d, 0.2)}}
 	for range c.Layers {
 		ck.Layers = append(ck.Layers, &llm.Layer{
-			RmsAtt: r(d, 1), Wq: r(d*d, 0.2), Wk: r(d*kv, 0.2), Wv: r(d*kv, 0.2), Wo: r(d*d, 0.2),
-			RmsFfn: r(d, 1), W1: r(d*h, 0.2), W2: r(h*d, 0.2), W3: r(d*h, 0.2),
+			RmsAtt: r(d, 1), Wq: m(d*d, 0.2), Wk: m(d*kv, 0.2), Wv: m(d*kv, 0.2), Wo: m(d*d, 0.2),
+			RmsFfn: r(d, 1), W1: m(d*h, 0.2), W2: m(h*d, 0.2), W3: m(d*h, 0.2),
 		})
 	}
 	return ck.Encode()

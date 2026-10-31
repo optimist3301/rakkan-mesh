@@ -127,7 +127,12 @@ export class Mesh {
   map(options: MapOptions): AsyncGenerator<MapItem, void, undefined>;
   status(): Promise<Status>;
   trust(): Promise<TrustPeer[]>;
-  importModel(options: { checkpoint: BlobSource; tokenizer: BlobSource; name?: string; signal?: AbortSignal }): Promise<{ model: string; config: ModelConfig }>;
+  /**
+   * Imports a llama2.c checkpoint and tokenizer, or with `hf` a Hugging Face
+   * model directory (config.json, tokenizer.json, *.safetensors): Llama,
+   * Mistral, Qwen2/2.5, Qwen3.
+   */
+  importModel(options: { checkpoint: BlobSource; tokenizer: BlobSource; name?: string; signal?: AbortSignal } | { hf: string; name?: string; signal?: AbortSignal }): Promise<{ model: string; config: ModelConfig; chat?: boolean }>;
   generate(options: GenerateOptions): AsyncGenerator<GenerateEvent, void, undefined>;
 }
 
@@ -157,11 +162,19 @@ export interface ModelConfig {
   n_kv_heads: number;
   vocab_size: number;
   seq_len: number;
+  head_dim?: number;
+  rope_theta?: number;
+  qkv_bias?: boolean;
+  qk_norm?: boolean;
+  /** How weight matrices are stored: "f32" or "bf16". */
+  dtype?: string;
 }
 
 export interface GenerateOptions {
   model: string;
   prompt: string;
+  /** Wrap the prompt in the model's chat format (instruction-tuned models). */
+  chat?: boolean;
   maxTokens?: number;
   /** 0 (default) always picks the most likely token. */
   temperature?: number;

@@ -279,6 +279,20 @@ test('language model: a real story, when RAKKAN_LLM_DIR has one', { skip: !proce
   assert.equal(stats.stages.length, 3);
 });
 
+test('language model: Qwen from Hugging Face, when RAKKAN_HF_MODELS has it', { skip: !process.env.RAKKAN_HF_MODELS }, async () => {
+  const { model, config, chat } = await mesh.importModel({ hf: `${process.env.RAKKAN_HF_MODELS}/qwen2.5-0.5b-instruct` });
+  assert.equal(config.dtype, 'bf16');
+  assert.equal(chat, true);
+  let text = '';
+  let stats;
+  for await (const e of mesh.generate({ model, prompt: 'What is the capital of France? Answer in one word.', chat: true, maxTokens: 10, stages: 3 })) {
+    if (e.done) stats = e.stats;
+    else text += e.text;
+  }
+  assert.match(text, /Paris/);
+  assert.equal(stats.stages.length, 3);
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

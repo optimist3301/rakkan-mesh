@@ -196,10 +196,31 @@ export class Mesh {
    * blobs that pipeline stages fetch. Resolves to `{model, config}`; the
    * model ID is the same on every node for the same files.
    */
-  async importModel({ checkpoint, tokenizer, name, signal } = {}) {
+  async importModel({ checkpoint, tokenizer, hf, name, signal } = {}) {
+    if (hf) return this.#importHF(hf, name, signal);
     const ck = await this.putBlob(checkpoint, { signal });
     const tok = await this.putBlob(tokenizer, { signal });
     return this.#call('POST', '/v1/llm/models', { checkpoint: ck.id, tokenizer: tok.id, name }, { signal });
+  }
+
+  // Uploads a Hugging Face model directory: config, tokenizer files and
+  // every safetensors shard, streamed from disk.
+  async #importHF(dir, name, signal) {
+    const { readdir } = await import('node:fs/promises');
+    const { join } = await import('node:path');
+    const files = await readdir(dir);
+    const put = async (file) => (await this.putBlob({ path: join(dir, file) }, { signal })).id;
+    const optional = async (file) => (files.includes(file) ? put(file) : undefined);
+    const weights = [];
+    for (const f of files.filter((f) => f.endsWith('.safetensors')).sort()) weights.push(await put(f));
+    const body = {
+      format: 'hf', name, weights,
+      config: await put('config.json'),
+      tokenizer: await put('tokenizer.json'),
+      generation_config: await optional('generation_config.json'),
+      tokenizer_config: await optional('tokenizer_config.json'),
+    };
+    return this.#call('POST', '/v1/llm/models', body, { signal });
   }
 
   /**
@@ -208,8 +229,8 @@ export class Mesh {
    * node fails, the stage moves to another node and the text continues
    * exactly as it would have. Breaking out of the loop stops the generation.
    */
-  async *generate({ model, prompt, maxTokens, temperature, seed, stages, signal } = {}) {
-    const body = JSON.stringify({ model, prompt, max_tokens: maxTokens, temperature, seed, stages });
+  async *generate({ model, prompt, chat, maxTokens, temperature, seed, stages, signal } = {}) {
+    const body = JSON.stringify({ model, prompt, chat, max_tokens: maxTokens, temperature, seed, stages });
     const controller = new AbortController();
     const onAbort = () => controller.abort(signal.reason);
     signal?.addEventListener('abort', onAbort, { once: true });

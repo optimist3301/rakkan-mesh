@@ -151,7 +151,7 @@ func generate(t *testing.T, n *llmNode, req GenerateRequest, onToken func(int)) 
 // localTokens generates with the whole model in one process.
 func localTokens(ck *Checkpoint, tok *Tokenizer, prompt string, maxTokens int) []int {
 	c := ck.Config
-	stage := NewStage(c, ck.Layers, NewRope(c))
+	stage := NewStage(c, ck.Layers, NewRope(c, c.SeqLen), c.SeqLen)
 	tokens := tok.Encode(prompt, true)
 	sampler := NewSampler(0, 0)
 	var out []int

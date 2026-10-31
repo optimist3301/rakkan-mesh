@@ -83,6 +83,20 @@ for await (const e of mesh.generate({ model, prompt: 'Once upon a time', maxToke
 
 Пример: `examples/story.js`.
 
+Модели Hugging Face (Llama, Mistral, Qwen2/2.5, Qwen3) импортируются из
+каталога, скачанного с Hub: `config.json`, `tokenizer.json`,
+`tokenizer_config.json`, `generation_config.json` и `*.safetensors`.
+С `chat: true` промпт оборачивается в формат чата модели:
+
+```js
+const { model } = await mesh.importModel({ hf: 'models/Qwen2.5-0.5B-Instruct' });
+for await (const e of mesh.generate({ model, prompt: 'What is the capital of France?', chat: true, maxTokens: 50 })) {
+  if (!e.done) process.stdout.write(e.text);
+}
+```
+
+Пример: `examples/chat.js`.
+
 ## Открытая сеть
 
 Владелец корневого ключа открывает сеть командой

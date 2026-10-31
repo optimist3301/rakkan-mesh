@@ -29,6 +29,9 @@ type GenerateRequest struct {
 	Stages int
 	// Providers hold the model's blobs, in addition to this node.
 	Providers []peer.ID
+	// Chat wraps the prompt in the model's conversation format, for
+	// chat-tuned models; it is an error for models without one.
+	Chat bool
 }
 
 // Event is one generated token.
@@ -61,9 +64,9 @@ type Stats struct {
 // itself.
 type coordModel struct {
 	manifest *Manifest
-	embed    []float32
+	embed    Matrix
 	head     *Head
-	tok      *Tokenizer
+	tok      Codec
 }
 
 // ErrNoStages means no member can serve the model's layers.
@@ -89,7 +92,7 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 		return s.blobs.Store().ReadAll(id, max)
 	}
 	cm = &coordModel{manifest: m}
-	embedSize := int64(4 * c.Vocab * c.Dim)
+	embedSize := EmbedBytes(c)
 	data, err := part(m.Embed, embedSize)
 	if err != nil {
 		return nil, err
@@ -106,7 +109,7 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 	if data, err = part(m.Tokenizer, 64<<20); err != nil {
 		return nil, err
 	}
-	if cm.tok, err = ReadTokenizer(data, c.Vocab); err != nil {
+	if cm.tok, err = readCodec(m, data); err != nil {
 		return nil, err
 	}
 	s.mu.Lock()
@@ -187,19 +190,19 @@ func (l *localStage) forward(xs []float32, pos, tokens int) error {
 func (l *localStage) close() { l.release() }
 
 // openStage starts a stage on a node: this one, or a member.
-func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, from, to int, providers []peer.ID) (stageConn, error) {
+func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, from, to, positions int, providers []peer.ID) (stageConn, error) {
 	if node == s.node.ID() {
 		l, err := s.acquire(ctx, model, from, to, providers)
 		if err != nil {
 			return nil, err
 		}
 		c := l.manifest.Config
-		cache := CacheBytes(c, to-from)
+		cache := CacheBytes(c, to-from, positions)
 		if err := s.reserve(cache); err != nil {
 			s.release(l)
 			return nil, err
 		}
-		return &localStage{stage: NewStage(c, l.layers, l.rope), dim: c.Dim, release: func() {
+		return &localStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim, release: func() {
 			s.unreserve(cache)
 			s.release(l)
 		}}, nil
@@ -210,7 +213,7 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 	}
 	// Loading may fetch the layers first.
 	st.SetDeadline(time.Now().Add(10 * time.Minute))
-	req := request{Op: "open", Model: model.String(), From: from, To: to}
+	req := request{Op: "open", Model: model.String(), From: from, To: to, Ctx: positions}
 	for _, p := range providers {
 		req.Providers = append(req.Providers, p.String())
 	}
@@ -229,9 +232,11 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 // planned is a stage of a running generation.
 type planned struct {
 	from, to int
-	node     peer.ID
-	conn     stageConn
-	witness  *witness
+	// positions is the generation's length: prompt and new tokens.
+	positions int
+	node      peer.ID
+	conn      stageConn
+	witness   *witness
 	// unwitnessed is set when no trusted node could witness the stage on
 	// its current node; it is not looked for again until the stage moves.
 	unwitnessed bool
@@ -294,6 +299,33 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	}
 	c := cm.manifest.Config
 
+	m := cm.manifest
+	prompt := req.Prompt
+	if req.Chat {
+		if m.Chat == nil {
+			return nil, errors.New("the model has no chat format")
+		}
+		prompt = m.Chat.Prefix + prompt + m.Chat.Suffix
+	}
+	tokens := cm.tok.Encode(prompt)
+	if bos := m.bos(); bos >= 0 {
+		tokens = append([]int{bos}, tokens...)
+	}
+	if len(tokens) == 0 {
+		return nil, errors.New("empty prompt")
+	}
+	if len(tokens) >= c.SeqLen {
+		return nil, fmt.Errorf("prompt of %d tokens fills the context of %d", len(tokens), c.SeqLen)
+	}
+	stats := &Stats{PromptTokens: len(tokens)}
+	sampler := NewSampler(req.Temperature, req.Seed)
+	maxTokens := c.SeqLen - len(tokens)
+	if req.MaxTokens > 0 {
+		maxTokens = min(req.MaxTokens, maxTokens)
+	}
+	// Stages keep caches for exactly this many positions.
+	positions := len(tokens) + maxTokens
+
 	n := req.Stages
 	if n <= 0 {
 		n = len(s.servers())
@@ -315,7 +347,7 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		}
 	}()
 	for i := range n {
-		st := &planned{from: i * c.Layers / n, to: (i + 1) * c.Layers / n}
+		st := &planned{from: i * c.Layers / n, to: (i + 1) * c.Layers / n, positions: positions}
 		if err := s.place(ctx, req.Model, st, used, providers); err != nil {
 			return nil, err
 		}
@@ -323,22 +355,13 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		stages[i] = st
 	}
 
-	tokens := cm.tok.Encode(req.Prompt, true)
-	if len(tokens) >= c.SeqLen {
-		return nil, fmt.Errorf("prompt of %d tokens fills the context of %d", len(tokens), c.SeqLen)
-	}
-	stats := &Stats{PromptTokens: len(tokens)}
-	sampler := NewSampler(req.Temperature, req.Seed)
-	maxTokens := min(req.MaxTokens, c.SeqLen-len(tokens))
-	if req.MaxTokens <= 0 {
-		maxTokens = c.SeqLen - len(tokens)
-	}
-
 	// Prefill: the whole prompt through each stage in one request.
 	xs := make([]float32, 0, len(tokens)*c.Dim)
 	for _, t := range tokens {
 		xs = append(xs, Embed(c, cm.embed, t)...)
 	}
+	stop := m.stop()
+	var pending []byte // bytes of a character split across tokens
 	pos := 0
 	for stats.Tokens < maxTokens {
 		count := len(xs) / c.Dim
@@ -350,12 +373,16 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		pos += count
 		last := xs[(count-1)*c.Dim:]
 		next := sampler.Sample(cm.head.Logits(c, last))
-		if next == TokenBOS || next == TokenEOS {
+		if slices.Contains(stop, next) {
 			break
 		}
-		if err := emit(Event{Token: next, Text: cm.tok.Decode(tokens[len(tokens)-1], next)}); err != nil {
+		pending = append(pending, cm.tok.Piece(tokens[len(tokens)-1], next)...)
+		var text []byte
+		text, pending = validUTF8Prefix(pending)
+		if err := emit(Event{Token: next, Text: string(text)}); err != nil {
 			return nil, err
 		}
+		pending = slices.Clone(pending)
 		tokens = append(tokens, next)
 		stats.Tokens++
 		xs = Embed(c, cm.embed, next)
@@ -378,7 +405,7 @@ func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude
 		if s.cfg.Trust != nil && s.cfg.Trust.Suspect(node) {
 			continue
 		}
-		conn, err := s.openStage(ctx, node, model, st.from, st.to, providers)
+		conn, err := s.openStage(ctx, node, model, st.from, st.to, st.positions, providers)
 		if err != nil {
 			lastErr = err
 			s.log.Info("stage refused", "node", node.ShortString(), "err", err)
@@ -494,7 +521,7 @@ func (s *Service) ensureWitness(ctx context.Context, model blob.ID, st *planned,
 		if !tr.Trusted(node) {
 			continue
 		}
-		conn, err := s.openStage(ctx, node, model, st.from, st.to, providers)
+		conn, err := s.openStage(ctx, node, model, st.from, st.to, st.positions, providers)
 		if err != nil {
 			continue
 		}

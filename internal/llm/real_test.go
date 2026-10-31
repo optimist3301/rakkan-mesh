@@ -37,7 +37,7 @@ func realModel(t testing.TB) (*Checkpoint, *Tokenizer) {
 // generateLocal runs the whole model in one stage, greedily.
 func generateLocal(ck *Checkpoint, tok *Tokenizer, prompt string, steps int) ([]int, string) {
 	c := ck.Config
-	stage := NewStage(c, ck.Layers, NewRope(c))
+	stage := NewStage(c, ck.Layers, NewRope(c, c.SeqLen), c.SeqLen)
 	tokens := tok.Encode(prompt, true)
 	var out strings.Builder
 	sampler := NewSampler(0, 0)

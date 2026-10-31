@@ -25,7 +25,7 @@ import (
 // Protocol serves pipeline stages. One stream is one stage of one
 // generation, and its key/value cache lives exactly as long as the stream:
 //
-//	-> {"op":"open","model":id,"from":l0,"to":l1,"providers":[...]}  <- status
+//	-> {"op":"open","model":id,"from":l0,"to":l1,"ctx":n,"providers":[...]}  <- status
 //	-> {"op":"forward","pos":p,"tokens":t} + activations [t][dim]    <- status + activations
 //
 // The node fetches the layers' blobs from the providers if needed. A
@@ -46,6 +46,9 @@ type request struct {
 	Providers []string `json:"providers,omitempty"`
 	Pos       int      `json:"pos,omitempty"`
 	Tokens    int      `json:"tokens,omitempty"`
+	// Ctx is the positions a generation needs, for which the stage keeps
+	// its cache; 0 means the model's whole context.
+	Ctx int `json:"ctx,omitempty"`
 }
 
 type status struct {
@@ -281,11 +284,7 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 	if from < 0 || to > m.Config.Layers || from >= to {
 		return nil, nil, nil, 0, fmt.Errorf("layers %d..%d outside the model's %d", from, to, m.Config.Layers)
 	}
-	var size int64
-	for _, sz := range m.Config.layerSizes() {
-		size += int64(sz) * 4
-	}
-	size *= int64(to - from)
+	size := LayerBytes(m.Config) * int64(to-from)
 	if err := s.reserve(size); err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -296,7 +295,7 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 			s.unreserve(size)
 			return nil, nil, nil, 0, err
 		}
-		data, err := s.blobs.Store().ReadAll(id, size)
+		data, err := s.blobs.Store().ReadAll(id, LayerBytes(m.Config))
 		if err == nil {
 			var l *Layer
 			if l, err = LoadLayer(m.Config, data); err == nil {
@@ -310,7 +309,7 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 	}
 	s.unreserve(size) // accounted by the caller once loaded
 	s.log.Info("loaded model layers", "model", model.String()[:12], "from", from, "to", to)
-	return m, layers, NewRope(m.Config), size, nil
+	return m, layers, NewRope(m.Config, m.Config.SeqLen), size, nil
 }
 
 // reserve checks the memory budget, unloading idle shards to make room.
@@ -427,13 +426,17 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	}
 	defer s.release(l)
 	cfg := l.manifest.Config
-	cache := CacheBytes(cfg, req.To-req.From)
+	positions := req.Ctx
+	if positions <= 0 || positions > cfg.SeqLen {
+		positions = cfg.SeqLen
+	}
+	cache := CacheBytes(cfg, req.To-req.From, positions)
 	if err := s.reserve(cache); err != nil {
 		writeStatus(st, err)
 		return
 	}
 	defer func() { s.unreserve(cache); s.notify() }()
-	stage := NewStage(cfg, l.layers, l.rope)
+	stage := NewStage(cfg, l.layers, l.rope, positions)
 	if writeStatus(st, nil) != nil {
 		return
 	}
@@ -451,8 +454,8 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 			st.Reset()
 			return
 		}
-		if req.Tokens <= 0 || req.Pos < 0 || req.Pos+req.Tokens > cfg.SeqLen {
-			writeStatus(st, fmt.Errorf("positions %d..%d outside the context of %d", req.Pos, req.Pos+req.Tokens, cfg.SeqLen))
+		if req.Tokens <= 0 || req.Pos < 0 || req.Pos+req.Tokens > positions {
+			writeStatus(st, fmt.Errorf("positions %d..%d outside the context of %d", req.Pos, req.Pos+req.Tokens, positions))
 			return
 		}
 		acts, err := readFrame(st, 4*req.Tokens*cfg.Dim)

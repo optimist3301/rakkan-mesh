@@ -29,15 +29,15 @@ func synthetic(seed uint64) *Checkpoint {
 		}
 		return v
 	}
-	ck := &Checkpoint{Config: c, Embed: r(c.Vocab*c.Dim, 1), Head: &Head{RmsFinal: r(c.Dim, 1), Wcls: r(c.Vocab*c.Dim, 0.2)}}
+	ck := &Checkpoint{Config: c, Embed: Matrix{F32: r(c.Vocab*c.Dim, 1)}, Head: &Head{RmsFinal: r(c.Dim, 1), Wcls: Matrix{F32: r(c.Vocab*c.Dim, 0.2)}}}
 	for range c.Layers {
 		l := &Layer{}
-		for i, size := range c.layerSizes() {
-			scale := 0.2
-			if i == 0 || i == 5 { // norm weights
-				scale = 1
+		for _, t := range l.tensors(c) {
+			if t.mat != nil {
+				t.mat.F32 = r(t.size, 0.2)
+			} else {
+				*t.vec = r(t.size, 1) // norm weights
 			}
-			*l.tensors()[i] = r(size, scale)
 		}
 		ck.Layers = append(ck.Layers, l)
 	}
@@ -89,10 +89,10 @@ func naiveLogits(ck *Checkpoint, tokens []int) []float64 {
 	caches := make([]kv, c.Layers)
 	var x []float64
 	for pos, tok := range tokens {
-		x = f(ck.Embed[tok*c.Dim : (tok+1)*c.Dim])
+		x = f(ck.Embed.F32[tok*c.Dim : (tok+1)*c.Dim])
 		for li, l := range ck.Layers {
 			xn := norm(x, l.RmsAtt)
-			q, k, v := matvec(l.Wq, xn, c.Dim), matvec(l.Wk, xn, c.KVDim()), matvec(l.Wv, xn, c.KVDim())
+			q, k, v := matvec(l.Wq.F32, xn, c.Dim), matvec(l.Wk.F32, xn, c.KVDim()), matvec(l.Wv.F32, xn, c.KVDim())
 			rope(q, pos)
 			rope(k, pos)
 			caches[li].k = append(caches[li].k, k)
@@ -120,29 +120,29 @@ func naiveLogits(ck *Checkpoint, tokens []int) []float64 {
 					}
 				}
 			}
-			o := matvec(l.Wo, att, c.Dim)
+			o := matvec(l.Wo.F32, att, c.Dim)
 			for i := range x {
 				x[i] += o[i]
 			}
 			xn = norm(x, l.RmsFfn)
-			a, b := matvec(l.W1, xn, c.Hidden), matvec(l.W3, xn, c.Hidden)
+			a, b := matvec(l.W1.F32, xn, c.Hidden), matvec(l.W3.F32, xn, c.Hidden)
 			for i := range a {
 				a[i] = a[i] / (1 + math.Exp(-a[i])) * b[i]
 			}
-			o = matvec(l.W2, a, c.Dim)
+			o = matvec(l.W2.F32, a, c.Dim)
 			for i := range x {
 				x[i] += o[i]
 			}
 		}
 	}
-	return matvec(ck.Head.Wcls, norm(x, ck.Head.RmsFinal), c.Vocab)
+	return matvec(ck.Head.Wcls.F32, norm(x, ck.Head.RmsFinal), c.Vocab)
 }
 
 func TestForwardMatchesNaiveReference(t *testing.T) {
 	ck := synthetic(1)
 	c := ck.Config
 	tokens := []int{1, 7, 33, 2, 49, 12, 12, 30, 5, 18}
-	stage := NewStage(c, ck.Layers, NewRope(c))
+	stage := NewStage(c, ck.Layers, NewRope(c, c.SeqLen), c.SeqLen)
 	for pos, tok := range tokens {
 		x := Embed(c, ck.Embed, tok)
 		stage.Forward(x, pos)
@@ -175,9 +175,9 @@ func argmaxF64(v []float64) int {
 func TestStagesComposeExactly(t *testing.T) {
 	ck := synthetic(2)
 	c := ck.Config
-	rope := NewRope(c)
-	whole := NewStage(c, ck.Layers, rope)
-	split := []*Stage{NewStage(c, ck.Layers[:1], rope), NewStage(c, ck.Layers[1:], rope)}
+	rope := NewRope(c, c.SeqLen)
+	whole := NewStage(c, ck.Layers, rope, c.SeqLen)
+	split := []*Stage{NewStage(c, ck.Layers[:1], rope, c.SeqLen), NewStage(c, ck.Layers[1:], rope, c.SeqLen)}
 	for pos, tok := range []int{1, 4, 9, 16, 25} {
 		a, b := Embed(c, ck.Embed, tok), Embed(c, ck.Embed, tok)
 		whole.Forward(a, pos)

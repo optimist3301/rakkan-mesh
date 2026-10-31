@@ -472,10 +472,20 @@ func (s *Server) trust(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"peers": peers})
 }
 
+// importRequest names uploaded blobs: a llama2.c checkpoint and tokenizer,
+// or, with format "hf", a Hugging Face model's files.
 type importRequest struct {
-	Checkpoint string `json:"checkpoint"` // blob IDs, uploaded first
+	Format     string `json:"format,omitempty"` // "llama2c" (default) or "hf"
+	Checkpoint string `json:"checkpoint,omitempty"`
 	Tokenizer  string `json:"tokenizer"`
 	Name       string `json:"name,omitempty"`
+	// Hugging Face: config.json, the optional generation_config.json and
+	// tokenizer_config.json, tokenizer.json (as Tokenizer), and the
+	// safetensors files.
+	Config           string   `json:"config,omitempty"`
+	GenerationConfig string   `json:"generation_config,omitempty"`
+	TokenizerConfig  string   `json:"tokenizer_config,omitempty"`
+	Weights          []string `json:"weights,omitempty"`
 }
 
 // importModel splits a llama2.c checkpoint into a model's blobs.
@@ -495,6 +505,10 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 			return nil, err
 		}
 		return s.Blobs.ReadAll(id, 64<<30)
+	}
+	if req.Format == "hf" {
+		s.importHF(w, req, read)
+		return
 	}
 	ckData, err := read(req.Checkpoint)
 	if err != nil {
@@ -523,7 +537,54 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.Config})
 }
 
+// importHF imports a Hugging Face model, reading the weights from the
+// store tensor by tensor.
+func (s *Server) importHF(w http.ResponseWriter, req importRequest, read func(string) ([]byte, error)) {
+	var src llm.HFSource
+	var err error
+	small := func(dst *[]byte, id, what string, required bool) bool {
+		if id == "" && !required {
+			return true
+		}
+		if *dst, err = read(id); err != nil {
+			badRequest(w, "%s: %v", what, err)
+			return false
+		}
+		return true
+	}
+	if !small(&src.Config, req.Config, "config", true) || !small(&src.Tokenizer, req.Tokenizer, "tokenizer", true) ||
+		!small(&src.GenerationConfig, req.GenerationConfig, "generation config", false) ||
+		!small(&src.TokenizerConfig, req.TokenizerConfig, "tokenizer config", false) {
+		return
+	}
+	if len(req.Weights) == 0 {
+		badRequest(w, "no weights")
+		return
+	}
+	for _, idStr := range req.Weights {
+		id, err := blob.ParseID(idStr)
+		if err != nil {
+			badRequest(w, "weights: %v", err)
+			return
+		}
+		r, err := s.Blobs.Open(id)
+		if err != nil {
+			badRequest(w, "weights: %v", err)
+			return
+		}
+		defer r.Close()
+		src.Weights = append(src.Weights, r)
+	}
+	id, m, err := llm.ImportHF(s.Blobs, src, req.Name)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.Config, "chat": m.Chat != nil})
+}
+
 type generateRequest struct {
+	Chat        bool    `json:"chat,omitempty"`
 	Model       string  `json:"model"`
 	Prompt      string  `json:"prompt"`
 	MaxTokens   int     `json:"max_tokens,omitempty"`
@@ -553,7 +614,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
-		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages,
+		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat,
 	}, func(e llm.Event) error {
 		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {
 			return err
