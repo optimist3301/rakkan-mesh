@@ -132,7 +132,16 @@ export class Mesh {
    * model directory (config.json, tokenizer.json, *.safetensors): Llama,
    * Mistral, Qwen2/2.5, Qwen3.
    */
-  importModel(options: { checkpoint: BlobSource; tokenizer: BlobSource; name?: string; signal?: AbortSignal } | { hf: string; name?: string; signal?: AbortSignal }): Promise<{ model: string; config: ModelConfig; chat?: boolean }>;
+  importModel(options: ({ checkpoint: BlobSource; tokenizer: BlobSource } | { hf: string }) & {
+    name?: string;
+    /**
+     * Store the matrices quantized: "q8_0" (about half of bf16, nearly
+     * lossless), "q4_m" (4 bits, value and down projections 8 bits) or
+     * "q4_0"; or "bf16".
+     */
+    quant?: 'bf16' | 'q8_0' | 'q4_m' | 'q4_0';
+    signal?: AbortSignal;
+  }): Promise<{ model: string; config: ModelConfig; chat?: boolean }>;
   generate(options: GenerateOptions): AsyncGenerator<GenerateEvent, void, undefined>;
 }
 
@@ -166,7 +175,7 @@ export interface ModelConfig {
   rope_theta?: number;
   qkv_bias?: boolean;
   qk_norm?: boolean;
-  /** How weight matrices are stored: "f32" or "bf16". */
+  /** How weight matrices are stored: "f32", "bf16", "q8_0", "q4_m" or "q4_0". */
   dtype?: string;
 }
 

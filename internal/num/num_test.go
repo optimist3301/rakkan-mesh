@@ -3,6 +3,7 @@ package num
 import (
 	"math"
 	"math/rand/v2"
+	"slices"
 	"testing"
 )
 
@@ -156,6 +157,113 @@ func BenchmarkDot(b *testing.B) {
 	b.Run("DotBF16", func(b *testing.B) {
 		for b.Loop() {
 			DotBF16(w16, x)
+		}
+	})
+}
+
+func TestQuantized(t *testing.T) {
+	r := rand.New(rand.NewPCG(3, 4))
+	rowsN, cols := 300, 896
+	w := make([]float32, rowsN*cols)
+	for i := range w {
+		w[i] = float32(r.NormFloat64() * 0.05)
+	}
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(r.NormFloat64())
+	}
+	exact := make([]float32, rowsN)
+	MatVec32(exact, w, x)
+	q8, s8 := QuantizeQ8(w)
+	q4, s4 := QuantizeQ4(w)
+	got8, got4 := make([]float32, rowsN), make([]float32, rowsN)
+	MatVecQ8(got8, q8, s8, x)
+	MatVecQ4(got4, q4, s4, x)
+	var e8, e4, norm float64
+	for i := range exact {
+		e8 += math.Pow(float64(got8[i]-exact[i]), 2)
+		e4 += math.Pow(float64(got4[i]-exact[i]), 2)
+		norm += math.Pow(float64(exact[i]), 2)
+	}
+	e8, e4 = math.Sqrt(e8/norm), math.Sqrt(e4/norm)
+	t.Logf("relative error: Q8_0 %.4f, Q4_0 %.4f", e8, e4)
+	if e8 > 0.01 || e4 > 0.15 {
+		t.Fatal("quantization error too large")
+	}
+	// Dequantized Q8_0 weights are within half a step; Q4_0 weights,
+	// whose scale minimizes the block's error rather than any one weight's,
+	// within two.
+	d8, d4 := make([]float32, len(w)), make([]float32, len(w))
+	DequantQ8(d8, q8, s8)
+	DequantQ4(d4, q4, s4)
+	for i := range w {
+		if math.Abs(float64(d8[i]-w[i])) > float64(s8[i/QBlock])*0.5001 || math.Abs(float64(d4[i]-w[i])) > math.Abs(float64(s4[i/QBlock]))*2.0001+1e-9 {
+			t.Fatalf("weight %d: %v, Q8 %v, Q4 %v", i, w[i], d8[i], d4[i])
+		}
+	}
+	// Vector and portable integer sums agree, including extreme values.
+	qx := make([]int8, cols)
+	for i := range qx {
+		qx[i] = int8(r.IntN(255) - 127)
+	}
+	for i := range q8[:cols] {
+		if i%7 == 0 {
+			q8[i] = 127
+		} else if i%11 == 0 {
+			q8[i] = -127
+		}
+	}
+	for _, n := range []int{cols, cols - 32, 96, 32} { // 28, 27, 3 and 1 blocks
+		nb := n / QBlock
+		a, b := make([]int32, nb), make([]int32, nb)
+		blockSumsQ8(q8[:n], qx[:n], a)
+		blockSumsQ8Generic(q8[:n], qx[:n], b)
+		if !slices.Equal(a, b) {
+			t.Fatalf("%d blocks: Q8 sums differ between vector and portable code", nb)
+		}
+		blockSumsQ4(q4[:n/2], qx[:n], a)
+		blockSumsQ4Generic(q4[:n/2], qx[:n], b)
+		if !slices.Equal(a, b) {
+			t.Fatalf("%d blocks: Q4 sums differ between vector and portable code", nb)
+		}
+	}
+}
+
+func BenchmarkMatVec(b *testing.B) {
+	rowsN, cols := 4864, 896
+	w := make([]float32, rowsN*cols)
+	for i := range w {
+		w[i] = float32(i%13) * 0.01
+	}
+	x := make([]float32, cols)
+	for i := range x {
+		x[i] = float32(i % 7)
+	}
+	out := make([]float32, rowsN)
+	w16 := make([]uint16, len(w))
+	for i, v := range w {
+		w16[i] = ToBF16(v)
+	}
+	q8, s8 := QuantizeQ8(w)
+	q4, s4 := QuantizeQ4(w)
+	b.Run("f32", func(b *testing.B) {
+		for b.Loop() {
+			MatVec32(out, w, x)
+		}
+	})
+	b.Run("bf16", func(b *testing.B) {
+		for b.Loop() {
+			MatVecBF16(out, w16, x)
+		}
+	})
+	b.Run("q8_0", func(b *testing.B) {
+		for b.Loop() {
+			MatVecQ8(out, q8, s8, x)
+		}
+	})
+	b.Run("q4_0", func(b *testing.B) {
+		for b.Loop() {
+			MatVecQ4(out, q4, s4, x)
 		}
 	})
 }

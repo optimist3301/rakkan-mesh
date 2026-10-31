@@ -1,7 +1,7 @@
 // Starts a local Rakkan network of real daemons for integration tests.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, existsSync } from 'node:fs';
+import { mkdtempSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,7 +66,13 @@ export async function startCluster({ nodes = 3, workers = 2, llm = false, guests
     sockets.push(socket);
   }
 
-  const stop = () => procs.forEach((p) => p.kill());
+  // Stopping removes the cluster's directory: stores hold copies of every
+  // uploaded model, gigabytes for real ones.
+  const stop = () => {
+    procs.forEach((p) => p.kill());
+    setTimeout(() => rmSync(dir, { recursive: true, force: true }), 500).unref?.();
+    process.once('exit', () => rmSync(dir, { recursive: true, force: true }));
+  };
   // Wait until the first node sees every other member's load.
   const mesh = connect({ socket: sockets[0] });
   const deadline = Date.now() + 20_000;

@@ -191,3 +191,80 @@ func TestStagesComposeExactly(t *testing.T) {
 		}
 	}
 }
+
+// Quantized models survive storage and compose across stages exactly, and
+// stay close to the float model.
+func TestQuantizedModels(t *testing.T) {
+	c := Config{Dim: 64, Hidden: 128, Layers: 3, Heads: 4, KVHeads: 2, Vocab: 50, SeqLen: 24}
+	ref := randomModel(c, 7)
+	for _, dtype := range []string{"bf16", "q8_0", "q4_m", "q4_0"} {
+		ck := randomModel(c, 7)
+		if err := ck.Quantize(dtype); err != nil {
+			t.Fatal(err)
+		}
+		qc := ck.Config
+		for i, l := range ck.Layers {
+			back, err := LoadLayer(qc, EncodeLayer(qc, l))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(EncodeLayer(qc, back)) != string(EncodeLayer(qc, l)) || int64(len(EncodeLayer(qc, l))) != LayerBytes(qc) {
+				t.Fatalf("%s: layer %d changed in a round trip", dtype, i)
+			}
+			ck.Layers[i] = back
+		}
+		embed, err := LoadEmbed(qc, appendMatrix(nil, ck.Embed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		rope := NewRope(qc, qc.SeqLen)
+		whole := NewStage(qc, ck.Layers, rope, 8)
+		split := []*Stage{NewStage(qc, ck.Layers[:2], rope, 8), NewStage(qc, ck.Layers[2:], rope, 8)}
+		exact := NewStage(c, ref.Layers, NewRope(c, c.SeqLen), 8)
+		var worst float64
+		for pos, tok := range []int{1, 4, 9, 16, 25} {
+			a, b, e := Embed(qc, embed, tok), Embed(qc, embed, tok), Embed(c, ref.Embed, tok)
+			whole.Forward(a, pos)
+			for _, s := range split {
+				s.Forward(b, pos)
+			}
+			exact.Forward(e, pos)
+			for i := range a {
+				if math.Float32bits(a[i]) != math.Float32bits(b[i]) {
+					t.Fatalf("%s, position %d: split pipeline differs", dtype, pos)
+				}
+				worst = max(worst, math.Abs(float64(a[i]-e[i]))/(1+math.Abs(float64(e[i]))))
+			}
+		}
+		t.Logf("%s: %d bytes per layer, largest relative deviation from float32 %.3f", dtype, LayerBytes(qc), worst)
+		if worst > 0.5 {
+			t.Fatalf("%s deviates too far from the float model", dtype)
+		}
+	}
+}
+
+func randomModel(c Config, seed uint64) *Checkpoint {
+	rng := rand.New(rand.NewPCG(seed, seed))
+	r := func(n int, scale float64) []float32 {
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = float32(rng.NormFloat64() * scale)
+		}
+		return v
+	}
+	ck := &Checkpoint{Config: c, Embed: Matrix{F32: r(c.Vocab*c.Dim, 1)}, Head: &Head{RmsFinal: r(c.Dim, 1)}}
+	ck.Head.Wcls = ck.Embed
+	ck.Config.SharedClassifier = true
+	for range c.Layers {
+		l := &Layer{}
+		for _, t := range l.tensors(c) {
+			if t.mat != nil {
+				t.mat.F32 = r(t.size, 0.1)
+			} else {
+				*t.vec = r(t.size, 1)
+			}
+		}
+		ck.Layers = append(ck.Layers, l)
+	}
+	return ck
+}

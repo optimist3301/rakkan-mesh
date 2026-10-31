@@ -29,3 +29,9 @@ func dotBF16(w *uint16, x *float32, n int, s *[32]float32) {
 	}
 	dotBF16Generic(unsafe.Slice(w, n), unsafe.Slice(x, n), s)
 }
+
+//go:noescape
+func blockSumsQ8AVX2(w, x *int8, nb int, sums *int32)
+
+//go:noescape
+func blockSumsQ4AVX2(w *byte, x *int8, nb int, sums *int32)

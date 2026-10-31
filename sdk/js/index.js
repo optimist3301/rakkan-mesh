@@ -196,16 +196,16 @@ export class Mesh {
    * blobs that pipeline stages fetch. Resolves to `{model, config}`; the
    * model ID is the same on every node for the same files.
    */
-  async importModel({ checkpoint, tokenizer, hf, name, signal } = {}) {
-    if (hf) return this.#importHF(hf, name, signal);
+  async importModel({ checkpoint, tokenizer, hf, name, quant, signal } = {}) {
+    if (hf) return this.#importHF(hf, name, quant, signal);
     const ck = await this.putBlob(checkpoint, { signal });
     const tok = await this.putBlob(tokenizer, { signal });
-    return this.#call('POST', '/v1/llm/models', { checkpoint: ck.id, tokenizer: tok.id, name }, { signal });
+    return this.#call('POST', '/v1/llm/models', { checkpoint: ck.id, tokenizer: tok.id, name, quant }, { signal });
   }
 
   // Uploads a Hugging Face model directory: config, tokenizer files and
   // every safetensors shard, streamed from disk.
-  async #importHF(dir, name, signal) {
+  async #importHF(dir, name, quant, signal) {
     const { readdir } = await import('node:fs/promises');
     const { join } = await import('node:path');
     const files = await readdir(dir);
@@ -214,7 +214,7 @@ export class Mesh {
     const weights = [];
     for (const f of files.filter((f) => f.endsWith('.safetensors')).sort()) weights.push(await put(f));
     const body = {
-      format: 'hf', name, weights,
+      format: 'hf', name, quant, weights,
       config: await put('config.json'),
       tokenizer: await put('tokenizer.json'),
       generation_config: await optional('generation_config.json'),

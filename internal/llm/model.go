@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
@@ -53,7 +54,11 @@ type Config struct {
 	// QKNorm normalizes each query and key head before the rotary
 	// embedding (Qwen3).
 	QKNorm bool `json:"qk_norm,omitempty"`
-	// DType stores weight matrices as "f32" (also "") or "bf16".
+	// DType stores weight matrices as "f32" (also ""), "bf16", or
+	// quantized: "q8_0", "q4_0" (package num), or "q4_m", which is q4_0
+	// with the value and down projections in q8_0, as llama.cpp's Q4_K_M
+	// keeps them more precise. With q4_0 and q4_m the embedding table and
+	// classifier, the most sensitive to precision, are q8_0.
 	DType string `json:"dtype,omitempty"`
 }
 
@@ -84,6 +89,28 @@ func (c Config) eps() float32 {
 	return 1e-5
 }
 
+func (c Config) quantized() bool { return c.DType == "q8_0" || c.DType == "q4_0" || c.DType == "q4_m" }
+
+// embedType is the type of the embedding table and the classifier.
+func (c Config) embedType() string {
+	if c.DType == "q4_0" || c.DType == "q4_m" {
+		return "q8_0"
+	}
+	return c.DType
+}
+
+// matType is the type of a layer's matrices; q4_m keeps the sensitive ones,
+// the value and down projections, in q8_0.
+func (c Config) matType(sensitive bool) string {
+	switch {
+	case c.DType != "q4_m":
+		return c.DType
+	case sensitive:
+		return "q8_0"
+	}
+	return "q4_0"
+}
+
 func (c Config) validate() error {
 	switch {
 	case c.Dim <= 0 || c.Hidden <= 0 || c.Layers <= 0 || c.Heads <= 0 || c.KVHeads <= 0 || c.Vocab <= 0 || c.SeqLen <= 0 || c.HeadDim < 0:
@@ -92,28 +119,40 @@ func (c Config) validate() error {
 		return errors.New("heads do not divide the model dimension evenly")
 	case c.Dim > 1<<16 || c.Hidden > 1<<18 || c.Layers > 1024 || c.Vocab > 1<<20 || c.SeqLen > 1<<20 || c.HeadSize() > 1024 || c.Heads > 1024:
 		return errors.New("dimensions out of range")
-	case c.DType != "" && c.DType != "f32" && c.DType != "bf16":
+	case !slices.Contains([]string{"", "f32", "bf16", "q8_0", "q4_0", "q4_m"}, c.DType):
 		return fmt.Errorf("unknown weight type %q", c.DType)
+	case c.quantized() && (c.Dim%num.QBlock != 0 || c.QDim()%num.QBlock != 0 || c.Hidden%num.QBlock != 0):
+		return fmt.Errorf("%s needs widths that are multiples of %d", c.DType, num.QBlock)
 	case c.RopeTheta < 0 || c.NormEps < 0 || c.NormEps > 1:
 		return errors.New("rope base or norm epsilon out of range")
 	}
 	return nil
 }
 
-// Matrix is a weight matrix, row-major [out][in], in float32 or bfloat16.
+// Matrix is a weight matrix, row-major [out][in]: float32, bfloat16, or
+// quantized in blocks with one scale each (Q8, Q4 and Scales; see package
+// num). Exactly one of F32, BF16, Q8 and Q4 is set.
 type Matrix struct {
-	F32  []float32
-	BF16 []uint16
+	F32    []float32
+	BF16   []uint16
+	Q8     []int8
+	Q4     []byte
+	Scales []float32
 }
 
 // Len is the number of elements.
-func (m Matrix) Len() int { return max(len(m.F32), len(m.BF16)) }
+func (m Matrix) Len() int { return max(len(m.F32), len(m.BF16), len(m.Q8), 2*len(m.Q4)) }
 
 // MulVec sets out = m·x.
 func (m Matrix) MulVec(out, x []float32) {
-	if m.BF16 != nil {
+	switch {
+	case m.Q8 != nil:
+		num.MatVecQ8(out, m.Q8, m.Scales, x)
+	case m.Q4 != nil:
+		num.MatVecQ4(out, m.Q4, m.Scales, x)
+	case m.BF16 != nil:
 		num.MatVecBF16(out, m.BF16, x)
-	} else {
+	default:
 		num.MatVec32(out, m.F32, x)
 	}
 }
@@ -121,21 +160,67 @@ func (m Matrix) MulVec(out, x []float32) {
 // Row copies row i, of n elements, into dst.
 func (m Matrix) Row(dst []float32, i int) {
 	n := len(dst)
-	if m.BF16 != nil {
+	nb := n / num.QBlock
+	switch {
+	case m.Q8 != nil:
+		num.DequantQ8(dst, m.Q8[i*n:(i+1)*n], m.Scales[i*nb:(i+1)*nb])
+	case m.Q4 != nil:
+		num.DequantQ4(dst, m.Q4[i*n/2:(i+1)*n/2], m.Scales[i*nb:(i+1)*nb])
+	case m.BF16 != nil:
 		for j, v := range m.BF16[i*n : (i+1)*n] {
 			dst[j] = num.BF16(v)
 		}
-		return
+	default:
+		copy(dst, m.F32[i*n:(i+1)*n])
 	}
-	copy(dst, m.F32[i*n:(i+1)*n])
 }
 
-// newMatrix allocates a zero matrix of n elements in the config's type.
-func newMatrix(c Config, n int) Matrix {
-	if c.DType == "bf16" {
-		return Matrix{BF16: make([]uint16, n)}
+// floats returns the matrix's values in float32; quantized matrices are
+// not expanded.
+func (m Matrix) floats() []float32 {
+	if m.BF16 == nil {
+		return m.F32
 	}
-	return Matrix{F32: make([]float32, n)}
+	out := make([]float32, len(m.BF16))
+	for i, v := range m.BF16 {
+		out[i] = num.BF16(v)
+	}
+	return out
+}
+
+// convert stores a float32 or bfloat16 matrix as dtype.
+func (m Matrix) convert(dtype string) Matrix {
+	switch dtype {
+	case "q8_0":
+		q, s := num.QuantizeQ8(m.floats())
+		return Matrix{Q8: q, Scales: s}
+	case "q4_0":
+		q, s := num.QuantizeQ4(m.floats())
+		return Matrix{Q4: q, Scales: s}
+	case "bf16":
+		if m.BF16 != nil {
+			return m
+		}
+		w := make([]uint16, len(m.F32))
+		for i, f := range m.F32 {
+			w[i] = num.ToBF16(f)
+		}
+		return Matrix{BF16: w}
+	}
+	return Matrix{F32: m.floats()}
+}
+
+// matBytes is the storage of n elements of a matrix type.
+func matBytes(dtype string, n int) int64 {
+	switch dtype {
+	case "bf16":
+		return 2 * int64(n)
+	case "q8_0":
+		return int64(n) + int64(n/num.QBlock)*4
+	case "q4_0":
+		return int64(n/2) + int64(n/num.QBlock)*4
+	}
+	return 4 * int64(n)
 }
 
 // Layer is one transformer layer's weights.
@@ -148,21 +233,24 @@ type Layer struct {
 	W1, W2, W3     Matrix // gate, down, up
 }
 
-// tensor is one of a layer's weights: a vector (float32) or a matrix.
+// tensor is one of a layer's weights: a vector (float32) or a matrix,
+// stored as dtype.
 type tensor struct {
-	vec  *[]float32
-	mat  *Matrix
-	size int
+	vec   *[]float32
+	mat   *Matrix
+	size  int
+	dtype string
 }
 
 // tensors lists a layer's weights in storage order: llama2.c's nine, then
 // the biases and head norms the config calls for.
 func (l *Layer) tensors(c Config) []tensor {
 	d, q, kv, h, hs := c.Dim, c.QDim(), c.KVDim(), c.Hidden, c.HeadSize()
+	m, sensitive := c.matType(false), c.matType(true)
 	t := []tensor{
-		{vec: &l.RmsAtt, size: d}, {mat: &l.Wq, size: q * d}, {mat: &l.Wk, size: kv * d}, {mat: &l.Wv, size: kv * d},
-		{mat: &l.Wo, size: d * q}, {vec: &l.RmsFfn, size: d}, {mat: &l.W1, size: h * d}, {mat: &l.W2, size: d * h},
-		{mat: &l.W3, size: h * d},
+		{vec: &l.RmsAtt, size: d}, {mat: &l.Wq, size: q * d, dtype: m}, {mat: &l.Wk, size: kv * d, dtype: m},
+		{mat: &l.Wv, size: kv * d, dtype: sensitive}, {mat: &l.Wo, size: d * q, dtype: m}, {vec: &l.RmsFfn, size: d},
+		{mat: &l.W1, size: h * d, dtype: m}, {mat: &l.W2, size: d * h, dtype: sensitive}, {mat: &l.W3, size: h * d, dtype: m},
 	}
 	if c.QKVBias {
 		t = append(t, tensor{vec: &l.Bq, size: q}, tensor{vec: &l.Bk, size: kv}, tensor{vec: &l.Bv, size: kv})
@@ -177,16 +265,13 @@ func (l *Layer) tensors(c Config) []tensor {
 func LayerBytes(c Config) int64 {
 	var n int64
 	for _, t := range (&Layer{}).tensors(c) {
-		n += int64(t.size) * elemBytes(c, t.mat != nil)
+		if t.mat != nil {
+			n += matBytes(t.dtype, t.size)
+		} else {
+			n += 4 * int64(t.size)
+		}
 	}
 	return n
-}
-
-func elemBytes(c Config, matrix bool) int64 {
-	if matrix && c.DType == "bf16" {
-		return 2
-	}
-	return 4
 }
 
 // StageGas prices a forward through layers for tokens in gas units, for
@@ -399,6 +484,33 @@ func (h *Head) Logits(c Config, x []float32) []float32 {
 	logits := make([]float32, c.Vocab)
 	h.Wcls.MulVec(logits, xn)
 	return logits
+}
+
+// Quantize converts the checkpoint's matrices to dtype ("bf16", "q8_0" or
+// "q4_0"). The llama2.c format holds only float32, so a quantized
+// checkpoint is imported (Import), not encoded.
+func (ck *Checkpoint) Quantize(dtype string) error {
+	c := ck.Config
+	c.DType = dtype
+	if err := c.validate(); err != nil {
+		return err
+	}
+	for _, l := range ck.Layers {
+		for _, t := range l.tensors(c) {
+			if t.mat != nil {
+				*t.mat = t.mat.convert(t.dtype)
+			}
+		}
+	}
+	shared := c.SharedClassifier
+	ck.Embed = ck.Embed.convert(c.embedType())
+	if shared {
+		ck.Head.Wcls = ck.Embed
+	} else {
+		ck.Head.Wcls = ck.Head.Wcls.convert(c.embedType())
+	}
+	ck.Config = c
+	return nil
 }
 
 // --- llama2.c checkpoints ---

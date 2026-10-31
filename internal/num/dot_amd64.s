@@ -84,3 +84,130 @@ donebf:
 	VMOVUPS Y3, 96(DX)
 	VZEROUPPER
 	RET
+
+// Integer block sums, four blocks at a time (nb is a multiple of 4): for
+// each block of 32, sum w[j]*x[j] exactly. The signed-by-signed product
+// goes through VPMADDUBSW, which multiplies unsigned by signed bytes: |w|
+// times x carrying w's sign. Pairs of products fit in 16 bits
+// (2·128·127 < 32768) and VPMADDWD widens them to 32; two rounds of
+// VPHADDD and a final add reduce each block's eight partial sums. Q4_0
+// blocks unpack to 32 signed bytes in order: the low nibbles of the 16
+// bytes are weights 0-15, the high nibbles weights 16-31.
+
+// func blockSumsQ8AVX2(w *int8, x *int8, nb int, sums *int32)
+TEXT ·blockSumsQ8AVX2(SB), NOSPLIT, $0-32
+	MOVQ w+0(FP), SI
+	MOVQ x+8(FP), DI
+	MOVQ nb+16(FP), CX
+	MOVQ sums+24(FP), DX
+	MOVL $0x00010001, AX
+	VMOVD AX, X7
+	VPBROADCASTD X7, Y7
+blockSumsQ8AVX2loop:
+	VMOVDQU 0(SI), Y0
+	VMOVDQU 0(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y10
+	VMOVDQU 32(SI), Y0
+	VMOVDQU 32(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y11
+	VMOVDQU 64(SI), Y0
+	VMOVDQU 64(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y12
+	VMOVDQU 96(SI), Y0
+	VMOVDQU 96(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y13
+	VPHADDD Y11, Y10, Y10
+	VPHADDD Y13, Y12, Y12
+	VPHADDD Y12, Y10, Y10
+	VEXTRACTI128 $1, Y10, X11
+	VPADDD X11, X10, X10
+	VMOVDQU X10, (DX)
+	ADDQ $128, SI
+	ADDQ $128, DI
+	ADDQ $16, DX
+	SUBQ $4, CX
+	JNZ blockSumsQ8AVX2loop
+	VZEROUPPER
+	RET
+
+// func blockSumsQ4AVX2(w *byte, x *int8, nb int, sums *int32)
+TEXT ·blockSumsQ4AVX2(SB), NOSPLIT, $0-32
+	MOVQ w+0(FP), SI
+	MOVQ x+8(FP), DI
+	MOVQ nb+16(FP), CX
+	MOVQ sums+24(FP), DX
+	MOVL $0x00010001, AX
+	VMOVD AX, X7
+	VPBROADCASTD X7, Y7
+	MOVL $0x0f0f0f0f, AX
+	VMOVD AX, X8
+	VPBROADCASTD X8, Y8
+	MOVL $0x08080808, AX
+	VMOVD AX, X9
+	VPBROADCASTD X9, Y9
+blockSumsQ4AVX2loop:
+	VMOVDQU 0(SI), X0
+	VPSRLW $4, X0, X1
+	VINSERTI128 $1, X1, Y0, Y0
+	VPAND Y8, Y0, Y0
+	VPSUBB Y9, Y0, Y0
+	VMOVDQU 0(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y10
+	VMOVDQU 16(SI), X0
+	VPSRLW $4, X0, X1
+	VINSERTI128 $1, X1, Y0, Y0
+	VPAND Y8, Y0, Y0
+	VPSUBB Y9, Y0, Y0
+	VMOVDQU 32(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y11
+	VMOVDQU 32(SI), X0
+	VPSRLW $4, X0, X1
+	VINSERTI128 $1, X1, Y0, Y0
+	VPAND Y8, Y0, Y0
+	VPSUBB Y9, Y0, Y0
+	VMOVDQU 64(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y12
+	VMOVDQU 48(SI), X0
+	VPSRLW $4, X0, X1
+	VINSERTI128 $1, X1, Y0, Y0
+	VPAND Y8, Y0, Y0
+	VPSUBB Y9, Y0, Y0
+	VMOVDQU 96(DI), Y1
+	VPSIGNB Y0, Y0, Y2
+	VPSIGNB Y0, Y1, Y3
+	VPMADDUBSW Y3, Y2, Y4
+	VPMADDWD Y7, Y4, Y13
+	VPHADDD Y11, Y10, Y10
+	VPHADDD Y13, Y12, Y12
+	VPHADDD Y12, Y10, Y10
+	VEXTRACTI128 $1, Y10, X11
+	VPADDD X11, X10, X10
+	VMOVDQU X10, (DX)
+	ADDQ $64, SI
+	ADDQ $128, DI
+	ADDQ $16, DX
+	SUBQ $4, CX
+	JNZ blockSumsQ4AVX2loop
+	VZEROUPPER
+	RET

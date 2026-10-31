@@ -241,8 +241,11 @@ func (s *Service) acquire(ctx context.Context, model blob.ID, from, to int, prov
 		l = &loaded{ready: make(chan struct{})}
 		s.shards[key] = l
 		s.mu.Unlock()
-		l.manifest, l.layers, l.rope, l.bytes, l.err = s.load(ctx, model, from, to, providers)
+		// Loaded outside the lock, published under it: adverts read the
+		// shard meanwhile.
+		manifest, layers, rope, size, err := s.load(ctx, model, from, to, providers)
 		s.mu.Lock()
+		l.manifest, l.layers, l.rope, l.bytes, l.err = manifest, layers, rope, size, err
 		if l.err != nil {
 			delete(s.shards, key)
 		} else {

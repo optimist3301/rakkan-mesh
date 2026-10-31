@@ -293,6 +293,24 @@ test('language model: Qwen from Hugging Face, when RAKKAN_HF_MODELS has it', { s
   assert.equal(stats.stages.length, 3);
 });
 
+test('language model: quantized to 4 bits, the same text however the layers are split', async () => {
+  const { model, config } = await mesh.importModel({
+    checkpoint: { path: new URL('fixtures/tiny-model.bin', import.meta.url).pathname },
+    tokenizer: { path: new URL('fixtures/tiny-tokenizer.bin', import.meta.url).pathname },
+    quant: 'q4_m',
+  });
+  assert.equal(config.dtype, 'q4_m');
+  const texts = [];
+  for (const stages of [1, 2, 3]) {
+    let text = '';
+    for await (const e of mesh.generate({ model, prompt: 'abc', maxTokens: 20, stages })) if (!e.done) text += e.text;
+    texts.push(text);
+  }
+  assert.ok(texts[0].length > 0);
+  assert.equal(texts[1], texts[0]);
+  assert.equal(texts[2], texts[0]);
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

@@ -30,6 +30,9 @@ type HFSource struct {
 	Tokenizer        []byte // tokenizer.json
 	// Weights are the safetensors files, all shards in any order.
 	Weights []SizedReaderAt
+	// Quant, if set, stores the matrices as "bf16", "q8_0" or "q4_0"
+	// instead of the type they come in.
+	Quant string
 }
 
 // SizedReaderAt is a file read in pieces, such as a stored blob.
@@ -188,8 +191,16 @@ func (m *hfModel) vec(name string, n int) ([]float32, error) {
 	return out, nil
 }
 
-func (m *hfModel) mat(name string, n int) (Matrix, error) {
-	if m.c.DType == "bf16" {
+// mat reads a matrix, stored as dtype.
+func (m *hfModel) mat(name string, n int, dtype string) (Matrix, error) {
+	if dtype == "q8_0" || dtype == "q4_0" {
+		v, err := m.vec(name, n)
+		if err != nil {
+			return Matrix{}, err
+		}
+		return Matrix{F32: v}.convert(dtype), nil
+	}
+	if dtype == "bf16" {
 		t, ok := m.tensors[name]
 		if !ok {
 			return Matrix{}, fmt.Errorf("tensor %s missing", name)
@@ -210,7 +221,7 @@ func (m *hfModel) mat(name string, n int) (Matrix, error) {
 	if err != nil {
 		return Matrix{}, err
 	}
-	if m.c.DType == "bf16" {
+	if dtype == "bf16" {
 		// A model mixing types: round the rest to bfloat16.
 		w := make([]uint16, n)
 		for i, f := range v {
@@ -236,14 +247,6 @@ func permuteRows[T any](w []T, rows, head int) {
 			copy(blk[2*j*n:], tmp[j*n:(j+1)*n])
 			copy(blk[(2*j+1)*n:], tmp[(j+head/2)*n:(j+head/2+1)*n])
 		}
-	}
-}
-
-func permuteMatrix(m *Matrix, rows, head int) {
-	if m.BF16 != nil {
-		permuteRows(m.BF16, rows, head)
-	} else {
-		permuteRows(m.F32, rows, head)
 	}
 }
 
@@ -319,6 +322,12 @@ func ImportHF(store *blob.Store, src HFSource, name string) (blob.ID, *Manifest,
 	if err != nil {
 		return blob.ID{}, nil, err
 	}
+	if src.Quant != "" {
+		c.DType = src.Quant
+		if err := c.validate(); err != nil {
+			return blob.ID{}, nil, err
+		}
+	}
 	if _, err := ReadBPE(src.Tokenizer, c.Vocab); err != nil {
 		return blob.ID{}, nil, err
 	}
@@ -330,7 +339,7 @@ func ImportHF(store *blob.Store, src HFSource, name string) (blob.ID, *Manifest,
 		id, err := store.PutBytes(b)
 		return id.String(), err
 	}
-	embed, err := hm.mat("model.embed_tokens.weight", c.Vocab*c.Dim)
+	embed, err := hm.mat("model.embed_tokens.weight", c.Vocab*c.Dim, c.embedType())
 	if err != nil {
 		return blob.ID{}, nil, err
 	}
@@ -342,7 +351,7 @@ func ImportHF(store *blob.Store, src HFSource, name string) (blob.ID, *Manifest,
 		return blob.ID{}, nil, err
 	}
 	if !c.SharedClassifier {
-		if head.Wcls, err = hm.mat("lm_head.weight", c.Vocab*c.Dim); err != nil {
+		if head.Wcls, err = hm.mat("lm_head.weight", c.Vocab*c.Dim, c.embedType()); err != nil {
 			return blob.ID{}, nil, err
 		}
 	}
@@ -381,20 +390,26 @@ func (hm *hfModel) layer(i int) (*Layer, error) {
 			*dst, err = hm.vec(p+name, n)
 		}
 	}
-	mat := func(dst *Matrix, name string, n int) {
+	mat := func(dst *Matrix, name string, n int, sensitive bool) {
 		if err == nil {
-			*dst, err = hm.mat(p+name, n)
+			*dst, err = hm.mat(p+name, n, c.matType(sensitive))
+		}
+	}
+	// Query and key rows are permuted before they are stored in blocks.
+	floatMat := func(dst *Matrix, name string, n int) {
+		if err == nil {
+			*dst, err = hm.mat(p+name, n, "f32")
 		}
 	}
 	vec(&l.RmsAtt, "input_layernorm.weight", d)
-	mat(&l.Wq, "self_attn.q_proj.weight", q*d)
-	mat(&l.Wk, "self_attn.k_proj.weight", kv*d)
-	mat(&l.Wv, "self_attn.v_proj.weight", kv*d)
-	mat(&l.Wo, "self_attn.o_proj.weight", d*q)
+	floatMat(&l.Wq, "self_attn.q_proj.weight", q*d)
+	floatMat(&l.Wk, "self_attn.k_proj.weight", kv*d)
+	mat(&l.Wv, "self_attn.v_proj.weight", kv*d, true)
+	mat(&l.Wo, "self_attn.o_proj.weight", d*q, false)
 	vec(&l.RmsFfn, "post_attention_layernorm.weight", d)
-	mat(&l.W1, "mlp.gate_proj.weight", h*d)
-	mat(&l.W2, "mlp.down_proj.weight", d*h)
-	mat(&l.W3, "mlp.up_proj.weight", h*d)
+	mat(&l.W1, "mlp.gate_proj.weight", h*d, false)
+	mat(&l.W2, "mlp.down_proj.weight", d*h, true)
+	mat(&l.W3, "mlp.up_proj.weight", h*d, false)
 	if c.QKVBias {
 		vec(&l.Bq, "self_attn.q_proj.bias", q)
 		vec(&l.Bk, "self_attn.k_proj.bias", kv)
@@ -407,8 +422,9 @@ func (hm *hfModel) layer(i int) (*Layer, error) {
 	if err != nil {
 		return nil, err
 	}
-	permuteMatrix(&l.Wq, q, hs)
-	permuteMatrix(&l.Wk, kv, hs)
+	permuteRows(l.Wq.F32, q, hs)
+	permuteRows(l.Wk.F32, kv, hs)
+	l.Wq, l.Wk = l.Wq.convert(c.matType(false)), l.Wk.convert(c.matType(false))
 	if c.QKVBias {
 		permuteVec(l.Bq, hs)
 		permuteVec(l.Bk, hs)

@@ -8,6 +8,7 @@ import (
 	"math"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
 
 // A model is stored as blobs: the embedding table, each layer, the head
@@ -104,9 +105,20 @@ func f32Bytes(parts ...[]float32) []byte {
 	return b
 }
 
-// appendMatrix appends a matrix in its own type: float32 or bfloat16,
-// little-endian.
+// appendMatrix appends a matrix in its own type, little-endian: float32,
+// bfloat16, or quantized as the scales (float32) then the values.
 func appendMatrix(b []byte, m Matrix) []byte {
+	switch {
+	case m.Q8 != nil:
+		b = append(b, f32Bytes(m.Scales)...)
+		for _, v := range m.Q8 {
+			b = append(b, byte(v))
+		}
+		return b
+	case m.Q4 != nil:
+		b = append(b, f32Bytes(m.Scales)...)
+		return append(b, m.Q4...)
+	}
 	if m.BF16 != nil {
 		for _, v := range m.BF16 {
 			b = binary.LittleEndian.AppendUint16(b, v)
@@ -135,8 +147,28 @@ func (d *decoder) take(n int) []byte {
 
 func (d *decoder) vec(n int) []float32 { return floats(d.take(4 * n)) }
 
-func (d *decoder) mat(n int) Matrix {
-	if d.c.DType == "bf16" {
+func (d *decoder) matAs(n int, dtype string) Matrix {
+	switch dtype {
+	case "q8_0":
+		scales := d.vec(n / num.QBlock)
+		b := d.take(n)
+		if b == nil {
+			return Matrix{}
+		}
+		q := make([]int8, n)
+		for i, v := range b {
+			q[i] = int8(v)
+		}
+		return Matrix{Q8: q, Scales: scales}
+	case "q4_0":
+		scales := d.vec(n / num.QBlock)
+		b := d.take(n / 2)
+		if b == nil {
+			return Matrix{}
+		}
+		return Matrix{Q4: append([]byte(nil), b...), Scales: scales}
+	}
+	if dtype == "bf16" {
 		b := d.take(2 * n)
 		if b == nil {
 			return Matrix{}
@@ -176,7 +208,7 @@ func LoadLayer(c Config, data []byte) (*Layer, error) {
 	l := &Layer{}
 	for _, t := range l.tensors(c) {
 		if t.mat != nil {
-			*t.mat = d.mat(t.size)
+			*t.mat = d.matAs(t.size, t.dtype)
 		} else {
 			*t.vec = d.vec(t.size)
 		}
@@ -196,19 +228,19 @@ func EncodeHead(c Config, h *Head) []byte {
 // LoadEmbed decodes the embedding table.
 func LoadEmbed(c Config, data []byte) (Matrix, error) {
 	d := &decoder{c: c, data: data}
-	m := d.mat(c.Vocab * c.Dim)
+	m := d.matAs(c.Vocab*c.Dim, c.embedType())
 	return m, d.done()
 }
 
 // EmbedBytes is the embedding table's size.
-func EmbedBytes(c Config) int64 { return int64(c.Vocab) * int64(c.Dim) * elemBytes(c, true) }
+func EmbedBytes(c Config) int64 { return matBytes(c.embedType(), c.Vocab*c.Dim) }
 
 // LoadHead decodes the head; a shared classifier is the embedding table.
 func LoadHead(c Config, data []byte, embed Matrix) (*Head, error) {
 	d := &decoder{c: c, data: data}
 	h := &Head{RmsFinal: d.vec(c.Dim), Wcls: embed}
 	if !c.SharedClassifier {
-		h.Wcls = d.mat(c.Vocab * c.Dim)
+		h.Wcls = d.matAs(c.Vocab*c.Dim, c.embedType())
 	}
 	return h, d.done()
 }

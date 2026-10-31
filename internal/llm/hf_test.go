@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"math"
@@ -151,55 +152,69 @@ func TestHFModels(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
 			continue
 		}
-		t.Run(name, func(t *testing.T) {
-			store, err := blob.OpenStore(t.TempDir(), 1<<34)
-			if err != nil {
-				t.Fatal(err)
-			}
-			start := time.Now()
-			id, m, err := ImportHF(store, openHF(t, dir), name)
-			if err != nil {
-				t.Fatal(err)
-			}
-			t.Logf("imported in %s: %+v, stop %v, chat %v", time.Since(start).Round(time.Millisecond), m.Config, m.Stop, m.Chat != nil)
-			lm := loadStored(t, store, id)
+		var ref [][]float32 // the reference's logits, computed once per model
+		for _, quant := range []string{"", "q8_0", "q4_m", "q4_0"} {
+			label := name + "/" + cmp.Or(quant, "native")
+			t.Run(label, func(t *testing.T) {
+				store, err := blob.OpenStore(t.TempDir(), 1<<34)
+				if err != nil {
+					t.Fatal(err)
+				}
+				start := time.Now()
+				src := openHF(t, dir)
+				src.Quant = quant
+				id, m, err := ImportHF(store, src, name)
+				if err != nil {
+					t.Fatal(err)
+				}
+				size := EmbedBytes(m.Config) + int64(m.Config.Layers)*LayerBytes(m.Config)
+				t.Logf("imported in %s, %d MiB: %+v, stop %v, chat %v", time.Since(start).Round(time.Millisecond), size>>20, m.Config, m.Stop, m.Chat != nil)
+				lm := loadStored(t, store, id)
 
-			// Special tokens are recognized in text; text round-trips.
-			tokens := lm.tok.Encode("<|im_start|>user\nНу привет, 世界! 1234<|im_end|>")
-			if tokens[0] != 151644 || tokens[len(tokens)-1] != 151645 {
-				t.Fatalf("special tokens not encoded as such: %v", tokens)
-			}
-			var back []byte
-			for i, tok := range tokens {
-				back = append(back, lm.tok.Piece(max(i-1, 0), tok)...)
-			}
-			if string(back) != "<|im_start|>user\nНу привет, 世界! 1234<|im_end|>" {
-				t.Fatalf("round trip: %q", back)
-			}
+				// Special tokens are recognized in text; text round-trips.
+				tokens := lm.tok.Encode("<|im_start|>user\nНу привет, 世界! 1234<|im_end|>")
+				if tokens[0] != 151644 || tokens[len(tokens)-1] != 151645 {
+					t.Fatalf("special tokens not encoded as such: %v", tokens)
+				}
+				var back []byte
+				for i, tok := range tokens {
+					back = append(back, lm.tok.Piece(max(i-1, 0), tok)...)
+				}
+				if string(back) != "<|im_start|>user\nНу привет, 世界! 1234<|im_end|>" {
+					t.Fatalf("round trip: %q", back)
+				}
 
-			// Logits agree with the independent numpy implementation.
-			prompt := lm.tok.Encode(lm.m.Chat.Prefix + "What is the capital of France?" + lm.m.Chat.Suffix)
-			compareWithReference(t, dir, lm, prompt)
+				// Logits agree with the independent numpy implementation:
+				// closely for the weights as published, roughly once
+				// quantized.
+				prompt := lm.tok.Encode(lm.m.Chat.Prefix + "What is the capital of France?" + lm.m.Chat.Suffix)
+				if ref == nil {
+					ref = referenceLogits(t, dir, prompt, m.Config.Vocab)
+				}
+				if ref != nil {
+					compareLogits(t, lm, prompt, ref, quant == "")
+				}
 
-			text, speed := lm.chat("What is the capital of France? Answer in one word.", 12)
-			t.Logf("answer %q (%.1f tokens/s)", text, speed)
-			if !strings.Contains(text, "Paris") {
-				t.Fatalf("answer %q does not name Paris", text)
-			}
-			text, _ = lm.chat("Write one sentence about the sea.", 40)
-			t.Logf("sentence %q", text)
-		})
+				text, speed := lm.chat("What is the capital of France? Answer in one word.", 12)
+				t.Logf("answer %q (%.1f tokens/s)", text, speed)
+				if !strings.Contains(text, "Paris") {
+					t.Fatalf("answer %q does not name Paris", text)
+				}
+				text, _ = lm.chat("Write one sentence about the sea.", 40)
+				t.Logf("sentence %q", text)
+			})
+		}
 	}
 }
 
-// compareWithReference checks the engine's logits at every position of
-// tokens against tools/llmref/hf_reference.py.
-func compareWithReference(t *testing.T, dir string, lm *localModel, tokens []int) {
+// referenceLogits runs tools/llmref/hf_reference.py on tokens, or returns
+// nil without python3 and numpy.
+func referenceLogits(t *testing.T, dir string, tokens []int, vocab int) [][]float32 {
 	t.Helper()
 	script, _ := filepath.Abs("../../tools/llmref/hf_reference.py")
 	if _, err := exec.LookPath("python3"); err != nil || exec.Command("python3", "-c", "import numpy").Run() != nil {
 		t.Log("python3 with numpy not available: skipping the reference comparison")
-		return
+		return nil
 	}
 	var ids []string
 	for _, tok := range tokens {
@@ -215,34 +230,48 @@ func compareWithReference(t *testing.T, dir string, lm *localModel, tokens []int
 	if err != nil {
 		t.Fatal(err)
 	}
-	vocab := lm.m.Config.Vocab
 	if len(raw) != 4*vocab*len(tokens) {
 		t.Fatalf("reference wrote %d bytes", len(raw))
 	}
+	ref := make([][]float32, len(tokens))
+	for p := range ref {
+		ref[p] = make([]float32, vocab)
+		for i := range ref[p] {
+			ref[p][i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*(p*vocab+i):]))
+		}
+	}
+	return ref
+}
+
+// compareLogits checks the engine's logits at every position against the
+// reference's: within 1e-3 of the largest with strict, and the top token
+// the same at all positions but one; quantized, the top token the same at
+// three positions in four.
+func compareLogits(t *testing.T, lm *localModel, tokens []int, ref [][]float32, strict bool) {
+	t.Helper()
 	got := lm.logits(tokens)
-	var worst, scale float64
+	var worst, scale, kl float64
 	agree := 0
 	for p := range tokens {
-		ref := make([]float32, vocab)
-		for i := range ref {
-			ref[i] = math.Float32frombits(binary.LittleEndian.Uint32(raw[4*(p*vocab+i):]))
+		kl += klDivergence(ref[p], got[p])
+		for i := range ref[p] {
+			worst = max(worst, math.Abs(float64(got[p][i]-ref[p][i])))
+			scale = max(scale, math.Abs(float64(ref[p][i])))
 		}
-		for i := range ref {
-			worst = max(worst, math.Abs(float64(got[p][i]-ref[i])))
-			scale = max(scale, math.Abs(float64(ref[i])))
-		}
-		if argmax(got[p]) == argmax(ref) {
+		if argmax(got[p]) == argmax(ref[p]) {
 			agree++
 		}
 	}
-	t.Logf("logits vs reference over %d positions: max difference %.2e (largest logit %.1f), top token agrees at %d", len(tokens), worst, scale, agree)
-	if worst > 1e-3*scale || agree < len(tokens)-1 {
+	t.Logf("logits vs reference over %d positions: max difference %.2e (largest logit %.1f), top token agrees at %d, mean KL divergence %.4f",
+		len(tokens), worst, scale, agree, kl/float64(len(tokens)))
+	if strict && (worst > 1e-3*scale || agree < len(tokens)-1) || !strict && agree*4 < len(tokens)*3 {
 		t.Fatalf("engine and reference disagree: max difference %.3g, top token agrees at %d of %d", worst, agree, len(tokens))
 	}
 }
 
-// TestHFModelOverCluster runs a Qwen model split over three nodes and
-// checks the text is the one a single process generates.
+// TestHFModelOverCluster runs a Qwen model split over three nodes, as
+// published and quantized, and checks the text is the one a single process
+// generates.
 func TestHFModelOverCluster(t *testing.T) {
 	root := os.Getenv("RAKKAN_HF_MODELS")
 	if root == "" {
@@ -257,33 +286,66 @@ func TestHFModelOverCluster(t *testing.T) {
 	for range 3 {
 		c.add(true)
 	}
-	model, _, err := ImportHF(coord.blobs.Store(), openHF(t, dir), "qwen")
-	if err != nil {
-		t.Fatal(err)
-	}
-	const question = "Name three colors of the rainbow."
-	want, wantTokens, _ := loadStored(t, coord.blobs.Store(), model).chatTokens(question, 30)
 	waitServers(t, coord, 3)
+	for _, quant := range []string{"", "q4_m"} {
+		t.Run(cmp.Or(quant, "native"), func(t *testing.T) {
+			src := openHF(t, dir)
+			src.Quant = quant
+			model, _, err := ImportHF(coord.blobs.Store(), src, "qwen")
+			if err != nil {
+				t.Fatal(err)
+			}
+			const question = "Name three colors of the rainbow."
+			want, wantTokens, _ := loadStored(t, coord.blobs.Store(), model).chatTokens(question, 30)
 
-	var text strings.Builder
-	var got []int
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
-	defer cancel()
-	stats, err := coord.llm.Generate(ctx, GenerateRequest{Model: model, Prompt: question, Chat: true, MaxTokens: 30, Stages: 3}, func(e Event) error {
-		got = append(got, e.Token)
-		text.WriteString(e.Text)
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
+			var text strings.Builder
+			var got []int
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+			defer cancel()
+			req := GenerateRequest{Model: model, Prompt: question, Chat: true, MaxTokens: 30, Stages: 3}
+			stats, err := coord.llm.Generate(ctx, req, func(e Event) error {
+				got = append(got, e.Token)
+				text.WriteString(e.Text)
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, wantTokens) || text.String() != want {
+				t.Fatalf("distributed %q, local %q", text.String(), want)
+			}
+			t.Logf("%d tokens over %d stages in %s, loading the layers included: %q", stats.Tokens, len(stats.Stages), stats.Elapsed.Round(time.Millisecond), text.String())
+			// Again, with the layers loaded.
+			if stats, err = coord.llm.Generate(ctx, req, func(Event) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("loaded: %d tokens in %s, %.1f tokens/s", stats.Tokens, stats.Elapsed.Round(time.Millisecond), float64(stats.Tokens)/stats.Elapsed.Seconds())
+		})
 	}
-	if !slices.Equal(got, wantTokens) || text.String() != want {
-		t.Fatalf("distributed %q, local %q", text.String(), want)
+}
+
+// klDivergence is KL(softmax(p) || softmax(q)) in nats: how much the
+// engine's next-token distribution q loses against the reference's p.
+func klDivergence(p, q []float32) float64 {
+	logSoftmax := func(v []float32) []float64 {
+		mx := float64(v[0])
+		for _, x := range v {
+			mx = max(mx, float64(x))
+		}
+		var sum float64
+		for _, x := range v {
+			sum += math.Exp(float64(x) - mx)
+		}
+		out := make([]float64, len(v))
+		for i, x := range v {
+			out[i] = float64(x) - mx - math.Log(sum)
+		}
+		return out
 	}
-	t.Logf("%d tokens over %d stages in %s, loading the layers included: %q", stats.Tokens, len(stats.Stages), stats.Elapsed.Round(time.Millisecond), text.String())
-	// Again, with the layers loaded.
-	if stats, err = coord.llm.Generate(ctx, GenerateRequest{Model: model, Prompt: question, Chat: true, MaxTokens: 30, Stages: 3}, func(Event) error { return nil }); err != nil {
-		t.Fatal(err)
+	lp, lq := logSoftmax(p), logSoftmax(q)
+	var kl float64
+	for i := range lp {
+		kl += math.Exp(lp[i]) * (lp[i] - lq[i])
 	}
-	t.Logf("loaded: %d tokens in %s, %.1f tokens/s", stats.Tokens, stats.Elapsed.Round(time.Millisecond), float64(stats.Tokens)/stats.Elapsed.Seconds())
+	return kl
 }

@@ -475,7 +475,9 @@ func (s *Server) trust(w http.ResponseWriter, _ *http.Request) {
 // importRequest names uploaded blobs: a llama2.c checkpoint and tokenizer,
 // or, with format "hf", a Hugging Face model's files.
 type importRequest struct {
-	Format     string `json:"format,omitempty"` // "llama2c" (default) or "hf"
+	Format string `json:"format,omitempty"` // "llama2c" (default) or "hf"
+	// Quant stores the matrices as "bf16", "q8_0", "q4_m" or "q4_0".
+	Quant      string `json:"quant,omitempty"`
 	Checkpoint string `json:"checkpoint,omitempty"`
 	Tokenizer  string `json:"tokenizer"`
 	Name       string `json:"name,omitempty"`
@@ -525,6 +527,12 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "%v", err)
 		return
 	}
+	if req.Quant != "" {
+		if err := ck.Quantize(req.Quant); err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+	}
 	if _, err := llm.ReadTokenizer(tokData, ck.Config.Vocab); err != nil {
 		badRequest(w, "%v", err)
 		return
@@ -540,7 +548,7 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 // importHF imports a Hugging Face model, reading the weights from the
 // store tensor by tensor.
 func (s *Server) importHF(w http.ResponseWriter, req importRequest, read func(string) ([]byte, error)) {
-	var src llm.HFSource
+	src := llm.HFSource{Quant: req.Quant}
 	var err error
 	small := func(dst *[]byte, id, what string, required bool) bool {
 		if id == "" && !required {
