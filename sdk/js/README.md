@@ -30,6 +30,28 @@ for await (const item of mesh.map({ module: wasmBytes, inputs, stopOnExitCode: 0
 // выход из цикла (break) или AbortSignal отменяют оставшиеся задачи.
 ```
 
+## Большие данные
+
+Вход больше 256 КБ SDK сам загружает в хранилище узла как блоб и передаёт
+ссылкой; выход больше 1 МиБ возвращается блобом и скачивается в `res.output`.
+Блобы режутся на чанки по 1 МиБ с проверкой SHA-256 каждого; исполнитель
+забирает вход по чанкам, при обрыве — докачивает.
+
+```js
+// Потоковая загрузка файла, без чтения в память.
+const { id } = await mesh.putBlob({ path: 'photo.raw' });
+const res = await mesh.run({ module, inputBlob: id, outputAsBlob: true });
+
+// Потоковая выгрузка результата; start/end — диапазон байтов (докачка).
+(await mesh.getBlob(res.outputBlob)).pipe(fs.createWriteStream('out.raw'));
+
+// Map по блобам.
+for await (const item of mesh.map({ module, inputBlobs: [id1, id2, id3] })) { ... }
+```
+
+Предел размера задаёт политика узлов: `rakkan-node daemon -max-input-mb 256
+-max-output-mb 256`.
+
 Ошибки задач — `TaskError` с полем `kind`: `out_of_gas`, `timeout`, `trap`,
 `invalid_module`, `output_limit`, … (ошибки самой задачи, повторять бессмысленно),
 `no_capacity`, `not_enough_nodes`, `no_consensus` (ошибки сети), `unavailable`

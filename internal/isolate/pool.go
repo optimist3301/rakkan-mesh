@@ -95,9 +95,10 @@ func NewPool(cfg Config) (*Pool, error) {
 		cfg.IdleTimeout = 30 * time.Second
 	}
 	if cfg.Isolation.MemoryBytes <= 0 {
-		// Linear memory may be copied when it grows, plus runtime and
-		// compiled code.
-		cfg.Isolation.MemoryBytes = 2*int64(cfg.Ceiling.MaxMemoryPages)*sandbox.PageSize + 256<<20
+		// Linear memory may be copied when it grows; the worker also holds
+		// the task's input and output, the runtime and compiled code.
+		cfg.Isolation.MemoryBytes = 2*int64(cfg.Ceiling.MaxMemoryPages)*sandbox.PageSize +
+			int64(cfg.Ceiling.MaxInputBytes) + int64(cfg.Ceiling.MaxOutputBytes) + 256<<20
 	}
 	if cfg.Executable == "" {
 		exe, err := os.Executable()

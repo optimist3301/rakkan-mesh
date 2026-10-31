@@ -2,7 +2,6 @@ package exec
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
 
@@ -23,8 +23,15 @@ var (
 type Request struct {
 	Module []byte
 	Entry  string
-	Input  []byte
-	Limits sandbox.Limits
+	// Input, or InputBlob for data already in the local blob store. Inputs
+	// larger than 1 MiB are stored as blobs automatically and fetched by
+	// the executor in verified chunks.
+	Input     []byte
+	InputBlob blob.ID
+	// Providers are other members holding InputBlob, which executors may
+	// fetch it from in parallel with this node.
+	Providers []peer.ID
+	Limits    sandbox.Limits
 	// Replicas > 1 runs the task on that many distinct members and accepts
 	// the outcome a majority agrees on.
 	Replicas int
@@ -33,8 +40,11 @@ type Request struct {
 // Result is a task's outcome and where it ran.
 type Result struct {
 	sandbox.Result
-	Node     peer.ID
-	Attempts int
+	// OutputBlob names an output larger than 1 MiB, fetched into the local
+	// blob store; Output is then empty.
+	OutputBlob blob.ID
+	Node       peer.ID
+	Attempts   int
 	// Replicas lists every replica's node and whether it agreed with the
 	// accepted outcome, when the task was replicated.
 	Replicas []Replica
@@ -51,6 +61,11 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 	if req.Limits == (sandbox.Limits{}) {
 		req.Limits = sandbox.DefaultLimits()
 	}
+	req, unpin, err := s.prepareInput(req)
+	if err != nil {
+		return nil, err
+	}
+	defer unpin()
 	if req.Replicas > 1 {
 		return s.runReplicated(ctx, req)
 	}
@@ -59,6 +74,28 @@ func (s *Service) Run(ctx context.Context, req Request) (*Result, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+// prepareInput turns a large inline input into a blob, so retries and
+// replicas share one stored copy and executors fetch it in verified chunks,
+// and pins the input blob while the task runs.
+func (s *Service) prepareInput(req Request) (Request, func(), error) {
+	store := s.cfg.Blobs.Store()
+	if req.InputBlob.IsZero() && len(req.Input) > inlineMax {
+		id, err := store.PutBytes(req.Input)
+		if err != nil {
+			return req, nil, err
+		}
+		req.InputBlob, req.Input = id, nil
+	}
+	if req.InputBlob.IsZero() {
+		return req, func() {}, nil
+	}
+	unpin, ok := store.Pin(req.InputBlob)
+	if !ok {
+		return req, nil, fmt.Errorf("%w: input blob %s", blob.ErrNotFound, req.InputBlob)
+	}
+	return req, unpin, nil
 }
 
 // placement tracks executors already used by a task, so retries and
@@ -234,11 +271,28 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 			return nil, ErrBusy
 		}
 		defer s.release()
-		res, err := s.cfg.Pool.Run(ctx, string(target), sandbox.Task{Module: req.Module, Entry: req.Entry, Input: req.Input, Limits: req.Limits})
+		input := req.Input
+		if !req.InputBlob.IsZero() {
+			var err error
+			if input, err = s.cfg.Blobs.Store().ReadAll(req.InputBlob, int64(req.Limits.MaxInputBytes)); err != nil {
+				if errors.Is(err, blob.ErrTooLarge) {
+					return nil, fmt.Errorf("%w: %v", sandbox.ErrInputTooLarge, err)
+				}
+				return nil, err
+			}
+		}
+		res, err := s.cfg.Pool.Run(ctx, string(target), sandbox.Task{Module: req.Module, Entry: req.Entry, Input: input, Limits: req.Limits})
 		if err != nil {
 			return nil, err
 		}
-		return &Result{Result: *res, Node: target}, nil
+		out := &Result{Result: *res, Node: target}
+		if len(res.Output) > inlineMax {
+			if out.OutputBlob, err = s.cfg.Blobs.Store().PutBytes(res.Output); err != nil {
+				return nil, err
+			}
+			out.Output = nil
+		}
+		return out, nil
 	}
 
 	s.mu.Lock()
@@ -262,6 +316,12 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 	defer st.Close()
 
 	h := header{Version: 1, ModuleHash: hash.String(), ModuleSize: len(req.Module), Entry: req.Entry, InputSize: len(req.Input), Limits: req.Limits}
+	if !req.InputBlob.IsZero() {
+		h.InputBlob, h.InputSize = req.InputBlob.String(), 0
+		for _, p := range req.Providers {
+			h.Providers = append(h.Providers, p.String())
+		}
+	}
 	if err := writeJSON(st, h); err != nil {
 		return nil, err
 	}
@@ -305,10 +365,22 @@ func (s *Service) execOn(ctx context.Context, target peer.ID, hash Hash, req Req
 	if rh.GasUsed < 0 || rh.GasUsed > req.Limits.MaxGas {
 		return nil, fmt.Errorf("%w: reported gas %d outside budget", ErrExecutorInternal, rh.GasUsed)
 	}
-	return &Result{Node: target, Result: sandbox.Result{
+	res := &Result{Node: target, Result: sandbox.Result{
 		ExitCode: rh.ExitCode, Output: output, Logs: logs, LogTruncated: rh.LogTruncated,
 		GasUsed: rh.GasUsed, Elapsed: time.Duration(rh.ElapsedNs),
-	}}, nil
+	}}
+	if rh.OutputBlob != "" {
+		// Fetch it now, so the result outlives the executor.
+		id, err := blob.ParseID(rh.OutputBlob)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrExecutorInternal, err)
+		}
+		if err := s.cfg.Blobs.Fetch(ctx, id, []peer.ID{target}, int64(req.Limits.MaxOutputBytes)); err != nil {
+			return nil, err
+		}
+		res.OutputBlob = id
+	}
+	return res, nil
 }
 
 // notePlaced remembers that an executor holds a module, for locality.
@@ -328,7 +400,7 @@ func (s *Service) notePlaced(p peer.ID, h Hash) {
 type outcome struct {
 	exit   uint32
 	gas    int64
-	output [sha256.Size]byte
+	output blob.ID
 	kind   string
 }
 
@@ -336,7 +408,12 @@ func outcomeOf(res *Result, err error) outcome {
 	if err != nil {
 		return outcome{kind: ErrorKind(err)}
 	}
-	return outcome{exit: res.ExitCode, gas: res.GasUsed, output: sha256.Sum256(res.Output)}
+	// Blob IDs identify content whether it arrived inline or as a blob.
+	id := res.OutputBlob
+	if id.IsZero() {
+		id = blob.IDOf(res.Output)
+	}
+	return outcome{exit: res.ExitCode, gas: res.GasUsed, output: id}
 }
 
 func (s *Service) runReplicated(ctx context.Context, req Request) (*Result, error) {
@@ -413,8 +490,10 @@ func (s *Service) runReplicated(ctx context.Context, req Request) (*Result, erro
 type MapRequest struct {
 	Module []byte
 	Entry  string
-	Inputs [][]byte
-	Limits sandbox.Limits
+	// Inputs, or InputBlobs naming stored blobs.
+	Inputs     [][]byte
+	InputBlobs []blob.ID
+	Limits     sandbox.Limits
 	// Concurrency bounds tasks in flight. Default: the free slots of all
 	// known executors.
 	Concurrency int
@@ -443,7 +522,11 @@ func (s *Service) Map(ctx context.Context, mr MapRequest) <-chan MapItem {
 			conc += l.Slots
 		}
 	}
-	conc = max(min(conc, len(mr.Inputs)), 1)
+	n := len(mr.Inputs)
+	if n == 0 {
+		n = len(mr.InputBlobs)
+	}
+	conc = max(min(conc, n), 1)
 
 	ctx, cancel := context.WithCancel(ctx)
 	out := make(chan MapItem)
@@ -453,7 +536,18 @@ func (s *Service) Map(ctx context.Context, mr MapRequest) <-chan MapItem {
 	for range conc {
 		wg.Go(func() {
 			for i := range jobs {
-				res, err := s.runOnce(ctx, Request{Module: mr.Module, Entry: mr.Entry, Input: mr.Inputs[i], Limits: mr.Limits}, newPlacement())
+				req := Request{Module: mr.Module, Entry: mr.Entry, Limits: mr.Limits}
+				if len(mr.Inputs) > 0 {
+					req.Input = mr.Inputs[i]
+				} else {
+					req.InputBlob = mr.InputBlobs[i]
+				}
+				var res *Result
+				prepared, unpin, err := s.prepareInput(req)
+				if err == nil {
+					res, err = s.runOnce(ctx, prepared, newPlacement())
+					unpin()
+				}
 				if ctx.Err() != nil {
 					continue // stopped or cancelled: not reported
 				}
@@ -471,7 +565,7 @@ func (s *Service) Map(ctx context.Context, mr MapRequest) <-chan MapItem {
 	}
 	go func() {
 	feed:
-		for i := range mr.Inputs {
+		for i := range n {
 			select {
 			case jobs <- i:
 			case <-ctx.Done():

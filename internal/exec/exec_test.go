@@ -15,6 +15,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
@@ -51,9 +52,10 @@ func newCluster(t *testing.T) *cluster {
 }
 
 type testNode struct {
-	node *mesh.Node
-	svc  *Service
-	pool *isolate.Pool
+	node  *mesh.Node
+	svc   *Service
+	pool  *isolate.Pool
+	blobs *blob.Service
 }
 
 func (tn *testNode) close() {
@@ -91,8 +93,12 @@ func (c *cluster) add(slots int) *testNode {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tn := &testNode{node: node}
-	cfg := Config{Node: node, LoadInterval: 200 * time.Millisecond}
+	store, err := blob.OpenStore(t.TempDir(), 1<<30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tn := &testNode{node: node, blobs: blob.NewService(node, store, nil)}
+	cfg := Config{Node: node, Blobs: tn.blobs, LoadInterval: 200 * time.Millisecond}
 	if slots > 0 {
 		tn.pool, err = isolate.NewPool(isolate.Config{Ceiling: sandbox.DefaultLimits(), Workers: slots, Isolation: isolate.StrictIsolation()})
 		if err != nil {
@@ -323,4 +329,74 @@ func TestMapStopsAtFirstMatch(t *testing.T) {
 		t.Fatalf("all %d inputs ran despite the early stop", reported)
 	}
 	t.Logf("stopped after %d of %d inputs", reported, n)
+}
+
+func bigLimits() sandbox.Limits {
+	l := sandbox.DefaultLimits()
+	l.MaxMemoryPages = 256 // 16 MiB
+	return l
+}
+
+func TestLargeInputAndOutputTravelAsBlobs(t *testing.T) {
+	c := newCluster(t)
+	exe := c.add(1)
+	req := c.add(0)
+	settle(t, req, exe)
+
+	in := make([]byte, 6<<20)
+	rand.Read(in)
+	res, err := req.svc.Run(t.Context(), Request{Module: w.EchoPages(100), Input: in, Limits: bigLimits()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Node != exe.node.ID() || res.OutputBlob.IsZero() || len(res.Output) != 0 {
+		t.Fatalf("node %s, output blob %s, inline output %d bytes", res.Node.ShortString(), res.OutputBlob, len(res.Output))
+	}
+	if !exe.blobs.Store().Has(blob.IDOf(in)) {
+		t.Fatal("executor did not receive the input as a blob")
+	}
+	// The output was fetched eagerly: it survives the executor leaving.
+	exe.close()
+	out, err := req.blobs.Store().ReadAll(res.OutputBlob, 1<<30)
+	if err != nil || !bytes.Equal(out, in) {
+		t.Fatalf("output blob: %v", err)
+	}
+}
+
+func TestInputBlobFromStore(t *testing.T) {
+	c := newCluster(t)
+	exe := c.add(1)
+	req := c.add(0)
+	settle(t, req, exe)
+	in := bytes.Repeat([]byte("rakkan "), 100_000)
+	id, err := req.blobs.Store().PutBytes(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := req.svc.Run(t.Context(), Request{Module: w.EchoPages(20), InputBlob: id, Limits: bigLimits()})
+	if err != nil || !bytes.Equal(res.Output, in) {
+		t.Fatalf("err=%v, output %d bytes", err, len(res.Output))
+	}
+	// Limits apply to blob inputs too.
+	lim := bigLimits()
+	lim.MaxInputBytes = 1000
+	if _, err := req.svc.Run(t.Context(), Request{Module: w.EchoPages(20), InputBlob: id, Limits: lim}); !errors.Is(err, sandbox.ErrInputTooLarge) {
+		t.Fatalf("got %v, want ErrInputTooLarge", err)
+	}
+}
+
+func TestReplicasAgreeOnBlobOutputs(t *testing.T) {
+	c := newCluster(t)
+	e1, e2 := c.add(1), c.add(1)
+	req := c.add(0)
+	settle(t, req, e1, e2)
+	in := make([]byte, 3<<20)
+	rand.Read(in)
+	res, err := req.svc.Run(t.Context(), Request{Module: w.EchoPages(60), Input: in, Limits: bigLimits(), Replicas: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.OutputBlob != blob.IDOf(in) || !res.Replicas[0].Agreed || !res.Replicas[1].Agreed {
+		t.Fatalf("output %s, replicas %+v", res.OutputBlob, res.Replicas)
+	}
 }

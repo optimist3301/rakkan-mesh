@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/optimist3301/rakkan-mesh/internal/api"
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/exec"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
@@ -43,6 +44,10 @@ func daemonCmd(args []string) int {
 	isolation := flags.String("isolation", "strict", "worker isolation: strict, ns or process")
 	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
+	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
+	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
+	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
+	maxOutputMB := flags.Int("max-output-mb", 16, "largest task output this node accepts, in MiB")
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
@@ -97,8 +102,16 @@ func daemonCmd(args []string) int {
 		fmt.Printf("listening on %s/p2p/%s\n", a, node.ID())
 	}
 
+	store, err := blob.OpenStore(*dataDir, int64(*storeGB*(1<<30)))
+	if err != nil {
+		return fail(fmt.Errorf("blob store: %w", err))
+	}
+	blobs := blob.NewService(node, store, cfg.Logger)
+
 	ceiling := sandbox.DefaultLimits()
-	svcCfg := exec.Config{Node: node, Ceiling: ceiling, Logger: cfg.Logger}
+	ceiling.MaxInputBytes = *maxInputMB << 20
+	ceiling.MaxOutputBytes = *maxOutputMB << 20
+	svcCfg := exec.Config{Node: node, Blobs: blobs, Ceiling: ceiling, Logger: cfg.Logger}
 	if *workers > 0 {
 		iso, err := parseIsolation(*isolation)
 		if err != nil {
@@ -126,7 +139,7 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("api: %w", err))
 		}
 		defer os.Remove(*apiPath)
-		srv := &api.Server{Service: svc, Node: node, Network: n.ID}
+		srv := &api.Server{Service: svc, Blobs: store, Node: node, Network: n.ID}
 		go func() {
 			if err := srv.Serve(ctx, l); err != nil {
 				slog.Error("api", "err", err)

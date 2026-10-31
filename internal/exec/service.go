@@ -28,6 +28,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
@@ -48,6 +49,8 @@ const taskGrace = 10 * time.Second
 // Config configures a Service.
 type Config struct {
 	Node *mesh.Node
+	// Blobs stores and transfers large inputs and outputs.
+	Blobs *blob.Service
 	// Pool executes tasks; nil makes this node a requester only.
 	Pool *isolate.Pool
 	// Ceiling is the most a task may request from this node.
@@ -103,8 +106,8 @@ type Service struct {
 
 // New starts a service on a running node.
 func New(cfg Config) (*Service, error) {
-	if cfg.Node == nil {
-		return nil, errors.New("exec: node is required")
+	if cfg.Node == nil || cfg.Blobs == nil {
+		return nil, errors.New("exec: node and blob service are required")
 	}
 	if cfg.Slots <= 0 {
 		cfg.Slots = runtime.GOMAXPROCS(0)
@@ -267,6 +270,11 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		return
 	}
 	hash, ok := ParseHash(h.ModuleHash)
+	if h.InputBlob != "" {
+		if _, err := blob.ParseID(h.InputBlob); err != nil {
+			ok = false
+		}
+	}
 	switch {
 	case !ok || h.Version != 1:
 		writeJSON(st, offer{Status: offerRejected, Reason: "malformed request"})
@@ -274,7 +282,8 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	case h.Limits.Within(s.cfg.Ceiling) != nil:
 		writeJSON(st, offer{Status: offerRejected, Reason: h.Limits.Within(s.cfg.Ceiling).Error()})
 		return
-	case h.ModuleSize > h.Limits.MaxModuleBytes || h.InputSize > h.Limits.MaxInputBytes || h.ModuleSize < 0 || h.InputSize < 0:
+	case h.ModuleSize > h.Limits.MaxModuleBytes || h.InputSize > h.Limits.MaxInputBytes || h.ModuleSize < 0 || h.InputSize < 0 ||
+		h.InputBlob != "" && h.InputSize != 0:
 		writeJSON(st, offer{Status: offerRejected, Reason: "module or input exceeds the requested limits"})
 		return
 	}
@@ -310,6 +319,18 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 
 	ctx, cancel := context.WithTimeout(s.ctx, h.Limits.Timeout+taskGrace)
 	defer cancel()
+	if h.InputBlob != "" {
+		providers := []peer.ID{c.Subject}
+		for _, p := range h.Providers {
+			if id, err := peer.Decode(p); err == nil && id != c.Subject {
+				providers = append(providers, id)
+			}
+		}
+		if input, err = s.readInputBlob(ctx, h.InputBlob, providers, h.Limits); err != nil {
+			writeResult(st, nil, err, s.cfg.Blobs.Store())
+			return
+		}
+	}
 	// The requester resets the stream to cancel; it reads to EOF only after
 	// receiving the result.
 	go func() {
@@ -326,10 +347,28 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	if err == nil && s.tamper != nil {
 		s.tamper(res)
 	}
-	writeResult(st, res, err)
+	writeResult(st, res, err, s.cfg.Blobs.Store())
 }
 
-func writeResult(w io.Writer, res *sandbox.Result, err error) error {
+// readInputBlob fetches a task's input blob and reads it whole: the worker
+// receives its input in one message.
+func (s *Service) readInputBlob(ctx context.Context, idStr string, providers []peer.ID, lim sandbox.Limits) ([]byte, error) {
+	id, err := blob.ParseID(idStr) // validated with the header
+	if err != nil {
+		return nil, err
+	}
+	if err := s.cfg.Blobs.Fetch(ctx, id, providers, int64(lim.MaxInputBytes)); err != nil {
+		if errors.Is(err, blob.ErrTooLarge) {
+			return nil, fmt.Errorf("%w: %v", sandbox.ErrInputTooLarge, err)
+		}
+		return nil, err
+	}
+	return s.cfg.Blobs.Store().ReadAll(id, int64(lim.MaxInputBytes))
+}
+
+// writeResult sends a task's outcome; an output larger than inlineMax is
+// stored as a blob for the requester to fetch.
+func writeResult(w io.Writer, res *sandbox.Result, err error, store *blob.Store) error {
 	rh := resultHeader{}
 	var output, logs []byte
 	if err != nil {
@@ -339,6 +378,13 @@ func writeResult(w io.Writer, res *sandbox.Result, err error) error {
 		rh.LogTruncated = res.LogTruncated
 		output, logs = res.Output, res.Logs
 		rh.OutputSize, rh.LogsSize = len(output), len(logs)
+		if len(output) > inlineMax {
+			id, perr := store.PutBytes(output)
+			if perr != nil {
+				return perr
+			}
+			rh.OutputBlob, output = id.String(), nil
+		}
 	}
 	if err := writeJSON(w, rh); err != nil {
 		return err

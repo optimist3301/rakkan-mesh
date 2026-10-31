@@ -19,8 +19,12 @@ import (
 //	requester -> executor  header      (JSON frame)
 //	executor  -> requester offer       (JSON frame: send_module, ready, busy, rejected)
 //	requester -> executor  [module]    (binary frame, only after send_module)
-//	requester -> executor  input       (binary frame)
+//	requester -> executor  input       (binary frame; empty when InputBlob is set)
 //	executor  -> requester result      (JSON frame), output, logs (binary frames)
+//
+// Inputs and outputs larger than inlineMax travel as blobs (package blob):
+// the executor fetches InputBlob from the requester and any listed
+// providers, and the requester fetches OutputBlob from the executor.
 //
 // The requester keeps its side open until it has the result; resetting the
 // stream cancels the task.
@@ -34,8 +38,13 @@ type header struct {
 	ModuleSize int            `json:"module_size"`
 	Entry      string         `json:"entry"`
 	InputSize  int            `json:"input_size"`
+	InputBlob  string         `json:"input_blob,omitempty"`
+	Providers  []string       `json:"providers,omitempty"`
 	Limits     sandbox.Limits `json:"limits"`
 }
+
+// inlineMax is the largest input or output sent within the task stream.
+const inlineMax = 1 << 20
 
 const (
 	offerSendModule = "send_module"
@@ -55,6 +64,7 @@ type resultHeader struct {
 	ElapsedNs    int64  `json:"elapsed_ns"`
 	LogTruncated bool   `json:"log_truncated,omitempty"`
 	OutputSize   int    `json:"output_size"`
+	OutputBlob   string `json:"output_blob,omitempty"`
 	LogsSize     int    `json:"logs_size"`
 	ErrorKind    string `json:"error_kind,omitempty"`
 	Error        string `json:"error,omitempty"`

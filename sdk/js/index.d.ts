@@ -20,7 +20,11 @@ export interface Replica {
 
 export interface Result {
   exitCode: number;
+  /** The output; empty with `outputAsBlob` when the output came as a blob. */
   output: Buffer;
+  /** Set when the output exceeded 1 MiB and travelled as a blob. */
+  outputBlob?: string;
+  outputSize: number;
   logs: string;
   gasUsed: number;
   elapsedMs: number;
@@ -38,6 +42,10 @@ export interface RunOptions {
   input?: Bytes;
   /** Encoded as the input instead of `input`. */
   json?: unknown;
+  /** A blob from putBlob() as the input. */
+  inputBlob?: string;
+  /** Leave a large output in the node's store instead of downloading it. */
+  outputAsBlob?: boolean;
   limits?: Limits;
   /** Run on this many distinct members and accept the majority outcome. */
   replicas?: number;
@@ -46,7 +54,10 @@ export interface RunOptions {
 
 export interface MapOptions {
   module: Bytes;
-  inputs: Bytes[];
+  inputs?: Bytes[];
+  /** Blobs from putBlob(), instead of `inputs`. */
+  inputBlobs?: string[];
+  outputAsBlob?: boolean;
   entry?: string;
   limits?: Limits;
   concurrency?: number;
@@ -79,8 +90,13 @@ export class TaskError extends Error {
   status?: number;
 }
 
+export type BlobSource = Bytes | NodeJS.ReadableStream | ReadableStream<Uint8Array> | { path: string };
+
 export class Mesh {
   upload(wasm: Bytes): Promise<string>;
+  putBlob(data: BlobSource, options?: { signal?: AbortSignal }): Promise<{ id: string; size: number }>;
+  getBlob(id: string, options?: { start?: number; end?: number; signal?: AbortSignal }): Promise<NodeJS.ReadableStream>;
+  readBlob(id: string, options?: { start?: number; end?: number; signal?: AbortSignal }): Promise<Buffer>;
   run(options: RunOptions): Promise<Result>;
   map(options: MapOptions): AsyncGenerator<MapItem, void, undefined>;
   status(): Promise<Status>;

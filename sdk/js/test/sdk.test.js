@@ -1,6 +1,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import { connect, TaskError } from '../index.js';
 import { startCluster } from './cluster.js';
 
@@ -115,6 +116,30 @@ test('breaking out of a map cancels the rest', async () => {
     assert.ok(Date.now() - started < 4_000, `still ${busy} tasks running after the map was abandoned`);
     await new Promise((r) => setTimeout(r, 100));
   }
+});
+
+test('blobs stream in and out, with ranges', async () => {
+  const data = randomBytes(5 * 1024 * 1024 + 99);
+  const file = `${cluster.dir}/upload.bin`;
+  writeFileSync(file, data);
+  const { id, size } = await mesh.putBlob({ path: file });
+  assert.equal(size, data.length);
+  assert.deepEqual(await mesh.readBlob(id), data);
+  const part = await mesh.readBlob(id, { start: 1_048_570, end: 1_048_590 });
+  assert.deepEqual(part, data.subarray(1_048_570, 1_048_591));
+});
+
+test('large inputs and outputs travel as blobs', async () => {
+  const big = randomBytes(3 * 1024 * 1024);
+  const echoBig = fixture('echo-big.wasm');
+  const res = await mesh.run({ module: echoBig, input: big, limits: { memoryMB: 16 } });
+  assert.ok(res.outputBlob, 'output came back as a blob');
+  assert.equal(res.outputSize, big.length);
+  assert.deepEqual(res.output, big);
+
+  const kept = await mesh.run({ module: echoBig, input: big, limits: { memoryMB: 16 }, outputAsBlob: true });
+  assert.equal(kept.output.length, 0);
+  assert.equal(kept.outputBlob, res.outputBlob, 'same content, same blob ID');
 });
 
 test('no node on the socket', async () => {

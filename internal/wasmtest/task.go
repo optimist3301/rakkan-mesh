@@ -26,8 +26,11 @@ func TaskModule(memPages uint32, locals []byte, body []byte) Module {
 }
 
 // Echo copies its input to its output.
-func Echo() []byte {
-	return TaskModule(1, []byte{I32}, Cat(
+func Echo() []byte { return EchoPages(1) }
+
+// EchoPages is Echo with the given initial memory, for larger inputs.
+func EchoPages(pages uint32) []byte {
+	return TaskModule(pages, []byte{I32}, Cat(
 		Call(FnInputLen), []byte{OpLocalSet, 0},
 		I32Const(0), I32Const(0), []byte{OpLocalGet, 0}, Call(FnInputRead), []byte{OpDrop},
 		I32Const(0), []byte{OpLocalGet, 0}, Call(FnOutputWrite),

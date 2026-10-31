@@ -1,12 +1,16 @@
 // Package api serves the local HTTP API that SDKs use to submit tasks to
 // the node, over a unix socket readable only by the node's user.
 //
-//	POST /v1/modules  body: module bytes             -> {"hash"}
-//	POST /v1/run      {module|module_hash, ...}      -> result
-//	POST /v1/map      {module_hash, inputs, ...}     -> NDJSON stream of results
+//	POST /v1/modules     body: module bytes          -> {"hash"}
+//	POST /v1/blobs       body: data, streamed        -> {"id", "size"}
+//	GET  /v1/blobs/{id}                              -> data, streamed, with Range support
+//	POST /v1/run         {module|module_hash, ...}   -> result
+//	POST /v1/map         {module_hash, inputs, ...}  -> NDJSON stream of results
 //	GET  /v1/status                                  -> node, load and members
 //
-// Binary fields (module, input, output) are base64 strings in JSON. Task
+// Binary fields (module, input, output) are base64 strings in JSON. Large
+// data goes through /v1/blobs instead: tasks take "input_blob" (or
+// "input_blobs" for a map) and return outputs over 1 MiB as "output_blob". Task
 // failures return 422 with {"error": {"kind", "message"}}; kind is one of
 // exec.ErrorKind's names, or no_capacity, not_enough_nodes, no_consensus.
 package api
@@ -22,6 +26,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/exec"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
@@ -30,6 +35,7 @@ import (
 // Server is the local API.
 type Server struct {
 	Service *exec.Service
+	Blobs   *blob.Store
 	Node    *mesh.Node
 	Network string
 }
@@ -55,6 +61,8 @@ func Listen(path string) (net.Listener, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/modules", s.upload)
+	mux.HandleFunc("POST /v1/blobs", s.putBlob)
+	mux.HandleFunc("GET /v1/blobs/{id}", s.getBlob)
 	mux.HandleFunc("POST /v1/run", s.run)
 	mux.HandleFunc("POST /v1/map", s.mapTasks)
 	mux.HandleFunc("GET /v1/status", s.status)
@@ -98,6 +106,7 @@ type runRequest struct {
 	ModuleHash string  `json:"module_hash,omitempty"`
 	Entry      string  `json:"entry,omitempty"`
 	Input      []byte  `json:"input,omitempty"`
+	InputBlob  string  `json:"input_blob,omitempty"`
 	Limits     *Limits `json:"limits,omitempty"`
 	Replicas   int     `json:"replicas,omitempty"`
 }
@@ -105,7 +114,8 @@ type runRequest struct {
 type mapRequest struct {
 	ModuleHash  string   `json:"module_hash"`
 	Entry       string   `json:"entry,omitempty"`
-	Inputs      [][]byte `json:"inputs"`
+	Inputs      [][]byte `json:"inputs,omitempty"`
+	InputBlobs  []string `json:"input_blobs,omitempty"`
 	Limits      *Limits  `json:"limits,omitempty"`
 	Concurrency int      `json:"concurrency,omitempty"`
 	// StopOnExitCode ends the map at the first task exiting with this code.
@@ -122,6 +132,8 @@ type resultJSON struct {
 	Index        *int          `json:"index,omitempty"`
 	ExitCode     uint32        `json:"exit_code"`
 	Output       []byte        `json:"output"`
+	OutputBlob   string        `json:"output_blob,omitempty"`
+	OutputSize   int           `json:"output_size"`
 	Logs         string        `json:"logs,omitempty"`
 	LogTruncated bool          `json:"log_truncated,omitempty"`
 	GasUsed      int64         `json:"gas_used"`
@@ -139,11 +151,18 @@ type errorJSON struct {
 	} `json:"error"`
 }
 
-func toJSON(res *exec.Result) resultJSON {
+func (s *Server) toJSON(res *exec.Result) resultJSON {
 	out := resultJSON{
 		ExitCode: res.ExitCode, Output: res.Output, Logs: string(res.Logs), LogTruncated: res.LogTruncated,
 		GasUsed: res.GasUsed, ElapsedMs: float64(res.Elapsed.Microseconds()) / 1000,
 		Node: res.Node.String(), Attempts: res.Attempts,
+	}
+	out.OutputSize = len(res.Output)
+	if !res.OutputBlob.IsZero() {
+		out.OutputBlob = res.OutputBlob.String()
+		if m, ok := s.Blobs.Manifest(res.OutputBlob); ok {
+			out.OutputSize = int(m.Size)
+		}
 	}
 	if out.Output == nil {
 		out.Output = []byte{}
@@ -206,6 +225,56 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"hash": s.Service.Modules().Put(module).String()})
 }
 
+func (s *Server) putBlob(w http.ResponseWriter, r *http.Request) {
+	id, m, err := s.Blobs.Put(r.Body)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": id.String(), "size": m.Size})
+}
+
+func (s *Server) getBlob(w http.ResponseWriter, r *http.Request) {
+	id, err := blob.ParseID(r.PathValue("id"))
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	rd, err := s.Blobs.Open(id)
+	if err != nil {
+		var e errorJSON
+		e.Error.Kind, e.Error.Message = "not_found", err.Error()
+		writeJSON(w, http.StatusNotFound, e)
+		return
+	}
+	defer rd.Close()
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("ETag", `"`+id.String()+`"`)
+	http.ServeContent(w, r, "", time.Time{}, rd)
+}
+
+// blobSize returns a stored blob's size for limits, or an error for the
+// client if it is unknown.
+func (s *Server) blobSize(idStr string) (blob.ID, int, error) {
+	id, err := blob.ParseID(idStr)
+	if err != nil {
+		return id, 0, err
+	}
+	m, ok := s.Blobs.Manifest(id)
+	if !ok {
+		return id, 0, fmt.Errorf("unknown blob %s: upload it first", idStr)
+	}
+	return id, int(m.Size), nil
+}
+
+// fitInput raises the default input limit to the input's size; executors
+// still enforce their own ceilings.
+func fitInput(l *Limits, lim *sandbox.Limits, size int) {
+	if (l == nil || l.MaxInputBytes == 0) && size > lim.MaxInputBytes {
+		lim.MaxInputBytes = size
+	}
+}
+
 // module resolves a request's module, inline or uploaded earlier.
 func (s *Server) module(inline []byte, hash string) ([]byte, error) {
 	if len(inline) > 0 {
@@ -234,15 +303,22 @@ func (s *Server) run(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "%v", err)
 		return
 	}
-	res, err := s.Service.Run(r.Context(), exec.Request{
-		Module: module, Entry: req.Entry, Input: req.Input, Limits: req.Limits.sandbox(), Replicas: req.Replicas,
-	})
+	er := exec.Request{Module: module, Entry: req.Entry, Input: req.Input, Limits: req.Limits.sandbox(), Replicas: req.Replicas}
+	size := len(req.Input)
+	if req.InputBlob != "" {
+		if er.InputBlob, size, err = s.blobSize(req.InputBlob); err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+	}
+	fitInput(req.Limits, &er.Limits, size)
+	res, err := s.Service.Run(r.Context(), er)
 	if err != nil {
 		code, e := errorOf(err)
 		writeJSON(w, code, e)
 		return
 	}
-	writeJSON(w, http.StatusOK, toJSON(res))
+	writeJSON(w, http.StatusOK, s.toJSON(res))
 }
 
 func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
@@ -257,6 +333,22 @@ func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	mr := exec.MapRequest{Module: module, Entry: req.Entry, Inputs: req.Inputs, Limits: req.Limits.sandbox(), Concurrency: req.Concurrency}
+	for _, in := range req.Inputs {
+		fitInput(req.Limits, &mr.Limits, len(in))
+	}
+	if len(req.Inputs) > 0 && len(req.InputBlobs) > 0 {
+		badRequest(w, "give inputs or input_blobs, not both")
+		return
+	}
+	for _, x := range req.InputBlobs {
+		id, size, err := s.blobSize(x)
+		if err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+		mr.InputBlobs = append(mr.InputBlobs, id)
+		fitInput(req.Limits, &mr.Limits, size)
+	}
 	if code := req.StopOnExitCode; code != nil {
 		mr.StopWhen = func(it exec.MapItem) bool { return it.Err == nil && it.Result.ExitCode == *code }
 	}
@@ -274,7 +366,7 @@ func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
 			e.Index = &idx
 			enc.Encode(e)
 		} else {
-			rj := toJSON(item.Result)
+			rj := s.toJSON(item.Result)
 			rj.Index = &idx
 			enc.Encode(rj)
 		}
@@ -282,7 +374,7 @@ func (s *Server) mapTasks(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
-	enc.Encode(map[string]any{"done": true, "reported": reported, "total": len(req.Inputs)})
+	enc.Encode(map[string]any{"done": true, "reported": reported, "total": len(req.Inputs) + len(req.InputBlobs)})
 }
 
 type loadJSON struct {
