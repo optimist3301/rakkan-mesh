@@ -2,3 +2,6 @@
 *.wasm
 !sdk/js/test/fixtures/*.wasm
 !sdk/js/test/fixtures/*.png
+sdk/as/node_modules/
+sdk/js/node_modules/
+!sdk/as/build/*.wasm

@@ -13,6 +13,7 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -260,8 +261,22 @@ func errOutput(limit int) error {
 	return fmt.Errorf("%w: limit %d bytes", ErrOutputLimit, limit)
 }
 
-// classify maps a runtime error to a sandbox error.
+// classify maps a runtime error to a sandbox error, with the end of the
+// task's log appended: a failing task's own diagnostics, such as an
+// AssemblyScript abort message, are usually the best explanation.
 func (s *execState) classify(ctx context.Context, err error) error {
+	err = s.classifyErr(ctx, err)
+	if len(s.logs) == 0 {
+		return err
+	}
+	tail := s.logs[max(0, len(s.logs)-logTail):]
+	return fmt.Errorf("%w; task log: %q", err, bytes.TrimSpace(tail))
+}
+
+// logTail bounds the log appended to a task error.
+const logTail = 1 << 10
+
+func (s *execState) classifyErr(ctx context.Context, err error) error {
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		return fmt.Errorf("%w after %s", ErrTimeout, s.lim.Timeout)

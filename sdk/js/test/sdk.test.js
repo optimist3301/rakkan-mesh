@@ -159,6 +159,47 @@ test('attached blobs are read in pieces', async () => {
   assert.deepEqual(res.output, data);
 });
 
+// Tasks compiled from AssemblyScript (sdk/as).
+const asModule = (name) => readFileSync(new URL(`../../as/build/${name}.wasm`, import.meta.url));
+
+test('AssemblyScript: word count as a map over ranges of a shared blob', async () => {
+  const line = 'the mesh runs tasks; meshmesh is not mesh-free.\n';
+  const text = Buffer.from(line.repeat(200_000)); // ~9.6 MB
+  const { id } = await mesh.putBlob(text);
+  const word = 'mesh';
+  const step = Math.ceil(text.length / 12);
+  const inputs = [];
+  for (let off = 0; off < text.length; off += step) {
+    const b = Buffer.alloc(16 + word.length);
+    b.writeBigUInt64LE(BigInt(off), 0);
+    b.writeBigUInt64LE(BigInt(step), 8);
+    b.write(word, 16);
+    inputs.push(b);
+  }
+  let total = 0;
+  for await (const item of mesh.map({ module: asModule('wordcount'), inputs, blobs: [id] })) {
+    assert.equal(item.error, undefined);
+    total += item.output.readUInt32LE(0);
+  }
+  assert.equal(total, 200_000 * 4); // mesh, meshmesh (2), mesh-free
+});
+
+test('AssemblyScript: sepia photo through image kernels and pixel access', async () => {
+  const res = await mesh.run({ module: asModule('sepia'), input: fixture('sample.png'), limits: { memoryMB: 16 } });
+  assert.equal(res.exitCode, 0);
+  assert.equal(res.output[0], 0xff); // JPEG SOI
+  assert.equal(res.output[1], 0xd8);
+  assert.match(res.logs, /sepia 800x500/);
+});
+
+test('AssemblyScript: an abort explains itself', async () => {
+  await assert.rejects(mesh.run({ module: asModule('test-abort') }), (err) => {
+    assert.equal(err.kind, 'trap');
+    assert.match(err.message, /abort: Index out of range/);
+    return true;
+  });
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

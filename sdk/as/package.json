@@ -1,0 +1,17 @@
+{
+  "name": "@rakkan/as",
+  "version": "0.1.0",
+  "description": "Write Rakkan mesh tasks in AssemblyScript",
+  "type": "module",
+  "exports": {
+    ".": "./assembly/index.ts"
+  },
+  "files": ["assembly/"],
+  "scripts": {
+    "build": "node build.js"
+  },
+  "devDependencies": {
+    "assemblyscript": "0.28.20"
+  },
+  "license": "UNLICENSED"
+}
