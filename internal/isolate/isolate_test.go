@@ -362,9 +362,10 @@ func TestPoolAffinity(t *testing.T) {
 }
 
 func TestPoolAffinitySkipsCompilation(t *testing.T) {
-	p := newPool(t, Config{Isolation: StrictIsolation()})
 	mod := w.CompileBomb(500)
 	lim := sandbox.DefaultLimits()
+	lim.Timeout = time.Minute // compilation is slow under -race on a loaded machine
+	p := newPool(t, Config{Isolation: StrictIsolation(), Ceiling: lim})
 	first, err := p.Run(t.Context(), "alice", sandbox.Task{Module: mod, Limits: lim})
 	if err != nil {
 		t.Fatal(err)

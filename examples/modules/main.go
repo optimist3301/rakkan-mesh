@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/optimist3301/rakkan-mesh/internal/llm/testmodel"
 	w "github.com/optimist3301/rakkan-mesh/internal/wasmtest"
 )
 
@@ -43,6 +44,8 @@ func main() {
 		"thumbnail-png.wasm":  w.Thumbnail(256, 256, 0, 0),
 		"thumbnail-jpeg.wasm": w.Thumbnail(320, 320, 1, 85),
 		"sample.png":          samplePNG(800, 500),
+		"tiny-model.bin":      testmodel.Checkpoint(1),
+		"tiny-tokenizer.bin":  testmodel.Tokenizer(),
 	}
 	for name, m := range modules {
 		if err := os.WriteFile(filepath.Join(*out, name), m, 0o644); err != nil {

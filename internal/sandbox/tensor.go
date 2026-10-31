@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"math"
 
+	"github.com/optimist3301/rakkan-mesh/internal/num"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -24,8 +25,8 @@ import (
 //     rounds once instead of twice and which arm64 compilers do emit; an
 //     explicit conversion forbids the fusion;
 //   - sums run in a fixed order;
-//   - exp, for softmax, is implemented here rather than taken from the math
-//     package, which uses assembly on some architectures;
+//   - exp, for softmax, comes from package num rather than math, which
+//     uses assembly on some architectures;
 //   - NaN results are canonicalized, as in WebAssembly code;
 //   - int8 matrix products accumulate in int32, exactly: the arithmetic of
 //     quantized inference.
@@ -187,7 +188,7 @@ func decodeInto(t *tensor, raw []byte) {
 	switch t.dtype {
 	case dtF32:
 		for i := range t.f32 {
-			t.f32[i] = canonical(math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:])))
+			t.f32[i] = num.Canonical(math.Float32frombits(binary.LittleEndian.Uint32(raw[4*i:])))
 		}
 	case dtI8:
 		for i := range t.i8 {
@@ -282,16 +283,6 @@ func (s *execState) tenDim(h int32, which int) int32 {
 	return [...]int32{int32(t.rows), int32(t.cols), t.dtype}[which]
 }
 
-// canonicalNaN32 is the quiet NaN WebAssembly code is canonicalized to.
-var canonicalNaN32 = math.Float32frombits(0x7fc00000)
-
-func canonical(v float32) float32 {
-	if v != v {
-		return canonicalNaN32
-	}
-	return v
-}
-
 func (s *execState) tenMatmul(ha, hb int32, transposed bool) int32 {
 	s.charge(0)
 	a, b := s.tensor(ha), s.tensor(hb)
@@ -333,7 +324,7 @@ func (s *execState) tenMatmul(ha, hb int32, transposed bool) int32 {
 					// into an FMA (see the package comment).
 					acc += float32(av * b.f32[p*stride+bj])
 				}
-				c.f32[i*n+j] = canonical(acc)
+				c.f32[i*n+j] = num.Canonical(acc)
 			} else {
 				var acc int32
 				ar := a.i8[i*k : i*k+k]
@@ -364,7 +355,7 @@ func (s *execState) tenAdd(ha, hb int32) int32 {
 			bi = i % a.cols
 		}
 		if a.dtype == dtF32 {
-			c.f32[i] = canonical(a.f32[i] + b.f32[bi])
+			c.f32[i] = num.Canonical(a.f32[i] + b.f32[bi])
 		} else {
 			c.i32[i] = a.i32[i] + b.i32[bi]
 		}
@@ -390,7 +381,7 @@ func (s *execState) tenScale(h int32, k float32) int32 {
 		} else {
 			v = float32(a.i32[i])
 		}
-		c.f32[i] = canonical(v * k)
+		c.f32[i] = num.Canonical(v * k)
 	}
 	return s.addTensor(c)
 }
@@ -411,7 +402,7 @@ func (s *execState) tenRelu(h int32) int32 {
 			if v := a.f32[i]; v > 0 {
 				c.f32[i] = v
 			} else if v != v {
-				c.f32[i] = canonicalNaN32
+				c.f32[i] = num.CanonicalNaN32
 			}
 		} else if v := a.i32[i]; v > 0 {
 			c.i32[i] = v
@@ -441,11 +432,11 @@ func (s *execState) tenSoftmax(h int32) int32 {
 		}
 		var sum float32
 		for i, v := range row {
-			out[i] = exp32(v - mx)
+			out[i] = num.Exp32(v - mx)
 			sum += out[i]
 		}
 		for i := range out {
-			out[i] = canonical(out[i] / sum)
+			out[i] = num.Canonical(out[i] / sum)
 		}
 	}
 	return s.addTensor(c)
@@ -507,32 +498,4 @@ func (s *execState) tenFree(h int32) int32 {
 	s.freeTensor(t)
 	delete(s.tensors.tensors, h)
 	return 0
-}
-
-// exp32 is e^x in float32, the same on every architecture: range reduction
-// to x = n*ln2 + r with |r| <= ln2/2, a degree-6 polynomial for e^r, and an
-// exact scaling by 2^n. Every product is converted explicitly, so it is
-// never fused. Relative error is within a few ulp, ample for softmax.
-func exp32(x float32) float32 {
-	switch {
-	case x != x:
-		return canonicalNaN32
-	case x > 88.72:
-		return float32(math.Inf(1))
-	case x < -103.97:
-		return 0
-	}
-	const (
-		ln2Hi = 0.693145751953125     // ln2 to 16 bits, so n*ln2Hi is exact
-		ln2Lo = 1.428606765330187e-06 // ln2 - ln2Hi
-	)
-	n := float32(math.RoundToEven(float64(float32(x * 1.4426950408889634))))
-	r := x - float32(n*ln2Hi)
-	r = r - float32(n*ln2Lo)
-	// Horner's rule; each step rounded.
-	p := float32(1.0 / 720)
-	for _, c := range []float32{1.0 / 120, 1.0 / 24, 1.0 / 6, 0.5, 1, 1} {
-		p = float32(p*r) + c
-	}
-	return float32(math.Ldexp(float64(p), int(n)))
 }

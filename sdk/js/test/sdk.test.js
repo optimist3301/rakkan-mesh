@@ -30,7 +30,7 @@ let cluster;
 let mesh;
 
 before(async () => {
-  cluster = await startCluster({ nodes: 3, workers: 2 });
+  cluster = await startCluster({ nodes: 3, workers: 2, llm: true });
   mesh = connect({ socket: cluster.sockets[0] });
 });
 
@@ -73,7 +73,9 @@ test('replicas agree on output and gas', async () => {
 });
 
 test('map finds a hash preimage across the network and stops', async () => {
-  const secret = Math.floor(Math.random() * (1 << 22));
+  // In the last chunk, so most chunks run before the stop and the work has
+  // to spread (a secret in the first chunks could finish on one node).
+  const secret = (1 << 22) - 1 - Math.floor(Math.random() * (1 << 15));
   const target = mix32(secret);
   const chunk = 1 << 16;
   const inputs = [];
@@ -239,6 +241,42 @@ test('distributed inference matches a JavaScript reference bit for bit', async (
     assert.deepEqual(new Uint32Array(got.buffer), new Uint32Array(want.buffer), `batch ${item.index} logits differ`);
   }
   assert.ok(nodes.size > 1, 'batches ran on several nodes');
+});
+
+async function collect(gen) {
+  const tokens = [];
+  let stats;
+  for await (const e of gen) {
+    if (e.done) stats = e.stats;
+    else tokens.push(e.token);
+  }
+  return { tokens, stats };
+}
+
+test('language model: the same text however the layers are split', async () => {
+  const { model, config } = await mesh.importModel({ checkpoint: fixture('tiny-model.bin'), tokenizer: fixture('tiny-tokenizer.bin'), name: 'tiny' });
+  assert.equal(config.n_layers, 4);
+  // Stage servers advertise themselves every couple of seconds.
+  await new Promise((r) => setTimeout(r, 2500));
+  const one = await collect(mesh.generate({ model, prompt: 'hello', maxTokens: 20, stages: 1 }));
+  const three = await collect(mesh.generate({ model, prompt: 'hello', maxTokens: 20, stages: 3 }));
+  assert.equal(one.stats.stages.length, 1);
+  assert.equal(three.stats.stages.length, 3);
+  assert.equal(new Set(three.stats.stages.map((s) => s.node)).size, 3, 'three nodes');
+  assert.deepEqual(three.tokens, one.tokens);
+});
+
+test('language model: a real story, when RAKKAN_LLM_DIR has one', { skip: !process.env.RAKKAN_LLM_DIR }, async () => {
+  const dir = process.env.RAKKAN_LLM_DIR;
+  const { model } = await mesh.importModel({ checkpoint: { path: `${dir}/stories15M.bin` }, tokenizer: { path: `${dir}/tokenizer.bin` } });
+  let text = '';
+  let stats;
+  for await (const e of mesh.generate({ model, prompt: 'Once upon a time', maxTokens: 50, stages: 3 })) {
+    if (e.done) stats = e.stats;
+    else text += e.text;
+  }
+  assert.match(text, /^, there was a little girl named Lily/);
+  assert.equal(stats.stages.length, 3);
 });
 
 test('no node on the socket', async () => {

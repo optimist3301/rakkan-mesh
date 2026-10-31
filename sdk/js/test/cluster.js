@@ -17,7 +17,7 @@ export function binary(dir) {
   return bin;
 }
 
-export async function startCluster({ nodes = 3, workers = 2 } = {}) {
+export async function startCluster({ nodes = 3, workers = 2, llm = false } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'rakkan-sdk-'));
   const bin = binary(dir);
   const run = (...args) => execFileSync(bin, args, { cwd: dir, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
@@ -25,9 +25,11 @@ export async function startCluster({ nodes = 3, workers = 2 } = {}) {
   const network = run('network', 'init', '-out', 'root.key');
   const procs = [];
   const sockets = [];
+  const ids = [];
   let bootstrap = '';
   for (let i = 0; i < nodes; i++) {
     const id = run('id', '-key', `n${i}.key`);
+    ids.push(id);
     run('network', 'issue', '-peer', id, '-out', `n${i}.cert`);
     const socket = join(dir, `n${i}.sock`);
     const args = [
@@ -36,6 +38,7 @@ export async function startCluster({ nodes = 3, workers = 2 } = {}) {
       '-workers', String(workers), '-api', socket,
     ];
     if (bootstrap) args.push('-bootstrap', bootstrap);
+    if (llm) args.push('-llm');
     const p = spawn(bin, args, { cwd: dir, stdio: ['ignore', 'pipe', 'pipe'] });
     procs.push(p);
     p.stderr.resume();
@@ -65,5 +68,7 @@ export async function startCluster({ nodes = 3, workers = 2 } = {}) {
     }
     await new Promise((r) => setTimeout(r, 100));
   }
-  return { dir, sockets, stop };
+  // kill(i) stops daemon i abruptly, as a crash would.
+  const kill = (i) => procs[i].kill('SIGKILL');
+  return { dir, sockets, ids, stop, kill };
 }

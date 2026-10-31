@@ -11,6 +11,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/exec"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
+	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 	"io/fs"
 	"log/slog"
@@ -48,6 +49,8 @@ func daemonCmd(args []string) int {
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
 	maxOutputMB := flags.Int("max-output-mb", 16, "largest task output this node accepts, in MiB")
+	serveLLM := flags.Bool("llm", false, "serve language model pipeline stages for the network")
+	llmMemGB := flags.Float64("llm-mem-gb", 4, "memory for model weights and caches served to the network, in GiB")
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
@@ -130,6 +133,12 @@ func daemonCmd(args []string) int {
 		return fail(err)
 	}
 	defer svc.Close()
+	lm, err := llm.NewService(llm.ServiceConfig{Node: node, Blobs: blobs, Serve: *serveLLM,
+		MemoryBytes: int64(*llmMemGB * (1 << 30)), Logger: cfg.Logger})
+	if err != nil {
+		return fail(err)
+	}
+	defer lm.Close()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -139,7 +148,7 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("api: %w", err))
 		}
 		defer os.Remove(*apiPath)
-		srv := &api.Server{Service: svc, Blobs: store, Node: node, Network: n.ID}
+		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Network: n.ID}
 		go func() {
 			if err := srv.Serve(ctx, l); err != nil {
 				slog.Error("api", "err", err)

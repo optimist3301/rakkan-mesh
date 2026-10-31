@@ -112,6 +112,43 @@ export class Mesh {
   run(options: RunOptions): Promise<Result>;
   map(options: MapOptions): AsyncGenerator<MapItem, void, undefined>;
   status(): Promise<Status>;
+  importModel(options: { checkpoint: BlobSource; tokenizer: BlobSource; name?: string; signal?: AbortSignal }): Promise<{ model: string; config: ModelConfig }>;
+  generate(options: GenerateOptions): AsyncGenerator<GenerateEvent, void, undefined>;
 }
+
+export interface ModelConfig {
+  dim: number;
+  hidden_dim: number;
+  n_layers: number;
+  n_heads: number;
+  n_kv_heads: number;
+  vocab_size: number;
+  seq_len: number;
+}
+
+export interface GenerateOptions {
+  model: string;
+  prompt: string;
+  maxTokens?: number;
+  /** 0 (default) always picks the most likely token. */
+  temperature?: number;
+  /** Reproduces a sampled generation exactly. */
+  seed?: number;
+  /** Pipeline stages to split the layers into; default one per serving member. */
+  stages?: number;
+  signal?: AbortSignal;
+}
+
+export interface GenerateStats {
+  promptTokens: number;
+  tokens: number;
+  elapsedMs: number;
+  tokensPerSecond: number;
+  stages: { from: number; to: number; node: string }[];
+  /** Stages moved to another node after a failure, mid-generation. */
+  failovers: number;
+}
+
+export type GenerateEvent = { token: number; text: string; done?: undefined } | { done: true; stats: GenerateStats };
 
 export function connect(options?: { socket?: string }): Mesh;

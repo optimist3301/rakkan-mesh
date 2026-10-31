@@ -107,26 +107,6 @@ func TestQuantizeRoundsAndClamps(t *testing.T) {
 	}
 }
 
-func TestExp32(t *testing.T) {
-	if exp32(0) != 1 {
-		t.Fatalf("exp32(0) = %v", exp32(0))
-	}
-	worst := 0.0
-	for x := float32(-100); x < 88; x += 0.0137 {
-		got, want := float64(exp32(x)), math.Exp(float64(x))
-		if want < 1e-37 { // subnormal range: absolute error matters
-			continue
-		}
-		worst = max(worst, math.Abs(got-want)/want)
-	}
-	if worst > 4e-7 {
-		t.Fatalf("worst relative error %.3g", worst)
-	}
-	if !math.IsInf(float64(exp32(100)), 1) || exp32(-200) != 0 {
-		t.Fatal("overflow or underflow mishandled")
-	}
-}
-
 func TestSoftmaxAddReluScale(t *testing.T) {
 	s := newState()
 	a := s.newTensor(dtF32, 2, 3)

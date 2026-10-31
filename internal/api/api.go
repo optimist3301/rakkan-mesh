@@ -7,6 +7,8 @@
 //	POST /v1/run         {module|module_hash, ...}   -> result
 //	POST /v1/map         {module_hash, inputs, ...}  -> NDJSON stream of results
 //	GET  /v1/status                                  -> node, load and members
+//	POST /v1/llm/models  {checkpoint, tokenizer}     -> {"model", "config"}
+//	POST /v1/llm/generate {model, prompt, ...}       -> NDJSON stream of tokens
 //
 // Tasks may attach up to 16 stored blobs ("blobs"), which they read in
 // pieces with blob_read; a map attaches them to every task.
@@ -31,6 +33,7 @@ import (
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/exec"
+	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
@@ -39,6 +42,7 @@ import (
 type Server struct {
 	Service *exec.Service
 	Blobs   *blob.Store
+	LLM     *llm.Service // nil disables /v1/llm
 	Node    *mesh.Node
 	Network string
 }
@@ -69,6 +73,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/run", s.run)
 	mux.HandleFunc("POST /v1/map", s.mapTasks)
 	mux.HandleFunc("GET /v1/status", s.status)
+	mux.HandleFunc("POST /v1/llm/models", s.importModel)
+	mux.HandleFunc("POST /v1/llm/generate", s.generate)
 	return mux
 }
 
@@ -436,6 +442,118 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 		out.Members = append(out.Members, mj)
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+type importRequest struct {
+	Checkpoint string `json:"checkpoint"` // blob IDs, uploaded first
+	Tokenizer  string `json:"tokenizer"`
+	Name       string `json:"name,omitempty"`
+}
+
+// importModel splits a llama2.c checkpoint into a model's blobs.
+func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
+	if s.LLM == nil {
+		badRequest(w, "language models are not enabled on this node")
+		return
+	}
+	var req importRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	read := func(idStr string) ([]byte, error) {
+		id, err := blob.ParseID(idStr)
+		if err != nil {
+			return nil, err
+		}
+		return s.Blobs.ReadAll(id, 64<<30)
+	}
+	ckData, err := read(req.Checkpoint)
+	if err != nil {
+		badRequest(w, "checkpoint: %v", err)
+		return
+	}
+	tokData, err := read(req.Tokenizer)
+	if err != nil {
+		badRequest(w, "tokenizer: %v", err)
+		return
+	}
+	ck, err := llm.ReadCheckpoint(ckData)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	if _, err := llm.ReadTokenizer(tokData, ck.Config.Vocab); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	id, m, err := llm.Import(s.Blobs, ck, tokData, req.Name)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.Config})
+}
+
+type generateRequest struct {
+	Model       string  `json:"model"`
+	Prompt      string  `json:"prompt"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
+	Temperature float32 `json:"temperature,omitempty"`
+	Seed        uint64  `json:"seed,omitempty"`
+	Stages      int     `json:"stages,omitempty"`
+}
+
+// generate streams a generation's tokens as NDJSON, then its statistics.
+func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
+	if s.LLM == nil {
+		badRequest(w, "language models are not enabled on this node")
+		return
+	}
+	var req generateRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	model, err := blob.ParseID(req.Model)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	enc := json.NewEncoder(w)
+	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
+		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages,
+	}, func(e llm.Event) error {
+		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	})
+	if err != nil {
+		var e errorJSON
+		e.Error.Kind, e.Error.Message = "generation_failed", err.Error()
+		if errors.Is(err, llm.ErrNoStages) {
+			e.Error.Kind = "no_capacity"
+		}
+		enc.Encode(e)
+		return
+	}
+	var stages []map[string]any
+	for _, st := range stats.Stages {
+		stages = append(stages, map[string]any{"from": st.From, "to": st.To, "node": st.Node.String()})
+	}
+	enc.Encode(map[string]any{"done": true, "stats": map[string]any{
+		"prompt_tokens": stats.PromptTokens, "tokens": stats.Tokens,
+		"elapsed_ms":   stats.Elapsed.Milliseconds(),
+		"tokens_per_s": float64(stats.Tokens) / stats.Elapsed.Seconds(),
+		"stages":       stages, "failovers": stats.Failovers,
+	}})
 }
 
 // Serve runs the API until ctx ends.

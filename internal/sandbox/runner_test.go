@@ -261,10 +261,11 @@ func TestConcurrentRuns(t *testing.T) {
 }
 
 func TestRepeatedRunsAreCached(t *testing.T) {
-	r := NewRunner(DefaultLimits())
-	defer r.Close(t.Context())
 	mod := w.CompileBomb(500) // slow enough to compile that a cache hit is obvious
 	lim := DefaultLimits()
+	lim.Timeout = time.Minute // compilation is slow under -race on a loaded machine
+	r := NewRunner(lim)
+	defer r.Close(t.Context())
 
 	first, err := r.Run(t.Context(), Task{Module: mod, Limits: lim})
 	if err != nil {

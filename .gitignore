@@ -5,3 +5,4 @@
 sdk/as/node_modules/
 sdk/js/node_modules/
 !sdk/as/build/*.wasm
+!sdk/js/test/fixtures/tiny-*.bin

@@ -190,6 +190,60 @@ export class Mesh {
     }
   }
 
+  /**
+   * Imports a language model in llama2.c's format: uploads the checkpoint
+   * and tokenizer as blobs, and the node splits the model into per-layer
+   * blobs that pipeline stages fetch. Resolves to `{model, config}`; the
+   * model ID is the same on every node for the same files.
+   */
+  async importModel({ checkpoint, tokenizer, name, signal } = {}) {
+    const ck = await this.putBlob(checkpoint, { signal });
+    const tok = await this.putBlob(tokenizer, { signal });
+    return this.#call('POST', '/v1/llm/models', { checkpoint: ck.id, tokenizer: tok.id, name }, { signal });
+  }
+
+  /**
+   * Generates text with a model split across members by layers, yielding
+   * `{token, text}` as tokens arrive, then `{done: true, stats}`. If a stage's
+   * node fails, the stage moves to another node and the text continues
+   * exactly as it would have. Breaking out of the loop stops the generation.
+   */
+  async *generate({ model, prompt, maxTokens, temperature, seed, stages, signal } = {}) {
+    const body = JSON.stringify({ model, prompt, max_tokens: maxTokens, temperature, seed, stages });
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(signal.reason);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const res = await this.#request('POST', '/v1/llm/generate', body, { type: 'application/json', signal: controller.signal });
+    try {
+      if (res.statusCode !== 200) throw await errorFrom(res);
+      let buffered = '';
+      for await (const chunk of res) {
+        buffered += chunk;
+        let nl;
+        while ((nl = buffered.indexOf('\n')) >= 0) {
+          const msg = JSON.parse(buffered.slice(0, nl));
+          buffered = buffered.slice(nl + 1);
+          if (msg.error) throw new TaskError(msg.error.kind, msg.error.message);
+          if (msg.done) {
+            const s = msg.stats;
+            yield {
+              done: true,
+              stats: {
+                promptTokens: s.prompt_tokens, tokens: s.tokens, elapsedMs: s.elapsed_ms,
+                tokensPerSecond: s.tokens_per_s, stages: s.stages, failovers: s.failovers,
+              },
+            };
+            return;
+          }
+          yield { token: msg.token, text: msg.text };
+        }
+      }
+    } finally {
+      signal?.removeEventListener('abort', onAbort);
+      if (!res.complete) controller.abort();
+    }
+  }
+
   /** The node's identity, load and view of the network. */
   async status() {
     return this.#call('GET', '/v1/status');

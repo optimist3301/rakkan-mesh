@@ -65,6 +65,24 @@ for await (const item of mesh.map({ module, inputs, blobs: [dict] })) { ... }
 `decode_input`, `fit`, `encode_output` и т. д. (см. ABI в корневом README).
 Пример `examples/thumbnails.js` делает JPEG-миниатюры пачки фото по сети.
 
+## Языковые модели
+
+Модель в формате llama2.c (например, `stories15M.bin` и `tokenizer.bin` из
+llama2.c/tinyllamas) делится по слоям между узлами, запущенными с
+`rakkan-node daemon -llm`. Текст одинаков при любом разбиении, а если узел-стадия
+упадёт посреди генерации, его слои переедут на другой узел и текст продолжится
+так, как продолжился бы без сбоя.
+
+```js
+const { model } = await mesh.importModel({ checkpoint: { path: 'stories15M.bin' }, tokenizer: { path: 'tokenizer.bin' } });
+for await (const e of mesh.generate({ model, prompt: 'Once upon a time', maxTokens: 200, stages: 3 })) {
+  if (e.done) console.log(e.stats); // tokensPerSecond, stages, failovers
+  else process.stdout.write(e.text);
+}
+```
+
+Пример: `examples/story.js`.
+
 Предел размера задаёт политика узлов: `rakkan-node daemon -max-input-mb 256
 -max-output-mb 256`.
 
