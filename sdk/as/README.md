@@ -4,7 +4,7 @@
 компилирующемся в WebAssembly.
 
 ```ts
-import { input, outputString, log, blobs, Image } from "@rakkan/as";
+import { input, outputString, log, blobs, Image } from "@rakkan/as/assembly";
 
 export function run(): i32 {        // 0 — успех
   const text = String.UTF8.decode(input().buffer);
@@ -14,8 +14,20 @@ export function run(): i32 {        // 0 — успех
 }
 ```
 
-Сборка: `npm install && npm run build` (`build.js`) — собирает `examples/` и
-`test/` в `build/`. Задаче нужны два флага компилятора, их передаёт `build.js`:
+В своём проекте:
+
+```sh
+npm install --save-dev assemblyscript@0.28.20 /путь/к/rakkan-mesh/sdk/as
+npx asc task.ts --outFile task.wasm --runtime stub \
+    --use abort=~lib/@rakkan/as/assembly/index/abort -O3
+```
+
+Импортируйте `@rakkan/as/assembly`: голое `@rakkan/as` компилятор
+AssemblyScript для пакетов со scope не находит.
+
+В этом репозитории: `npm install && npm run build` (`build.js`) — собирает
+`examples/` и `test/` в `build/`. Задаче нужны два флага компилятора, их
+передаёт `build.js`:
 
 - `--runtime stub` — без сборщика мусора: задачи короткие, а освобождённая
   память всё равно уходит вместе с процессом. Следствие: не выделяйте память
@@ -25,6 +37,8 @@ export function run(): i32 {        // 0 — успех
   импортируется из `env`, которого в песочнице нет; привязки логируют
   сообщение и завершают задачу trap. Сообщение (`abort: Index out of range at
   ~lib/array.ts:114:42`) приходит пользователю в тексте ошибки.
+
+Полное руководство по задачам — [docs/dev/tasks.md](../../docs/dev/tasks.md).
 
 ## API (`assembly/index.ts`)
 
@@ -45,6 +59,8 @@ export function run(): i32 {        // 0 — успех
 
 ## Примеры
 
+- `examples/montecarlo.ts` — оценка π методом Монте-Карло: детерминированный
+  генератор с зерном из входа; map/reduce по сети — `sdk/js/examples/pi.js`;
 - `examples/search.ts` — поиск прообраза хеша (тот же, что `search.wasm`,
   собранный вручную; Go-тест сверяет их результаты);
 - `examples/sepia.ts` — декодирование и масштабирование kernels, попиксельная

@@ -1,5 +1,8 @@
 # @rakkan/sdk
 
+Полный справочник — [docs/dev/sdk.md](../../docs/dev/sdk.md), руководство по
+распределённым программам — [docs/dev/distributed.md](../../docs/dev/distributed.md).
+
 Запуск WebAssembly-задач в сети Rakkan из Node.js (18+). Без зависимостей;
 типы для TypeScript в `index.d.ts`. SDK общается с локальным узлом через его
 API-сокет (`rakkan-node daemon -api rakkan.sock`), а узел распределяет задачи
