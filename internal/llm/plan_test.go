@@ -38,6 +38,11 @@ func TestPlanStages(t *testing.T) {
 	if !equalSpans(got, []span{{0, 10, "gpu-big"}, {10, 16, "gpu-small"}}) {
 		t.Fatalf("two stages: %v", got)
 	}
+	// Every stage asked for gets a layer, however slow its node.
+	slow := stageNode{id: "slow", speed: 0.01, layers: 10}
+	if got, _ := planStages(4, []stageNode{gpuBig, slow}, 2); len(got) != 2 || got[1].node != "slow" || got[1].to-got[1].from != 1 {
+		t.Fatalf("slow node in two stages: %v", got)
+	}
 	// Equal nodes share evenly.
 	a, b, c := stageNode{id: "a", speed: 5, layers: 99}, stageNode{id: "b", speed: 5, layers: 99}, stageNode{id: "c", speed: 5, layers: 99}
 	if got, _ := planStages(9, []stageNode{a, b, c}, 3); len(got) != 3 || got[0].to != 3 || got[1].to != 6 {
@@ -74,10 +79,14 @@ func TestFits(t *testing.T) {
 	if n := fits(cpu, "m", c, 100); n != 6 {
 		t.Fatalf("with 4 layers loaded: %d, want 6", n)
 	}
-	// A GPU node: weights on the device, caches in RAM; the scarcer bounds.
-	gpu := advert{Device: "gpu", FreeMem: 8 * lb, FreeCache: 5 * cb}
-	if n := fits(gpu, "m", c, 100); n != 5 {
-		t.Fatalf("GPU node fits %d, want 5", n)
+	// Caches apart from weights: the scarcer bounds.
+	apart := advert{Device: "gpu", FreeMem: 8 * lb, FreeCache: 5 * cb}
+	if n := fits(apart, "m", c, 100); n != 5 {
+		t.Fatalf("caches apart: fits %d, want 5", n)
+	}
+	// A GPU holding weights and caches is one pool.
+	if n := fits(advert{Device: "gpu", FreeMem: 4 * (lb + cb)}, "m", c, 100); n != 4 {
+		t.Fatalf("GPU node fits %d, want 4", n)
 	}
 	if n := fits(advert{FreeMem: 1 << 40}, "m", c, 100); n != c.Layers {
 		t.Fatalf("huge node fits %d", n)

@@ -286,6 +286,31 @@ type Layer struct {
 	QNorm, KNorm   []float32 // with QKNorm: one head's width
 	RmsFfn         []float32
 	W1, W2, W3     Matrix // gate, down, up
+
+	// vecs holds the vectors on the GPU holding the matrices (see
+	// vecLayout), so the whole layer runs there.
+	vecs *gpu.Vectors
+}
+
+// vecOffsets are the positions of a layer's vectors in its device buffer.
+type vecOffsets struct{ rmsAtt, rmsFfn, bq, bk, bv, qNorm, kNorm int }
+
+func (l *Layer) vecLayout(c Config) ([]float32, vecOffsets) {
+	var all []float32
+	var o vecOffsets
+	put := func(v []float32) int {
+		at := len(all)
+		all = append(all, v...)
+		return at
+	}
+	o.rmsAtt, o.rmsFfn = put(l.RmsAtt), put(l.RmsFfn)
+	if c.QKVBias {
+		o.bq, o.bk, o.bv = put(l.Bq), put(l.Bk), put(l.Bv)
+	}
+	if c.QKNorm {
+		o.qNorm, o.kNorm = put(l.QNorm), put(l.KNorm)
+	}
+	return all, o
 }
 
 // tensor is one of a layer's weights: a vector (float32) or a matrix,
@@ -337,11 +362,22 @@ func (l *Layer) toDevice(c Config, d *gpu.Device) (int64, error) {
 		moved = append(moved, t.mat)
 		bytes += t.mat.dev.Bytes()
 	}
-	return bytes, nil
+	all, _ := l.vecLayout(c)
+	vecs, err := d.UploadVectors(all)
+	if err != nil {
+		l.release(c)
+		return 0, err
+	}
+	l.vecs = vecs
+	return bytes + int64(4*len(all)), nil
 }
 
 // release frees the layer's device memory, if any.
 func (l *Layer) release(c Config) {
+	if l.vecs != nil {
+		l.vecs.Free()
+		l.vecs = nil
+	}
 	for _, t := range l.tensors(c) {
 		if t.mat != nil && t.mat.dev != nil {
 			t.mat.dev.Free()
@@ -417,12 +453,23 @@ type Stage struct {
 	vals   [][]float32
 	// Scratch buffers.
 	xb, xb2, q, k, v, att, attOut, hb, hb2 []float32
+
+	// gpu runs the stage on the GPU holding its layers, if they are on one;
+	// gpuErr is why that GPU could not take the stage.
+	gpu    *gpuStage
+	gpuErr error
 }
 
 // NewStage allocates a stage's caches for a generation of up to ctx
-// positions, at most the rope table's.
+// positions, at most the rope table's. Layers on a GPU run there, caches
+// included.
 func NewStage(c Config, layers []*Layer, rope *Rope, ctx int) *Stage {
 	ctx = min(ctx, rope.Positions())
+	if d := layersDevice(c, layers); d != nil {
+		s := &Stage{cfg: c, layers: layers, rope: rope, ctx: ctx}
+		s.gpu, s.gpuErr = newGPUStage(d, c, layers, rope, ctx)
+		return s
+	}
 	s := &Stage{
 		cfg: c, layers: layers, rope: rope, ctx: ctx,
 		xb: make([]float32, c.Dim), xb2: make([]float32, c.Dim),
@@ -444,9 +491,38 @@ func CacheBytes(c Config, layers, ctx int) int64 {
 	return int64(layers) * 2 * int64(ctx) * int64(c.KVDim()) * 4
 }
 
+// Close frees the stage's GPU memory, if any.
+func (s *Stage) Close() {
+	if s.gpu != nil {
+		s.gpu.close()
+		s.gpu = nil
+	}
+}
+
+// ForwardMany runs tokens activations, each c.Dim wide, at positions pos,
+// pos+1, ..., through the stage in place: on a GPU, in one submission.
+func (s *Stage) ForwardMany(xs []float32, pos, tokens int) error {
+	if s.gpu != nil || s.gpuErr != nil {
+		if s.gpuErr != nil {
+			return s.gpuErr
+		}
+		return s.gpu.forward(xs, pos, tokens)
+	}
+	d := s.cfg.Dim
+	for t := range tokens {
+		if err := s.Forward(xs[t*d:(t+1)*d], pos+t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Forward runs the stage's layers on x, the activation of the token at
 // position pos (below Positions), in place. It fails only if a GPU does.
 func (s *Stage) Forward(x []float32, pos int) error {
+	if s.gpu != nil || s.gpuErr != nil {
+		return s.ForwardMany(x, pos, 1)
+	}
 	c := s.cfg
 	hs, qDim, kvDim := c.HeadSize(), c.QDim(), c.KVDim()
 	kvMul := c.Heads / c.KVHeads
@@ -523,8 +599,7 @@ func (s *Stage) Forward(x []float32, pos int) error {
 			return err
 		}
 		for i, v := range s.hb {
-			silu := float32(v * float32(1/(1+num.Exp32(-v))))
-			s.hb[i] = float32(silu * s.hb2[i])
+			s.hb[i] = float32(silu(v) * s.hb2[i])
 		}
 		mul(l.W2, s.xb, s.hb)
 		if err != nil {
@@ -549,10 +624,14 @@ func rotate(v []float32, i int, co, si float32) {
 	v[i+1] = float32(v0*si) + float32(v1*co)
 }
 
+// Divisions and square roots go through num.Recip32 and num.Rsqrt32,
+// which GPUs compute identically (see package num), so a layer runs the
+// same on either.
+
 // rmsNorm normalizes x into out, which may be x.
 func rmsNorm(out, x, w []float32, eps float32) {
-	ss := num.Dot32(x, x)/float32(len(x)) + eps
-	inv := 1 / float32(math.Sqrt(float64(ss)))
+	ss := float32(num.Dot32(x, x)*num.Recip32(float32(len(x)))) + eps
+	inv := num.Rsqrt32(ss)
 	for i := range out {
 		out[i] = float32(w[i] * float32(inv*x[i]))
 	}
@@ -568,10 +647,14 @@ func softmax(x []float32) {
 		x[i] = num.Exp32(v - mx)
 		sum += x[i]
 	}
+	inv := num.Recip32(sum)
 	for i := range x {
-		x[i] /= sum
+		x[i] = float32(x[i] * inv)
 	}
 }
+
+// silu is x·sigmoid(x).
+func silu(v float32) float32 { return float32(v * num.Recip32(1+num.Exp32(-v))) }
 
 // Embed returns the activation for a token.
 func Embed(c Config, table Matrix, token int) []float32 {

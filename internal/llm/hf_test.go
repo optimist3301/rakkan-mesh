@@ -100,6 +100,7 @@ func loadStored(t testing.TB, store *blob.Store, id blob.ID) *localModel {
 func (lm *localModel) logits(tokens []int) [][]float32 {
 	c := lm.m.Config
 	stage := NewStage(c, lm.layers, NewRope(c, len(tokens)), len(tokens))
+	defer stage.Close()
 	var out [][]float32
 	for pos, tok := range tokens {
 		x := Embed(c, lm.embed, tok)
@@ -121,6 +122,7 @@ func (lm *localModel) chatTokens(prompt string, maxTokens int) (string, []int, f
 	tokens := lm.tok.Encode(lm.m.Chat.Prefix + prompt + lm.m.Chat.Suffix)
 	n := len(tokens) + maxTokens
 	stage := NewStage(c, lm.layers, NewRope(c, n), n)
+	defer stage.Close()
 	var text []byte
 	var x []float32
 	var out []int
@@ -406,6 +408,9 @@ func TestHFModelOnGPU(t *testing.T) {
 				l.release(c)
 			}
 			lm.head.Wcls.dev.Free()
+			if d.Used() != 0 {
+				t.Fatalf("%s: %d bytes left on the device", d.Info().Name, d.Used())
+			}
 		}
 	}
 }

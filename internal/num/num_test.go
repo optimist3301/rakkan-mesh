@@ -267,3 +267,57 @@ func BenchmarkMatVec(b *testing.B) {
 		}
 	})
 }
+
+func TestRecipRsqrt(t *testing.T) {
+	r := rand.New(rand.NewPCG(5, 6))
+	ulpsOf := func(got float32, exact float64) float64 {
+		g := float64(got)
+		if g == exact {
+			return 0
+		}
+		step := math.Abs(float64(math.Nextafter32(float32(exact), float32(math.Inf(1)))) - float64(float32(exact)))
+		if step == 0 {
+			step = math.SmallestNonzeroFloat32
+		}
+		return math.Abs(g-exact) / step
+	}
+	var worstR, worstS float64
+	for i := range 2_000_000 {
+		var x float32
+		switch i % 4 {
+		case 0:
+			x = float32(math.Exp(r.Float64()*170 - 85))
+		case 1:
+			x = math.Float32frombits(uint32(r.Uint32() & 0x7fffffff)) // any positive bits
+		case 2:
+			x = float32(r.Float64()*4 + 0.25)
+		default:
+			x = math.Float32frombits(uint32(r.IntN(1 << 23))) // subnormal
+		}
+		if x == 0 || math.IsInf(float64(x), 0) || x != x {
+			continue
+		}
+		if 1/float64(x) > math.MaxFloat32 {
+			if !math.IsInf(float64(Recip32(x)), 1) {
+				t.Fatalf("Recip32(%v) = %v, want +Inf", x, Recip32(x))
+			}
+		} else {
+			worstR = max(worstR, ulpsOf(Recip32(x), 1/float64(x)))
+		}
+		worstS = max(worstS, ulpsOf(Rsqrt32(x), 1/math.Sqrt(float64(x))))
+		if y := -x; Recip32(y) != -Recip32(x) {
+			t.Fatalf("Recip32(-x) != -Recip32(x) at %v", x)
+		}
+	}
+	t.Logf("worst error: Recip32 %.2f ulp, Rsqrt32 %.2f ulp", worstR, worstS)
+	if worstR > 2 || worstS > 2 {
+		t.Fatal("too inaccurate")
+	}
+	inf := float32(math.Inf(1))
+	if Recip32(0) != inf || Recip32(inf) != 0 || Rsqrt32(0) != inf || Rsqrt32(inf) != 0 || Recip32(float32(math.NaN())) == Recip32(float32(math.NaN())) {
+		t.Fatal("special values")
+	}
+	if Recip32(4) != 0.25 || Rsqrt32(4) != 0.5 || Rsqrt32(1) != 1 {
+		t.Fatalf("exact cases: %v %v %v", Recip32(4), Rsqrt32(4), Rsqrt32(1))
+	}
+}

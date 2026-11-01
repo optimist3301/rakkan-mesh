@@ -30,6 +30,7 @@ func QuantizeQ8(w []float32) (q []int8, scales []float32) {
 }
 
 // quantize8 rounds each block to the nearest multiple of amax/127.
+// Rounding to an integer is exact, as is |v|.
 func quantize8(w []float32, q []int8, scales []float32) {
 	for b := range scales {
 		blk := w[b*QBlock : (b+1)*QBlock]
@@ -37,13 +38,14 @@ func quantize8(w []float32, q []int8, scales []float32) {
 		for _, v := range blk {
 			amax = max(amax, float32(math.Abs(float64(v))))
 		}
-		d := amax / 127
+		// No division: GPUs quantize inputs too and must match (recip.go).
+		d := amax * float32(1.0/127)
 		scales[b] = d
 		if d == 0 || d != d {
 			clear(q[b*QBlock : (b+1)*QBlock])
 			continue
 		}
-		id := 1 / d
+		id := Recip32(d)
 		for j, v := range blk {
 			q[b*QBlock+j] = int8(max(-127, min(127, math.RoundToEven(float64(float32(v*id))))))
 		}

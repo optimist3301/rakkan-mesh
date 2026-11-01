@@ -187,14 +187,14 @@ func Best(devs []Info) (Info, bool) {
 	return best, ok
 }
 
-// I/O buffer sizes: the widest input and output a model may have.
+// The widest input and output a model may have.
 const (
 	maxCols = 1 << 18 // Config.Hidden's limit
 	maxRows = 1 << 20 // Config.Vocab's limit
 )
 
 // Device is an opened GPU. Its methods are safe for concurrent use; the
-// products run one at a time.
+// submissions run one at a time.
 type Device struct {
 	info   Info
 	dev    uintptr
@@ -206,12 +206,15 @@ type Device struct {
 	cmd   uintptr
 	fence uint64
 
-	kernels map[kernelKind]*pipeline
-	in, out *buffer // input vector (or quantized input and scales), output
-	qx, xs  *buffer
+	setLayouts [2]uint64 // set 0: weights or vectors; set 1: an arena
+	layout     uint64
+	kernels    [kindCount]*pipeline
+	setPool    uint64 // descriptor sets of arenas and vectors
+
+	host *Arena // for MulVecs: input, output and quantized input
 
 	mu   sync.Mutex
-	used int64 // bytes of matrices held
+	used int64 // bytes of matrices, vectors and arenas held
 }
 
 type buffer struct {
@@ -221,13 +224,12 @@ type buffer struct {
 }
 
 type pipeline struct {
-	module, setLayout, layout, pipe uint64
-	bindings                        int
+	module, pipe uint64
 }
 
 // Open opens a device listed by Devices.
 func Open(info Info) (*Device, error) {
-	d := &Device{info: info, kernels: map[kernelKind]*pipeline{}}
+	d := &Device{info: info}
 	vk.GetPhysicalDeviceMemoryProperties(info.pd, &d.memory)
 
 	var n uint32
@@ -282,57 +284,81 @@ func (d *Device) init() error {
 	if err := check("create fence", vk.CreateFence(d.dev, &finfo, nil, &d.fence)); err != nil {
 		return err
 	}
+	for set, count := range []int{2, 1} {
+		bs := make([]vkDescriptorSetLayoutBinding, count)
+		for i := range bs {
+			bs[i] = vkDescriptorSetLayoutBinding{binding: uint32(i), descriptorType: descriptorStorageBuffer, descriptorCount: 1, stageFlags: stageCompute}
+		}
+		linfo := vkDescriptorSetLayoutCreateInfo{sType: stDescriptorSetLayout, bindingCount: uint32(count), pBindings: &bs[0]}
+		if err := check("create set layout", vk.CreateDescriptorSetLayout(d.dev, &linfo, nil, &d.setLayouts[set])); err != nil {
+			return err
+		}
+	}
+	pcr := vkPushConstantRange{stageFlags: stageCompute, size: 4 * pushWords}
+	plinfo := vkPipelineLayoutCreateInfo{sType: stPipelineLayoutCreate, setLayoutCount: 2, pSetLayouts: &d.setLayouts[0],
+		pushConstantRangeCount: 1, pPushConstantRanges: &pcr}
+	if err := check("create pipeline layout", vk.CreatePipelineLayout(d.dev, &plinfo, nil, &d.layout)); err != nil {
+		return err
+	}
+	// Arenas and layer vectors take one set each; a node holds at most a
+	// few thousand layers and generations.
+	size := vkDescriptorPoolSize{typ: descriptorStorageBuffer, count: 16384}
+	poolInfo := vkDescriptorPoolCreateInfo{sType: stDescriptorPoolCreate, flags: descriptorPoolFreeSet, maxSets: 16384, poolSizeCount: 1, pPoolSizes: &size}
+	if err := check("create descriptor pool", vk.CreateDescriptorPool(d.dev, &poolInfo, nil, &d.setPool)); err != nil {
+		return err
+	}
+	for k := range kindCount {
+		p, err := d.newPipeline(kernel(k, d.info.modes))
+		if err != nil {
+			return fmt.Errorf("kernel %d: %w", k, err)
+		}
+		d.kernels[k] = p
+	}
 	var err error
-	host := uint32(memHostVisible | memHostCoherent)
-	if d.in, err = d.newBuffer(4*maxCols, host); err != nil {
+	d.host, err = d.NewArena(maxCols+maxRows+maxCols/4+maxCols/num.QBlock, maxCols+maxRows)
+	if err != nil {
 		return err
 	}
-	if d.out, err = d.newBuffer(4*maxRows, host); err != nil {
-		return err
-	}
-	if d.qx, err = d.newBuffer(maxCols, host); err != nil {
-		return err
-	}
-	if d.xs, err = d.newBuffer(4*maxCols/num.QBlock, host); err != nil {
-		return err
-	}
-	for _, k := range []kernelKind{kindF32, kindBF16} {
-		if d.kernels[k], err = d.newPipeline(floatKernel(k, d.info.modes), 3); err != nil {
-			return err
-		}
-	}
-	for _, k := range []kernelKind{kindQ8, kindQ4} {
-		if d.kernels[k], err = d.newPipeline(quantKernel(k, d.info.modes), 5); err != nil {
-			return err
-		}
-	}
+	d.host.SetQuantScratch(maxCols+maxRows, maxCols+maxRows+maxCols/4)
 	return nil
 }
 
 // Info describes the device.
 func (d *Device) Info() Info { return d.info }
 
-// Used is the memory held by matrices on the device.
+// Used is the device memory held by matrices, vectors and arenas, the
+// device's own excepted.
 func (d *Device) Used() int64 {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.used
 }
 
-// Close releases the device; its matrices must be freed first.
+// Close releases the device; what was allocated on it must be freed first.
 func (d *Device) Close() {
 	if d.dev == 0 {
 		return
 	}
 	vk.QueueWaitIdle(d.queue)
-	for _, p := range d.kernels {
-		vk.DestroyPipeline(d.dev, p.pipe, nil)
-		vk.DestroyPipelineLayout(d.dev, p.layout, nil)
-		vk.DestroyDescriptorSetLayout(d.dev, p.setLayout, nil)
-		vk.DestroyShaderModule(d.dev, p.module, nil)
+	if d.host != nil {
+		d.host.Free()
 	}
-	for _, b := range []*buffer{d.in, d.out, d.qx, d.xs} {
-		d.freeBuffer(b)
+	for _, p := range d.kernels {
+		if p != nil {
+			vk.DestroyPipeline(d.dev, p.pipe, nil)
+			vk.DestroyShaderModule(d.dev, p.module, nil)
+		}
+	}
+	if d.layout != 0 {
+		vk.DestroyPipelineLayout(d.dev, d.layout, nil)
+	}
+	for _, l := range d.setLayouts {
+		if l != 0 {
+			vk.DestroyDescriptorSetLayout(d.dev, l, nil)
+		}
+	}
+	if d.setPool != 0 {
+		vk.DestroyDescriptorPool(d.dev, d.setPool, nil)
 	}
 	if d.fence != 0 {
 		vk.DestroyFence(d.dev, d.fence, nil)
@@ -405,7 +431,7 @@ func (b *buffer) bytes() []byte { return unsafe.Slice((*byte)(b.mapped), b.size)
 
 // upload creates a device-local buffer holding data: written directly when
 // the memory is also host-visible (integrated GPUs, resizable BAR), else
-// through a staging buffer.
+// through a staging buffer. The caller holds d.mu.
 func (d *Device) upload(data []byte) (*buffer, error) {
 	size := uint64(max(len(data), 4))
 	b, err := d.newBuffer(size, memDeviceLocal)
@@ -434,17 +460,28 @@ func (d *Device) upload(data []byte) (*buffer, error) {
 	return b, nil
 }
 
+// barrier makes every earlier write visible to every later command and to
+// the host.
+func barrier(cb uintptr) {
+	bar := vkMemoryBarrier{sType: stMemoryBarrier, srcAccessMask: accessShaderWrite | accessTransferWrite,
+		dstAccessMask: accessShaderRead | accessShaderWrite | accessTransferRead | accessTransferWrite | accessHostRead}
+	stages := uint32(pipelineStageCompute | pipelineStageTransfer)
+	vk.CmdPipelineBarrier(cb, stages, stages|pipelineStageHost, 0, 1, &bar, 0, nil, 0, nil)
+}
+
 // run records commands into the device's command buffer, submits them and
-// waits. The caller holds d.mu or has the device to itself.
+// waits. The caller holds d.mu.
 func (d *Device) run(record func(cb uintptr)) error {
 	begin := vkCommandBufferBeginInfo{sType: stCommandBufferBegin, flags: commandBufferOneTimeOnly}
 	if err := check("begin commands", vk.BeginCommandBuffer(d.cmd, &begin)); err != nil {
 		return err
 	}
 	record(d.cmd)
-	// Results become visible to the host.
-	bar := vkMemoryBarrier{sType: stMemoryBarrier, srcAccessMask: accessShaderWrite | accessTransferWrite, dstAccessMask: accessHostRead}
-	vk.CmdPipelineBarrier(d.cmd, pipelineStageCompute|pipelineStageTransfer, pipelineStageHost, 0, 1, &bar, 0, nil, 0, nil)
+	barrier(d.cmd)
+	return d.submit()
+}
+
+func (d *Device) submit() error {
 	if err := check("end commands", vk.EndCommandBuffer(d.cmd)); err != nil {
 		return err
 	}
@@ -458,32 +495,42 @@ func (d *Device) run(record func(cb uintptr)) error {
 	return check("wait", r)
 }
 
-func (d *Device) newPipeline(code []uint32, bindings int) (*pipeline, error) {
-	p := &pipeline{bindings: bindings}
+func (d *Device) newPipeline(code []uint32) (*pipeline, error) {
+	p := &pipeline{}
 	sinfo := vkShaderModuleCreateInfo{sType: stShaderModuleCreateInfo, codeSize: uintptr(4 * len(code)), pCode: &code[0]}
 	if err := check("create shader", vk.CreateShaderModule(d.dev, &sinfo, nil, &p.module)); err != nil {
 		return nil, err
 	}
-	bs := make([]vkDescriptorSetLayoutBinding, bindings)
-	for i := range bs {
-		bs[i] = vkDescriptorSetLayoutBinding{binding: uint32(i), descriptorType: descriptorStorageBuffer, descriptorCount: 1, stageFlags: stageCompute}
-	}
-	linfo := vkDescriptorSetLayoutCreateInfo{sType: stDescriptorSetLayout, bindingCount: uint32(bindings), pBindings: &bs[0]}
-	if err := check("create set layout", vk.CreateDescriptorSetLayout(d.dev, &linfo, nil, &p.setLayout)); err != nil {
-		return nil, err
-	}
-	pcr := vkPushConstantRange{stageFlags: stageCompute, size: 16}
-	plinfo := vkPipelineLayoutCreateInfo{sType: stPipelineLayoutCreate, setLayoutCount: 1, pSetLayouts: &p.setLayout,
-		pushConstantRangeCount: 1, pPushConstantRanges: &pcr}
-	if err := check("create pipeline layout", vk.CreatePipelineLayout(d.dev, &plinfo, nil, &p.layout)); err != nil {
-		return nil, err
-	}
-	cinfo := vkComputePipelineCreateInfo{sType: stComputePipelineCreate, layout: p.layout, basePipelineIndex: -1,
+	cinfo := vkComputePipelineCreateInfo{sType: stComputePipelineCreate, layout: d.layout, basePipelineIndex: -1,
 		stage: vkPipelineShaderStageCreateInfo{sType: stPipelineShaderStage, stage: stageCompute, module: p.module, pName: cstr("main")}}
 	if err := check("create pipeline", vk.CreateComputePipelines(d.dev, 0, 1, &cinfo, nil, &p.pipe)); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// newSet allocates a descriptor set of layout set from pool, binding bufs.
+func (d *Device) newSet(pool uint64, set int, bufs ...*buffer) (uint64, error) {
+	layout := d.setLayouts[set]
+	ainfo := vkDescriptorSetAllocateInfo{sType: stDescriptorSetAllocate, descriptorPool: pool, descriptorSetCount: 1, pSetLayouts: &layout}
+	var ds uint64
+	if err := check("allocate descriptor set", vk.AllocateDescriptorSets(d.dev, &ainfo, &ds)); err != nil {
+		return 0, err
+	}
+	infos := make([]vkDescriptorBufferInfo, len(bufs))
+	writes := make([]vkWriteDescriptorSet, len(bufs))
+	for j, b := range bufs {
+		infos[j] = vkDescriptorBufferInfo{buffer: b.buf, rng: b.size}
+		writes[j] = vkWriteDescriptorSet{sType: stWriteDescriptorSet, dstSet: ds, dstBinding: uint32(j),
+			descriptorCount: 1, descriptorType: descriptorStorageBuffer, pBufferInfo: &infos[j]}
+	}
+	vk.UpdateDescriptorSets(d.dev, uint32(len(writes)), &writes[0], 0, nil)
+	runtime.KeepAlive(infos)
+	return ds, nil
+}
+
+func floatBytes(v []float32) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(v))), 4*len(v))
 }
 
 // Matrix is a weight matrix held on a device.
@@ -503,7 +550,7 @@ type part struct {
 	set        uint64
 }
 
-// Matrices come in these formats, as package num stores them.
+// Format is a matrix in one of the types package num stores.
 type Format struct {
 	F32    []float32
 	BF16   []uint16
@@ -520,7 +567,7 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	switch {
 	case f.F32 != nil:
 		m.kind, rowBytes = kindF32, 4*cols
-		data = unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(f.F32))), 4*len(f.F32))
+		data = floatBytes(f.F32)
 	case f.BF16 != nil:
 		if cols%2 != 0 {
 			return nil, errors.New("gpu: bfloat16 rows need an even width")
@@ -542,13 +589,18 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	if (m.kind == kindQ8 || m.kind == kindQ4) && (cols%num.QBlock != 0 || len(f.Scales) != rows*cols/num.QBlock) {
 		return nil, errors.New("gpu: quantized matrix of the wrong shape")
 	}
-	scales := unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(f.Scales))), 4*len(f.Scales))
+	scales := floatBytes(f.Scales)
 
 	// Split rows so each part fits a binding, and a gigabyte at most.
 	limit := min(d.info.maxRange, 1<<30)
 	per := max(int(limit)/rowBytes, 1)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	size := vkDescriptorPoolSize{typ: descriptorStorageBuffer, count: uint32(2 * ((rows + per - 1) / per))}
+	pinfo := vkDescriptorPoolCreateInfo{sType: stDescriptorPoolCreate, maxSets: size.count / 2, poolSizeCount: 1, pPoolSizes: &size}
+	if err := check("create descriptor pool", vk.CreateDescriptorPool(d.dev, &pinfo, nil, &m.pool)); err != nil {
+		return nil, err
+	}
 	for r := 0; r < rows; r += per {
 		n := min(per, rows-r)
 		p := part{row0: r, rows: n}
@@ -556,7 +608,16 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		if p.w, err = d.upload(data[r*rowBytes : (r+n)*rowBytes]); err == nil && scaleBytes > 0 {
 			p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
 		}
+		if err == nil {
+			bufs := []*buffer{p.w}
+			if p.s != nil {
+				bufs = append(bufs, p.s)
+			}
+			p.set, err = d.newSet(m.pool, 0, bufs...)
+		}
 		if err != nil {
+			d.freeBuffer(p.w)
+			d.freeBuffer(p.s)
 			m.free()
 			return nil, err
 		}
@@ -566,46 +627,9 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 			m.bytes += int64(p.s.size)
 		}
 	}
-	if err := m.bind(); err != nil {
-		m.free()
-		return nil, err
-	}
 	d.used += m.bytes
 	runtime.KeepAlive(f)
 	return m, nil
-}
-
-// bind creates a descriptor set per part.
-func (m *Matrix) bind() error {
-	d := m.d
-	p := d.kernels[m.kind]
-	size := vkDescriptorPoolSize{typ: descriptorStorageBuffer, count: uint32(len(m.parts) * p.bindings)}
-	pinfo := vkDescriptorPoolCreateInfo{sType: stDescriptorPoolCreate, maxSets: uint32(len(m.parts)), poolSizeCount: 1, pPoolSizes: &size}
-	if err := check("create descriptor pool", vk.CreateDescriptorPool(d.dev, &pinfo, nil, &m.pool)); err != nil {
-		return err
-	}
-	for i := range m.parts {
-		pt := &m.parts[i]
-		layout := p.setLayout
-		ainfo := vkDescriptorSetAllocateInfo{sType: stDescriptorSetAllocate, descriptorPool: m.pool, descriptorSetCount: 1, pSetLayouts: &layout}
-		if err := check("allocate descriptor set", vk.AllocateDescriptorSets(d.dev, &ainfo, &pt.set)); err != nil {
-			return err
-		}
-		bufs := []*buffer{pt.w, d.in, d.out}
-		if m.kind == kindQ8 || m.kind == kindQ4 {
-			bufs = []*buffer{pt.w, pt.s, d.qx, d.xs, d.out}
-		}
-		infos := make([]vkDescriptorBufferInfo, len(bufs))
-		writes := make([]vkWriteDescriptorSet, len(bufs))
-		for j, b := range bufs {
-			infos[j] = vkDescriptorBufferInfo{buffer: b.buf, rng: b.size}
-			writes[j] = vkWriteDescriptorSet{sType: stWriteDescriptorSet, dstSet: pt.set, dstBinding: uint32(j),
-				descriptorCount: 1, descriptorType: descriptorStorageBuffer, pBufferInfo: &infos[j]}
-		}
-		vk.UpdateDescriptorSets(d.dev, uint32(len(writes)), &writes[0], 0, nil)
-		runtime.KeepAlive(infos)
-	}
-	return nil
 }
 
 // SameDevice reports whether two matrices are on the same device.
@@ -613,6 +637,9 @@ func SameDevice(a, b *Matrix) bool { return a != nil && b != nil && a.d == b.d }
 
 // Bytes is the device memory the matrix holds.
 func (m *Matrix) Bytes() int64 { return m.bytes }
+
+// Device is the device holding the matrix.
+func (m *Matrix) Device() *Device { return m.d }
 
 // Free releases the matrix's device memory.
 func (m *Matrix) Free() {
@@ -646,54 +673,23 @@ func MulVecs(ms []*Matrix, outs [][]float32, x []float32) error {
 		return nil
 	}
 	d := ms[0].d
-	total, quant, float := 0, false, false
+	total := 0
+	offs := make([]int, len(ms))
 	for i, m := range ms {
 		if m.d != d || len(x) != m.cols || len(outs[i]) != m.rows {
 			return fmt.Errorf("gpu: %d×%d matrix times %d into %d", m.rows, m.cols, len(x), len(outs[i]))
 		}
+		offs[i] = maxCols + total
 		total += m.rows
-		quant = quant || m.kind == kindQ8 || m.kind == kindQ4
-		float = float || m.kind == kindF32 || m.kind == kindBF16
 	}
 	if total > maxRows {
 		return errors.New("gpu: products too large for one submission")
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if quant {
-		qx, xs := num.QuantizeActs(x)
-		copy(d.qx.bytes(), unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(qx))), len(qx)))
-		copy(d.xs.bytes(), unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(xs))), 4*len(xs)))
+	b := d.host.Begin()
+	b.Write(0, x)
+	b.MatVecs(ms, offs, 0)
+	for i := range ms {
+		b.Read(offs[i], outs[i])
 	}
-	if float {
-		copy(d.in.bytes(), unsafe.Slice((*byte)(unsafe.Pointer(unsafe.SliceData(x))), 4*len(x)))
-	}
-	err := d.run(func(cb uintptr) {
-		at := 0
-		for _, m := range ms {
-			p := d.kernels[m.kind]
-			vk.CmdBindPipeline(cb, bindPointCompute, p.pipe)
-			for _, pt := range m.parts {
-				set := pt.set
-				vk.CmdBindDescriptorSets(cb, bindPointCompute, p.layout, 0, 1, &set, 0, nil)
-				per := groupRows(m.kind)
-				groups := (pt.rows + per - 1) / per
-				gx := min(groups, 65535)
-				gy := (groups + gx - 1) / gx
-				pc := [4]uint32{uint32(pt.rows), uint32(m.cols), uint32(gx), uint32(at + pt.row0)}
-				vk.CmdPushConstants(cb, p.layout, stageCompute, 0, 16, unsafe.Pointer(&pc[0]))
-				vk.CmdDispatch(cb, uint32(gx), uint32(gy), 1)
-			}
-			at += m.rows
-		}
-	})
-	if err != nil {
-		return err
-	}
-	res := unsafe.Slice((*float32)(d.out.mapped), total)
-	for i, m := range ms {
-		copy(outs[i], res[:m.rows])
-		res = res[m.rows:]
-	}
-	return nil
+	return b.Submit()
 }

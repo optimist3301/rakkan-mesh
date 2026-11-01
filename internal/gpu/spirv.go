@@ -41,10 +41,25 @@ const (
 	opCompositeExtract   = 81
 	opConvertSToF        = 111
 	opBitcast            = 124
+	opConvertFToS        = 110
+	opFNegate            = 127
+	opFSub               = 131
+	opSDiv               = 135
+	opIsNan              = 156
+	opIsInf              = 157
+	opLogicalOr          = 166
+	opFOrdEqual          = 180
+	opFOrdLessThan       = 184
+	opFOrdGreaterThan    = 186
+	opSLessThan          = 177
+	opSGreaterThan       = 173
+	opBitwiseOr          = 197
 	opIAdd               = 128
 	opFAdd               = 129
 	opISub               = 130
 	opIMul               = 132
+	opUDiv               = 134
+	opUMod               = 137
 	opFMul               = 133
 	opLogicalAnd         = 167
 	opSelect             = 169
@@ -173,8 +188,13 @@ func (b *builder) decorate(t id, args ...uint32) {
 	inst(&b.annots, opDecorate, append([]uint32{t}, args...)...)
 }
 
-// storageBuffer declares binding n of set 0: a runtime array of words.
+// storageBuffer declares a binding of set 0: a runtime array of words.
 func (b *builder) storageBuffer(binding uint32, readOnly bool) id {
+	return b.storageBufferIn(0, binding, readOnly)
+}
+
+// storageBufferIn declares a binding of a descriptor set.
+func (b *builder) storageBufferIn(set, binding uint32, readOnly bool) id {
 	arr := b.typ(opTypeRuntimeArray, b.tU32)
 	b.decorate(arr, decArrayStride, 4)
 	st := b.typ(opTypeStruct, arr)
@@ -186,7 +206,7 @@ func (b *builder) storageBuffer(binding uint32, readOnly bool) id {
 	ptr := b.typ(opTypePointer, scStorageBuffer, st)
 	v := b.id()
 	inst(&b.types, opVariable, ptr, v, scStorageBuffer)
-	b.decorate(v, decDescriptorSet, 0)
+	b.decorate(v, decDescriptorSet, set)
 	b.decorate(v, decBinding, binding)
 	return v
 }
@@ -274,7 +294,26 @@ func (b *builder) fadd(x, y id) id {
 	return r
 }
 
-func (b *builder) sel(c, x, y id) id { return b.op(opSelect, b.tU32, c, x, y) }
+func (b *builder) sel(c, x, y id) id  { return b.op(opSelect, b.tU32, c, x, y) }
+func (b *builder) selF(c, x, y id) id { return b.op(opSelect, b.tF32, c, x, y) }
+func (b *builder) selI(c, x, y id) id { return b.op(opSelect, b.tI32, c, x, y) }
+func (b *builder) or(x, y id) id      { return b.op(opBitwiseOr, b.tU32, x, y) }
+func (b *builder) lor(x, y id) id     { return b.op(opLogicalOr, b.tBool, x, y) }
+func (b *builder) isNaN(x id) id      { return b.op(opIsNan, b.tBool, x) }
+func (b *builder) isInf(x id) id      { return b.op(opIsInf, b.tBool, x) }
+func (b *builder) flt(x, y id) id     { return b.op(opFOrdLessThan, b.tBool, x, y) }
+func (b *builder) fgt(x, y id) id     { return b.op(opFOrdGreaterThan, b.tBool, x, y) }
+func (b *builder) feq(x, y id) id     { return b.op(opFOrdEqual, b.tBool, x, y) }
+func (b *builder) slt(x, y id) id     { return b.op(opSLessThan, b.tBool, x, y) }
+func (b *builder) sgt(x, y id) id     { return b.op(opSGreaterThan, b.tBool, x, y) }
+func (b *builder) sdiv(x, y id) id    { return b.op(opSDiv, b.tI32, x, y) }
+func (b *builder) fneg(x id) id       { return b.op(opFNegate, b.tF32, x) }
+
+func (b *builder) fsub(x, y id) id {
+	r := b.op(opFSub, b.tF32, x, y)
+	b.decorate(r, decNoContraction)
+	return r
+}
 
 // word returns element i of a storage buffer.
 func (b *builder) word(buf, i id) id {

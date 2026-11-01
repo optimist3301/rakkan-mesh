@@ -194,15 +194,13 @@ type localStage struct {
 }
 
 func (l *localStage) forward(xs []float32, pos, tokens int) error {
-	for t := range tokens {
-		if err := l.stage.Forward(xs[t*l.dim:(t+1)*l.dim], pos+t); err != nil {
-			return err
-		}
-	}
-	return nil
+	return l.stage.ForwardMany(xs, pos, tokens)
 }
 
-func (l *localStage) close() { l.release() }
+func (l *localStage) close() {
+	l.stage.Close()
+	l.release()
+}
 
 // openStage starts a stage on a node: this one, or a member.
 func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, from, to, positions int, providers []peer.ID) (stageConn, error) {
@@ -212,13 +210,13 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 			return nil, err
 		}
 		c := l.manifest.Config
-		cache := CacheBytes(c, to-from, positions)
-		if err := s.reserve(cache); err != nil {
+		unreserve, err := s.reserveCache(l, positions)
+		if err != nil {
 			s.release(l)
 			return nil, err
 		}
 		return &localStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim, release: func() {
-			s.unreserve(cache)
+			unreserve()
 			s.release(l)
 		}}, nil
 	}

@@ -63,6 +63,8 @@ const (
 	accessHostWrite       = 0x4000
 
 	commandPoolResetBuffer   = 0x2
+	descriptorPoolFreeSet    = 0x1
+	accessTransferRead       = 0x800
 	commandBufferOneTimeOnly = 0x1
 
 	physicalDeviceOther      = 0
@@ -346,6 +348,7 @@ var vk struct {
 	CreateDescriptorPool                 func(uintptr, *vkDescriptorPoolCreateInfo, unsafe.Pointer, *uint64) int32
 	DestroyDescriptorPool                func(uintptr, uint64, unsafe.Pointer)
 	AllocateDescriptorSets               func(uintptr, *vkDescriptorSetAllocateInfo, *uint64) int32
+	FreeDescriptorSets                   func(uintptr, uint64, uint32, *uint64) int32
 	UpdateDescriptorSets                 func(uintptr, uint32, *vkWriteDescriptorSet, uint32, unsafe.Pointer)
 	CreateCommandPool                    func(uintptr, *vkCommandPoolCreateInfo, unsafe.Pointer, *uint64) int32
 	DestroyCommandPool                   func(uintptr, uint64, unsafe.Pointer)
@@ -430,6 +433,7 @@ func load() error {
 		bind(&vk.DestroyDescriptorPool, "vkDestroyDescriptorPool")
 		bind(&vk.AllocateDescriptorSets, "vkAllocateDescriptorSets")
 		bind(&vk.UpdateDescriptorSets, "vkUpdateDescriptorSets")
+		bind(&vk.FreeDescriptorSets, "vkFreeDescriptorSets")
 		bind(&vk.CreateCommandPool, "vkCreateCommandPool")
 		bind(&vk.DestroyCommandPool, "vkDestroyCommandPool")
 		bind(&vk.AllocateCommandBuffers, "vkAllocateCommandBuffers")

@@ -69,8 +69,8 @@ type Shard struct {
 type advert struct {
 	Serves bool    `json:"serves"`
 	Shards []Shard `json:"shards"`
-	// FreeMem is the memory left for weights: on the GPU, if Device is
-	// set, with FreeCache left in RAM for caches; else shared by both.
+	// FreeMem is the memory left for weights and caches: on the GPU, if
+	// Device is set. FreeCache, if set, is memory for caches apart.
 	FreeMem   int64 `json:"free_mem"`
 	FreeCache int64 `json:"free_cache,omitempty"`
 	// Speed is how fast the node streams weights through a product, in
@@ -237,8 +237,9 @@ func (s *Service) advert() advert {
 	defer s.mu.Unlock()
 	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used, Speed: s.speed}
 	if s.cfg.Device != nil {
+		// Weights and caches share the GPU's memory.
 		a.Device = s.deviceName()
-		a.FreeMem, a.FreeCache = s.cfg.DeviceBytes-s.devUsed, s.cfg.MemoryBytes-s.used
+		a.FreeMem = s.cfg.DeviceBytes - s.devUsed
 	}
 	for sh, l := range s.shards {
 		if l.err == nil && l.layers != nil {
@@ -447,6 +448,32 @@ func (s *Service) toDevice(c Config, layers []*Layer) (int64, bool) {
 	return need, true
 }
 
+// reserveCache accounts for a stage's caches: in GPU memory, with its
+// activations, when the shard's layers are there; else in RAM.
+func (s *Service) reserveCache(l *loaded, positions int) (func(), error) {
+	c := l.manifest.Config
+	layers := len(l.layers)
+	if !l.onDevice {
+		n := CacheBytes(c, layers, positions)
+		if err := s.reserve(n); err != nil {
+			return nil, err
+		}
+		return func() { s.unreserve(n) }, nil
+	}
+	n := ArenaBytes(c, layers, positions)
+	s.mu.Lock()
+	if s.devUsed+n > s.cfg.DeviceBytes {
+		s.evictDevice(n)
+	}
+	if s.devUsed+n > s.cfg.DeviceBytes {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("GPU memory budget exhausted (%d of %d bytes in use)", s.devUsed, s.cfg.DeviceBytes)
+	}
+	s.devUsed += n
+	s.mu.Unlock()
+	return func() { s.unreserveDevice(n) }, nil
+}
+
 func (s *Service) unreserveDevice(n int64) {
 	s.mu.Lock()
 	s.devUsed -= n
@@ -602,13 +629,14 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	if positions <= 0 || positions > cfg.SeqLen {
 		positions = cfg.SeqLen
 	}
-	cache := CacheBytes(cfg, req.To-req.From, positions)
-	if err := s.reserve(cache); err != nil {
+	unreserve, err := s.reserveCache(l, positions)
+	if err != nil {
 		writeStatus(st, err)
 		return
 	}
-	defer func() { s.unreserve(cache); s.notify() }()
+	defer func() { unreserve(); s.notify() }()
 	stage := NewStage(cfg, l.layers, l.rope, positions)
+	defer stage.Close()
 	if writeStatus(st, nil) != nil {
 		return
 	}
@@ -648,12 +676,7 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 			}
 		}
 		xs := decodeActs(acts)
-		for t := range req.Tokens {
-			if err = stage.Forward(xs[t*cfg.Dim:(t+1)*cfg.Dim], req.Pos+t); err != nil {
-				break
-			}
-		}
-		if err != nil {
+		if err = stage.ForwardMany(xs, req.Pos, req.Tokens); err != nil {
 			settle(0)
 			writeStatus(st, err)
 			return

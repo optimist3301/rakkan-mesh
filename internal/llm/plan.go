@@ -32,8 +32,9 @@ type span struct {
 }
 
 // fits returns how many layers of a model a node can hold for a
-// generation of positions: weights and caches share its memory unless it
-// has a GPU. Layers of the model it has loaded already cost only caches.
+// generation of positions: weights and caches share its memory (its GPU's,
+// if it has one) unless it advertises memory for caches apart. Layers of
+// the model it has loaded already cost only caches.
 func fits(a advert, model string, c Config, positions int) int {
 	lb, cb := LayerBytes(c), CacheBytes(c, 1, positions)
 	loaded := 0
@@ -43,7 +44,7 @@ func fits(a advert, model string, c Config, positions int) int {
 		}
 	}
 	var n int64
-	if a.Device != "" {
+	if a.FreeCache > 0 {
 		n = min(a.FreeMem/lb+int64(loaded), a.FreeCache/max(cb, 1))
 	} else {
 		n = (a.FreeMem + int64(loaded)*lb) / (lb + cb)
@@ -66,8 +67,9 @@ func sortNodes(nodes []stageNode) {
 // planStages assigns a model's layers to nodes. With stages <= 0 the
 // fastest nodes take as many layers as fit, which minimizes both compute
 // time and hops. With stages > 0 the layers are spread over that many of
-// the fastest nodes, in proportion to their speed within what each holds:
-// each layer goes to the node whose stage would then finish soonest.
+// the fastest nodes (fewer if there are fewer nodes or layers): a layer
+// each, then the rest in proportion to their speed within what each holds,
+// each layer going to the node whose stage would then finish soonest.
 func planStages(layers int, nodes []stageNode, stages int) ([]span, error) {
 	nodes = slices.DeleteFunc(slices.Clone(nodes), func(n stageNode) bool { return n.layers <= 0 })
 	sortNodes(nodes)
@@ -87,9 +89,13 @@ func planStages(layers int, nodes []stageNode, stages int) ([]span, error) {
 			return nil, fmt.Errorf("%w: the model has %d layers, nodes serving stages hold %d", ErrNoStages, layers, total)
 		}
 	} else {
-		nodes = nodes[:min(stages, len(nodes))]
+		nodes = nodes[:min(stages, len(nodes), layers)]
 		counts = make([]int, len(nodes))
-		for range layers {
+		// Each stage asked for gets a layer; the rest go by speed.
+		for i := range counts {
+			counts[i] = 1
+		}
+		for range layers - len(nodes) {
 			best := -1
 			var bestT float64
 			for i, n := range nodes {
