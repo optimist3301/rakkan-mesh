@@ -311,6 +311,16 @@ test('language model: quantized to 4 bits, the same text however the layers are 
   assert.equal(texts[2], texts[0]);
 });
 
+test('nodes serving model stages advertise their speed and memory', async () => {
+  const st = await mesh.status();
+  assert.equal(st.llm.length, 3);
+  for (const n of st.llm) {
+    assert.ok(n.speed > 0, 'measured speed');
+    assert.ok(n.free_mem > 0);
+  }
+  assert.ok(st.llm[0].speed >= st.llm[2].speed, 'fastest first');
+});
+
 test('no node on the socket', async () => {
   const nowhere = connect({ socket: '/nonexistent/rakkan.sock' });
   await assert.rejects(nowhere.status(), (err) => err instanceof TaskError && err.kind === 'unavailable');

@@ -143,6 +143,15 @@ func DequantQ4(dst []float32, q []byte, scales []float32) {
 	}
 }
 
+// QuantizeActs quantizes an input vector, a whole number of blocks, to
+// Q8_0 as the quantized products do.
+func QuantizeActs(x []float32) (q []int8, scales []float32) {
+	q = make([]int8, len(x))
+	scales = make([]float32, len(x)/QBlock)
+	quantize8(x, q, scales)
+	return q, scales
+}
+
 // qrow combines a row's integer block sums with the scales.
 func qrow(sums []int32, ws, xs []float32) float32 {
 	var s [8]float32

@@ -349,3 +349,63 @@ func klDivergence(p, q []float32) float64 {
 	}
 	return kl
 }
+
+// TestHFModelOnGPU runs Qwen with its layers and classifier on each GPU:
+// the logits are the CPU's, bit for bit.
+func TestHFModelOnGPU(t *testing.T) {
+	root := os.Getenv("RAKKAN_HF_MODELS")
+	if root == "" {
+		t.Skip("RAKKAN_HF_MODELS not set")
+	}
+	dir := filepath.Join(root, hfModels[0])
+	if _, err := os.Stat(dir); err != nil {
+		t.Skip(err)
+	}
+	devs := gpuDevices(t)
+	for _, quant := range []string{"", "q4_m"} {
+		store, err := blob.OpenStore(t.TempDir(), 1<<34)
+		if err != nil {
+			t.Fatal(err)
+		}
+		src := openHF(t, dir)
+		src.Quant = quant
+		id, _, err := ImportHF(store, src, "qwen")
+		if err != nil {
+			t.Fatal(err)
+		}
+		cpu := loadStored(t, store, id)
+		prompt := cpu.tok.Encode(cpu.m.Chat.Prefix + "What is the capital of France?" + cpu.m.Chat.Suffix)
+		want := cpu.logits(prompt)
+		_, wantTokens, cpuSpeed := cpu.chatTokens("Name three colors of the rainbow.", 20)
+		for _, d := range devs {
+			lm := loadStored(t, store, id)
+			c := lm.m.Config
+			for _, l := range lm.layers {
+				if _, err := l.toDevice(c, d); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := lm.head.Wcls.toDevice(d, c.Vocab, c.Dim, true); err != nil {
+				t.Fatal(err)
+			}
+			got := lm.logits(prompt)
+			for p := range want {
+				for i := range want[p] {
+					if math.Float32bits(got[p][i]) != math.Float32bits(want[p][i]) {
+						t.Fatalf("%s %s: position %d token %d: GPU %v, CPU %v", d.Info().Name, cmp.Or(quant, "native"), p, i, got[p][i], want[p][i])
+					}
+				}
+			}
+			_, tokens, speed := lm.chatTokens("Name three colors of the rainbow.", 20)
+			if !slices.Equal(tokens, wantTokens) {
+				t.Fatalf("%s: generated tokens differ", d.Info().Name)
+			}
+			t.Logf("%s, %s: logits identical to the CPU's at %d positions; %.1f tokens/s (CPU %.1f), %d MiB on the device",
+				d.Info().Name, cmp.Or(quant, "native"), len(prompt), speed, cpuSpeed, d.Used()>>20)
+			for _, l := range lm.layers {
+				l.release(c)
+			}
+			lm.head.Wcls.dev.Free()
+		}
+	}
+}

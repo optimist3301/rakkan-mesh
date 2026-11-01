@@ -443,6 +443,8 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 		PowBits int          `json:"pow_bits,omitempty"`
 		Load    loadJSON     `json:"load"`
 		Members []memberJSON `json:"members"`
+		// LLM lists the nodes serving model stages, fastest first.
+		LLM []llm.NodeInfo `json:"llm,omitempty"`
 	}{ID: s.Node.ID().String(), Network: s.Network, Guest: !s.Node.Certified(), Open: pol.Open, PowBits: pol.PowBits,
 		Load: loadJSON{local.Slots, local.Busy, local.Queued, local.Capabilities}, Members: []memberJSON{}}
 	for _, m := range s.Node.Members() {
@@ -455,6 +457,9 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 			mj.Load = &loadJSON{l.Slots, l.Busy, l.Queued, l.Capabilities}
 		}
 		out.Members = append(out.Members, mj)
+	}
+	if s.LLM != nil {
+		out.LLM = s.LLM.Nodes()
 	}
 	writeJSON(w, http.StatusOK, out)
 }

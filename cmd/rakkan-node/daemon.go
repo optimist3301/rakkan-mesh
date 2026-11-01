@@ -10,6 +10,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/api"
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/exec"
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
@@ -19,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,10 +58,15 @@ func daemonCmd(args []string) int {
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
 	maxOutputMB := flags.Int("max-output-mb", 16, "largest task output this node accepts, in MiB")
 	serveLLM := flags.Bool("llm", false, "serve language model pipeline stages for the network")
-	llmMemGB := flags.Float64("llm-mem-gb", 4, "memory for model weights and caches served to the network, in GiB")
+	llmMemGB := flags.Float64("llm-mem-gb", 4, "memory for model weights and caches served to the network, in GiB; with a GPU, for caches only")
+	gpuFlag := flags.String("gpu", "auto", `GPU for language models: "auto" (the best exact one), "off", a device index, or "list" to show them`)
+	gpuMemGB := flags.Float64("gpu-mem-gb", 0, "GPU memory for model weights, in GiB (default: 85% of the device's)")
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
+	if *gpuFlag == "list" {
+		return listGPUs()
+	}
 	n, err := membership.ParseNetwork(*network)
 	if err != nil {
 		return fail(fmt.Errorf("-network: %w", err))
@@ -164,8 +171,15 @@ func daemonCmd(args []string) int {
 		return fail(err)
 	}
 	defer svc.Close()
+	dev, err := openGPU(*gpuFlag)
+	if err != nil {
+		return fail(err)
+	}
+	if dev != nil {
+		defer dev.Close()
+	}
 	lm, err := llm.NewService(llm.ServiceConfig{Node: node, Blobs: blobs, Serve: *serveLLM,
-		MemoryBytes: int64(*llmMemGB * (1 << 30)), Trust: tr, Logger: cfg.Logger})
+		MemoryBytes: int64(*llmMemGB * (1 << 30)), Device: dev, DeviceBytes: int64(*gpuMemGB * (1 << 30)), Trust: tr, Logger: cfg.Logger})
 	if err != nil {
 		return fail(err)
 	}
@@ -206,6 +220,69 @@ func daemonCmd(args []string) int {
 			}
 		}
 	}
+}
+
+// listGPUs prints the Vulkan devices.
+func listGPUs() int {
+	devs, err := gpu.Devices()
+	if err != nil {
+		return fail(err)
+	}
+	if len(devs) == 0 {
+		fmt.Println("no Vulkan devices")
+	}
+	best, _ := gpu.Best(devs)
+	for _, d := range devs {
+		mark := " "
+		if d.Name == best.Name && d.Index == best.Index {
+			mark = "*"
+		}
+		exact := "exact"
+		if !d.Exact {
+			exact = "not exact: results may differ from CPU nodes'"
+		}
+		fmt.Printf("%s %d  %s (%s, Vulkan %s, %.1f GiB, %s)\n", mark, d.Index, d.Name, d.Type, d.API, float64(d.Memory)/(1<<30), exact)
+	}
+	fmt.Println("* the device -gpu auto picks")
+	return 0
+}
+
+// openGPU opens the GPU the -gpu flag names, or none.
+func openGPU(which string) (*gpu.Device, error) {
+	if which == "off" {
+		return nil, nil
+	}
+	devs, err := gpu.Devices()
+	if err != nil {
+		if which == "auto" {
+			slog.Info("no GPU: language models run on the CPU", "reason", err)
+			return nil, nil
+		}
+		return nil, err
+	}
+	var info gpu.Info
+	if which == "auto" {
+		var ok bool
+		if info, ok = gpu.Best(devs); !ok {
+			slog.Info("no suitable GPU: language models run on the CPU")
+			return nil, nil
+		}
+	} else {
+		i, err := strconv.Atoi(which)
+		if err != nil || i < 0 || i >= len(devs) {
+			return nil, fmt.Errorf("-gpu %q: want auto, off, list or a device index", which)
+		}
+		info = devs[i]
+		if !info.Exact {
+			slog.Warn("this GPU does not guarantee exact arithmetic: rarely, its results may differ from other nodes' and fail checks", "device", info.Name)
+		}
+	}
+	d, err := gpu.Open(info)
+	if err != nil {
+		return nil, fmt.Errorf("GPU %s: %w", info.Name, err)
+	}
+	fmt.Printf("GPU: %s (%s, %.1f GiB)\n", info.Name, info.Type, float64(info.Memory)/(1<<30))
+	return d, nil
 }
 
 func parseIsolation(s string) (isolate.Isolation, error) {

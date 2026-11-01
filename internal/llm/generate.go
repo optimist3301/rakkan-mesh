@@ -2,7 +2,6 @@ package llm
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -106,6 +105,13 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 	if cm.head, err = LoadHead(c, data, cm.embed); err != nil {
 		return nil, err
 	}
+	if d := s.cfg.Device; d != nil {
+		// The classifier is the coordinator's largest product. The host copy
+		// stays: it is the embedding table too, and the fallback.
+		if err := cm.head.Wcls.toDevice(d, c.Vocab, c.Dim, true); err != nil {
+			s.log.Warn("classifier stays on the CPU", "err", err)
+		}
+	}
 	if data, err = part(m.Tokenizer, 64<<20); err != nil {
 		return nil, err
 	}
@@ -113,8 +119,15 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 		return nil, err
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.coords[model]; ok {
+		// A concurrent generation loaded it first: keep one copy.
+		if cm.head.Wcls.dev != nil {
+			cm.head.Wcls.dev.Free()
+		}
+		return prev, nil
+	}
 	s.coords[model] = cm
-	s.mu.Unlock()
 	return cm, nil
 }
 
@@ -182,7 +195,9 @@ type localStage struct {
 
 func (l *localStage) forward(xs []float32, pos, tokens int) error {
 	for t := range tokens {
-		l.stage.Forward(xs[t*l.dim:(t+1)*l.dim], pos+t)
+		if err := l.stage.Forward(xs[t*l.dim:(t+1)*l.dim], pos+t); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -251,35 +266,27 @@ type witness struct {
 	conn stageConn
 }
 
-// candidates lists nodes able to serve stages, preferring those already
-// holding the range.
-func (s *Service) candidates(model blob.ID, from, to int, exclude map[peer.ID]bool) []peer.ID {
+// candidates lists nodes able to hold layers from..to for a generation of
+// positions, those already holding the range first, then the fastest.
+func (s *Service) candidates(model blob.ID, from, to, positions int, exclude map[peer.ID]bool) []peer.ID {
 	key := Shard{model.String(), from, to}
+	c := s.manifestConfig(model)
+	servers := s.servers()
+	var nodes []stageNode
+	for _, n := range s.stageNodes(model.String(), c, positions, exclude) {
+		if n.layers >= to-from {
+			nodes = append(nodes, n)
+		}
+	}
+	sortNodes(nodes)
 	var loaded, others []peer.ID
-	byMem := map[peer.ID]int64{}
-	for p, a := range s.servers() {
-		if exclude[p] {
-			continue
-		}
-		byMem[p] = a.FreeMem
-		if slices.Contains(a.Shards, key) {
-			loaded = append(loaded, p)
+	for _, n := range nodes {
+		if slices.Contains(servers[n.id].Shards, key) {
+			loaded = append(loaded, n.id)
 		} else {
-			others = append(others, p)
+			others = append(others, n.id)
 		}
 	}
-	if s.cfg.Serve && !exclude[s.node.ID()] {
-		others = append(others, s.node.ID())
-		byMem[s.node.ID()] = s.cfg.MemoryBytes
-	}
-	byFree := func(a, b peer.ID) int {
-		if c := cmp.Compare(byMem[b], byMem[a]); c != 0 {
-			return c
-		}
-		return cmp.Compare(a, b)
-	}
-	slices.SortFunc(loaded, byFree)
-	slices.SortFunc(others, byFree)
 	return append(loaded, others...)
 }
 
@@ -326,15 +333,12 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	// Stages keep caches for exactly this many positions.
 	positions := len(tokens) + maxTokens
 
-	n := req.Stages
-	if n <= 0 {
-		n = len(s.servers())
-		if s.cfg.Serve {
-			n++
-		}
+	// Assign layers by the nodes' speed and memory.
+	spans, err := planStages(c.Layers, s.stageNodes(req.Model.String(), c, positions, nil), min(req.Stages, c.Layers))
+	if err != nil {
+		return nil, err
 	}
-	n = min(max(n, 1), c.Layers)
-	stages := make([]*planned, n)
+	stages := make([]*planned, len(spans))
 	used := map[peer.ID]bool{}
 	defer func() {
 		for _, st := range stages {
@@ -346,10 +350,16 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 			}
 		}
 	}()
-	for i := range n {
-		st := &planned{from: i * c.Layers / n, to: (i + 1) * c.Layers / n, positions: positions}
-		if err := s.place(ctx, req.Model, st, used, providers); err != nil {
-			return nil, err
+	for i, sp := range spans {
+		st := &planned{from: sp.from, to: sp.to, positions: positions}
+		// The planned node, or, if it refuses, the next best.
+		if conn, err := s.openStage(ctx, sp.node, req.Model, sp.from, sp.to, positions, providers); err == nil {
+			st.node, st.conn = sp.node, conn
+		} else {
+			s.log.Info("stage refused", "node", sp.node.ShortString(), "err", err)
+			if err := s.place(ctx, req.Model, st, used, providers); err != nil {
+				return nil, err
+			}
 		}
 		used[st.node] = true
 		stages[i] = st
@@ -401,7 +411,7 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 // place opens a stage on the best available node.
 func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude map[peer.ID]bool, providers []peer.ID) error {
 	var lastErr error = ErrNoStages
-	for _, node := range s.candidates(model, st.from, st.to, exclude) {
+	for _, node := range s.candidates(model, st.from, st.to, st.positions, exclude) {
 		if s.cfg.Trust != nil && s.cfg.Trust.Suspect(node) {
 			continue
 		}
@@ -517,7 +527,7 @@ func (s *Service) ensureWitness(ctx context.Context, model blob.ID, st *planned,
 		}
 		return
 	}
-	for _, node := range s.candidates(model, st.from, st.to, map[peer.ID]bool{st.node: true}) {
+	for _, node := range s.candidates(model, st.from, st.to, st.positions, map[peer.ID]bool{st.node: true}) {
 		if !tr.Trusted(node) {
 			continue
 		}

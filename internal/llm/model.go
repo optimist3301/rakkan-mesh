@@ -29,6 +29,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
 
@@ -138,13 +139,41 @@ type Matrix struct {
 	Q8     []int8
 	Q4     []byte
 	Scales []float32
+
+	// dev is the matrix on a GPU, which computes the same bits as the
+	// host code; the host copy may have been dropped (see toDevice).
+	dev    *gpu.Matrix
+	devLen int
 }
 
 // Len is the number of elements.
-func (m Matrix) Len() int { return max(len(m.F32), len(m.BF16), len(m.Q8), 2*len(m.Q4)) }
+func (m Matrix) Len() int { return max(len(m.F32), len(m.BF16), len(m.Q8), 2*len(m.Q4), m.devLen) }
 
-// MulVec sets out = m·x.
-func (m Matrix) MulVec(out, x []float32) {
+func (m Matrix) onHost() bool { return m.F32 != nil || m.BF16 != nil || m.Q8 != nil || m.Q4 != nil }
+
+// toDevice copies the matrix, of rows×cols, to a GPU; without keepHost the
+// host copy is dropped, so the weights take device memory only.
+func (m *Matrix) toDevice(d *gpu.Device, rows, cols int, keepHost bool) error {
+	dm, err := d.Upload(rows, cols, gpu.Format{F32: m.F32, BF16: m.BF16, Q8: m.Q8, Q4: m.Q4, Scales: m.Scales})
+	if err != nil {
+		return err
+	}
+	m.dev, m.devLen = dm, rows*cols
+	if !keepHost {
+		m.F32, m.BF16, m.Q8, m.Q4, m.Scales = nil, nil, nil, nil, nil
+	}
+	return nil
+}
+
+// MulVec sets out = m·x. A GPU failure falls back to the host copy, when
+// there is one.
+func (m Matrix) MulVec(out, x []float32) error {
+	if m.dev != nil {
+		err := m.dev.MulVec(out, x)
+		if err == nil || !m.onHost() {
+			return err
+		}
+	}
 	switch {
 	case m.Q8 != nil:
 		num.MatVecQ8(out, m.Q8, m.Scales, x)
@@ -155,6 +184,32 @@ func (m Matrix) MulVec(out, x []float32) {
 	default:
 		num.MatVec32(out, m.F32, x)
 	}
+	return nil
+}
+
+// mulVecs sets outs[i] = ms[i]·x: on the GPU in one submission when all
+// the matrices are on the same device, else one by one.
+func mulVecs(ms []Matrix, outs [][]float32, x []float32) error {
+	devs := make([]*gpu.Matrix, len(ms))
+	for i, m := range ms {
+		devs[i] = m.dev
+		if m.dev == nil || !gpu.SameDevice(m.dev, ms[0].dev) {
+			devs = nil
+			break
+		}
+	}
+	if devs != nil {
+		err := gpu.MulVecs(devs, outs, x)
+		if err == nil || !ms[0].onHost() {
+			return err
+		}
+	}
+	for i, m := range ms {
+		if err := m.MulVec(outs[i], x); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Row copies row i, of n elements, into dst.
@@ -239,6 +294,7 @@ type tensor struct {
 	vec   *[]float32
 	mat   *Matrix
 	size  int
+	cols  int // a matrix's input width
 	dtype string
 }
 
@@ -248,9 +304,9 @@ func (l *Layer) tensors(c Config) []tensor {
 	d, q, kv, h, hs := c.Dim, c.QDim(), c.KVDim(), c.Hidden, c.HeadSize()
 	m, sensitive := c.matType(false), c.matType(true)
 	t := []tensor{
-		{vec: &l.RmsAtt, size: d}, {mat: &l.Wq, size: q * d, dtype: m}, {mat: &l.Wk, size: kv * d, dtype: m},
-		{mat: &l.Wv, size: kv * d, dtype: sensitive}, {mat: &l.Wo, size: d * q, dtype: m}, {vec: &l.RmsFfn, size: d},
-		{mat: &l.W1, size: h * d, dtype: m}, {mat: &l.W2, size: d * h, dtype: sensitive}, {mat: &l.W3, size: h * d, dtype: m},
+		{vec: &l.RmsAtt, size: d}, {mat: &l.Wq, size: q * d, cols: d, dtype: m}, {mat: &l.Wk, size: kv * d, cols: d, dtype: m},
+		{mat: &l.Wv, size: kv * d, cols: d, dtype: sensitive}, {mat: &l.Wo, size: d * q, cols: q, dtype: m}, {vec: &l.RmsFfn, size: d},
+		{mat: &l.W1, size: h * d, cols: d, dtype: m}, {mat: &l.W2, size: d * h, cols: h, dtype: sensitive}, {mat: &l.W3, size: h * d, cols: d, dtype: m},
 	}
 	if c.QKVBias {
 		t = append(t, tensor{vec: &l.Bq, size: q}, tensor{vec: &l.Bk, size: kv}, tensor{vec: &l.Bv, size: kv})
@@ -259,6 +315,39 @@ func (l *Layer) tensors(c Config) []tensor {
 		t = append(t, tensor{vec: &l.QNorm, size: hs}, tensor{vec: &l.KNorm, size: hs})
 	}
 	return t
+}
+
+// toDevice moves the layer's matrices to a GPU, returning the device
+// memory they take. On failure the layer stays on the host.
+func (l *Layer) toDevice(c Config, d *gpu.Device) (int64, error) {
+	var moved []*Matrix
+	var bytes int64
+	for _, t := range l.tensors(c) {
+		if t.mat == nil {
+			continue
+		}
+		host := *t.mat
+		if err := t.mat.toDevice(d, t.size/t.cols, t.cols, false); err != nil {
+			*t.mat = host
+			for _, m := range moved {
+				m.dev.Free()
+			}
+			return 0, err
+		}
+		moved = append(moved, t.mat)
+		bytes += t.mat.dev.Bytes()
+	}
+	return bytes, nil
+}
+
+// release frees the layer's device memory, if any.
+func (l *Layer) release(c Config) {
+	for _, t := range l.tensors(c) {
+		if t.mat != nil && t.mat.dev != nil {
+			t.mat.dev.Free()
+			t.mat.dev = nil
+		}
+	}
 }
 
 // LayerBytes is a layer's size in memory and in storage.
@@ -356,18 +445,24 @@ func CacheBytes(c Config, layers, ctx int) int64 {
 }
 
 // Forward runs the stage's layers on x, the activation of the token at
-// position pos (below Positions), in place.
-func (s *Stage) Forward(x []float32, pos int) {
+// position pos (below Positions), in place. It fails only if a GPU does.
+func (s *Stage) Forward(x []float32, pos int) error {
 	c := s.cfg
 	hs, qDim, kvDim := c.HeadSize(), c.QDim(), c.KVDim()
 	kvMul := c.Heads / c.KVHeads
 	invSqrt := float32(1 / math.Sqrt(float64(hs)))
 	eps := c.eps()
+	var err error
+	mul := func(m Matrix, out, in []float32) {
+		if err == nil {
+			err = m.MulVec(out, in)
+		}
+	}
 	for li, l := range s.layers {
 		rmsNorm(s.xb, x, l.RmsAtt, eps)
-		l.Wq.MulVec(s.q, s.xb)
-		l.Wk.MulVec(s.k, s.xb)
-		l.Wv.MulVec(s.v, s.xb)
+		if err := mulVecs([]Matrix{l.Wq, l.Wk, l.Wv}, [][]float32{s.q, s.k, s.v}, s.xb); err != nil {
+			return err
+		}
 		if c.QKVBias {
 			addTo(s.q, l.Bq)
 			addTo(s.k, l.Bk)
@@ -414,24 +509,32 @@ func (s *Stage) Forward(x []float32, pos int) {
 				}
 			}
 		}
-		l.Wo.MulVec(s.xb2, s.attOut)
+		mul(l.Wo, s.xb2, s.attOut)
+		if err != nil {
+			return err
+		}
 		for i := range x {
 			x[i] += s.xb2[i]
 		}
 
 		// Feed-forward: w2(silu(w1 x) * w3 x).
 		rmsNorm(s.xb, x, l.RmsFfn, eps)
-		l.W1.MulVec(s.hb, s.xb)
-		l.W3.MulVec(s.hb2, s.xb)
+		if err := mulVecs([]Matrix{l.W1, l.W3}, [][]float32{s.hb, s.hb2}, s.xb); err != nil {
+			return err
+		}
 		for i, v := range s.hb {
 			silu := float32(v * float32(1/(1+num.Exp32(-v))))
 			s.hb[i] = float32(silu * s.hb2[i])
 		}
-		l.W2.MulVec(s.xb, s.hb)
+		mul(l.W2, s.xb, s.hb)
+		if err != nil {
+			return err
+		}
 		for i := range x {
 			x[i] = num.Canonical(x[i] + s.xb[i])
 		}
 	}
+	return nil
 }
 
 func addTo(v, b []float32) {
@@ -482,7 +585,7 @@ func (h *Head) Logits(c Config, x []float32) []float32 {
 	xn := make([]float32, c.Dim)
 	rmsNorm(xn, x, h.RmsFinal, c.eps())
 	logits := make([]float32, c.Vocab)
-	h.Wcls.MulVec(logits, xn)
+	h.Wcls.MulVec(logits, xn) // the head keeps its host copy: never fails
 	return logits
 }
 

@@ -3,12 +3,14 @@ module github.com/optimist3301/rakkan-mesh
 go 1.26.10
 
 require (
+	github.com/ebitengine/purego v0.8.4
 	github.com/libp2p/go-libp2p v0.51.0
 	github.com/libp2p/go-libp2p-kad-dht v0.43.0
 	github.com/libp2p/go-libp2p-pubsub v0.19.0
 	github.com/multiformats/go-multiaddr v0.16.1
 	github.com/tetratelabs/wazero v1.12.0
 	golang.org/x/sys v0.48.0
+	golang.org/x/text v0.42.0
 )
 
 require (
@@ -112,7 +114,6 @@ require (
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
-	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.50.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect

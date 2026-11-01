@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/protocol"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
@@ -64,9 +67,16 @@ type Shard struct {
 }
 
 type advert struct {
-	Serves   bool    `json:"serves"`
-	Shards   []Shard `json:"shards"`
-	FreeMem  int64   `json:"free_mem"`
+	Serves bool    `json:"serves"`
+	Shards []Shard `json:"shards"`
+	// FreeMem is the memory left for weights: on the GPU, if Device is
+	// set, with FreeCache left in RAM for caches; else shared by both.
+	FreeMem   int64 `json:"free_mem"`
+	FreeCache int64 `json:"free_cache,omitempty"`
+	// Speed is how fast the node streams weights through a product, in
+	// GB/s: what a forward pass costs it, per byte of layers.
+	Speed    float64 `json:"speed"`
+	Device   string  `json:"device,omitempty"`
 	received time.Time
 }
 
@@ -78,6 +88,14 @@ type ServiceConfig struct {
 	// the weights and caches held for them. Default 4 GiB.
 	Serve       bool
 	MemoryBytes int64
+	// Device, if set, holds the weights of stages this node serves and the
+	// classifier of generations it coordinates; DeviceBytes bounds the
+	// weights on it (default 85% of its memory), and MemoryBytes then
+	// bounds caches only. The GPU computes the same bits as the CPU.
+	Device      *gpu.Device
+	DeviceBytes int64
+	// Speed overrides the measured speed (GB/s of weights), for tests.
+	Speed float64
 	// Trust, when set, charges guests' credit for the stages this node
 	// serves them, and has stages on guests checked by a witness (see
 	// Generate). Without it every peer is trusted.
@@ -93,9 +111,12 @@ type Service struct {
 	log   *slog.Logger
 	topic *pubsub.Topic
 
+	speed float64 // GB/s of weights, measured at start
+
 	mu       sync.Mutex
 	shards   map[Shard]*loaded
-	used     int64 // bytes of weights and caches held
+	used     int64 // bytes of caches, and of weights unless on the device
+	devUsed  int64 // bytes of weights on the device
 	adverts  map[peer.ID]advert
 	coords   map[blob.ID]*coordModel
 	ctx      context.Context
@@ -111,6 +132,7 @@ type loaded struct {
 	layers   []*Layer
 	rope     *Rope
 	bytes    int64
+	onDevice bool // bytes are device memory
 	users    int
 	lastUsed time.Time
 	ready    chan struct{} // closed once loaded
@@ -122,6 +144,9 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	if cfg.MemoryBytes <= 0 {
 		cfg.MemoryBytes = 4 << 30
 	}
+	if cfg.Device != nil && cfg.DeviceBytes <= 0 {
+		cfg.DeviceBytes = cfg.Device.Info().Memory / 100 * 85
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -131,6 +156,11 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 		changed: make(chan struct{}, 1),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
+	s.speed = cfg.Speed
+	if s.speed <= 0 && cfg.Serve {
+		s.speed = MeasureSpeed(cfg.Device)
+		s.log.Info("measured stage speed", "gb_per_s", fmt.Sprintf("%.1f", s.speed), "device", s.deviceName())
+	}
 	var err error
 	if s.topic, err = cfg.Node.JoinTopic("llm/1"); err != nil {
 		return nil, err
@@ -147,15 +177,69 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	return s, nil
 }
 
+// Close stops the service and frees device memory held.
 func (s *Service) Close() {
 	s.cancel()
 	s.wg.Wait()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k, l := range s.shards {
+		if l.users == 0 && l.layers != nil {
+			s.drop(k)
+		}
+	}
+	for _, cm := range s.coords {
+		if cm.head.Wcls.dev != nil {
+			cm.head.Wcls.dev.Free()
+		}
+	}
+}
+
+// NodeInfo describes a node serving stages.
+type NodeInfo struct {
+	ID peer.ID `json:"id"`
+	// Device is the GPU holding its weights; empty for the CPU.
+	Device string `json:"device,omitempty"`
+	// Speed is in GB of weights per second.
+	Speed float64 `json:"speed"`
+	// FreeMem is the memory left for weights, FreeCache for caches when
+	// they are apart (a GPU node).
+	FreeMem   int64   `json:"free_mem"`
+	FreeCache int64   `json:"free_cache,omitempty"`
+	Shards    []Shard `json:"shards,omitempty"`
+}
+
+// Nodes lists the nodes serving stages, this one included, fastest first.
+func (s *Service) Nodes() []NodeInfo {
+	var out []NodeInfo
+	add := func(p peer.ID, a advert) {
+		out = append(out, NodeInfo{ID: p, Device: a.Device, Speed: a.Speed, FreeMem: a.FreeMem, FreeCache: a.FreeCache, Shards: a.Shards})
+	}
+	for p, a := range s.servers() {
+		add(p, a)
+	}
+	if s.cfg.Serve {
+		add(s.node.ID(), s.advert())
+	}
+	slices.SortFunc(out, func(a, b NodeInfo) int { return cmp.Compare(b.Speed, a.Speed) })
+	return out
+}
+
+func (s *Service) deviceName() string {
+	if s.cfg.Device == nil {
+		return "cpu"
+	}
+	return s.cfg.Device.Info().Name
 }
 
 func (s *Service) advert() advert {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used}
+	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used, Speed: s.speed}
+	if s.cfg.Device != nil {
+		a.Device = s.deviceName()
+		a.FreeMem, a.FreeCache = s.cfg.DeviceBytes-s.devUsed, s.cfg.MemoryBytes-s.used
+	}
 	for sh, l := range s.shards {
 		if l.err == nil && l.layers != nil {
 			a.Shards = append(a.Shards, sh)
@@ -244,11 +328,18 @@ func (s *Service) acquire(ctx context.Context, model blob.ID, from, to int, prov
 		// Loaded outside the lock, published under it: adverts read the
 		// shard meanwhile.
 		manifest, layers, rope, size, err := s.load(ctx, model, from, to, providers)
+		onDevice := false
+		if err == nil {
+			var devBytes int64
+			if devBytes, onDevice = s.toDevice(manifest.Config, layers); onDevice {
+				size = devBytes
+			}
+		}
 		s.mu.Lock()
-		l.manifest, l.layers, l.rope, l.bytes, l.err = manifest, layers, rope, size, err
+		l.manifest, l.layers, l.rope, l.bytes, l.err, l.onDevice = manifest, layers, rope, size, err, onDevice
 		if l.err != nil {
 			delete(s.shards, key)
-		} else {
+		} else if !onDevice {
 			s.used += l.bytes
 		}
 		close(l.ready)
@@ -288,6 +379,7 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 		return nil, nil, nil, 0, fmt.Errorf("layers %d..%d outside the model's %d", from, to, m.Config.Layers)
 	}
 	size := LayerBytes(m.Config) * int64(to-from)
+	// The host copy is needed while loading, whatever holds it after.
 	if err := s.reserve(size); err != nil {
 		return nil, nil, nil, 0, err
 	}
@@ -315,23 +407,100 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 	return m, layers, NewRope(m.Config, m.Config.SeqLen), size, nil
 }
 
+// toDevice moves loaded layers to the GPU within its budget. It reports
+// the device memory taken; on failure the layers stay on the host.
+func (s *Service) toDevice(c Config, layers []*Layer) (int64, bool) {
+	d := s.cfg.Device
+	if d == nil {
+		return 0, false
+	}
+	need := LayerBytes(c) * int64(len(layers))
+	s.mu.Lock()
+	if s.devUsed+need > s.cfg.DeviceBytes {
+		s.evictDevice(need)
+	}
+	ok := s.devUsed+need <= s.cfg.DeviceBytes
+	if ok {
+		s.devUsed += need
+	}
+	s.mu.Unlock()
+	if !ok {
+		s.log.Warn("GPU memory full; serving layers from the CPU")
+		return 0, false
+	}
+	var moved int
+	var err error
+	for _, l := range layers {
+		if _, err = l.toDevice(c, d); err != nil {
+			break
+		}
+		moved++
+	}
+	if err != nil {
+		for _, l := range layers[:moved] {
+			l.release(c)
+		}
+		s.unreserveDevice(need)
+		s.log.Warn("could not move layers to the GPU; serving them from the CPU", "err", err)
+		return 0, false
+	}
+	return need, true
+}
+
+func (s *Service) unreserveDevice(n int64) {
+	s.mu.Lock()
+	s.devUsed -= n
+	s.mu.Unlock()
+}
+
+// evictDevice unloads idle shards on the device until n bytes fit. The
+// caller holds s.mu.
+func (s *Service) evictDevice(n int64) {
+	for s.devUsed+n > s.cfg.DeviceBytes {
+		victim, ok := s.idlest(true)
+		if !ok {
+			return
+		}
+		s.drop(victim)
+	}
+}
+
+// idlest finds the least recently used idle shard, on the device or not.
+func (s *Service) idlest(onDevice bool) (Shard, bool) {
+	var victim Shard
+	var oldest time.Time
+	for k, l := range s.shards {
+		if l.users == 0 && l.layers != nil && l.onDevice == onDevice && (oldest.IsZero() || l.lastUsed.Before(oldest)) {
+			victim, oldest = k, l.lastUsed
+		}
+	}
+	return victim, !oldest.IsZero()
+}
+
+// drop unloads a shard. The caller holds s.mu.
+func (s *Service) drop(k Shard) {
+	l := s.shards[k]
+	if l.onDevice {
+		for _, layer := range l.layers {
+			layer.release(l.manifest.Config)
+		}
+		s.devUsed -= l.bytes
+	} else {
+		s.used -= l.bytes
+	}
+	delete(s.shards, k)
+}
+
 // reserve checks the memory budget, unloading idle shards to make room.
 func (s *Service) reserve(n int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for s.used+n > s.cfg.MemoryBytes {
-		var victim Shard
-		var oldest time.Time
-		for k, l := range s.shards {
-			if l.users == 0 && l.layers != nil && (oldest.IsZero() || l.lastUsed.Before(oldest)) {
-				victim, oldest = k, l.lastUsed
-			}
-		}
-		if oldest.IsZero() {
+		victim, ok := s.idlest(false)
+		if !ok {
 			return fmt.Errorf("model memory budget exhausted (%d of %d bytes in use)", s.used, s.cfg.MemoryBytes)
 		}
-		s.used -= s.shards[victim].bytes
-		delete(s.shards, victim)
+		s.drop(victim)
 	}
 	s.used += n
 	return nil
@@ -480,7 +649,14 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		}
 		xs := decodeActs(acts)
 		for t := range req.Tokens {
-			stage.Forward(xs[t*cfg.Dim:(t+1)*cfg.Dim], req.Pos+t)
+			if err = stage.Forward(xs[t*cfg.Dim:(t+1)*cfg.Dim], req.Pos+t); err != nil {
+				break
+			}
+		}
+		if err != nil {
+			settle(0)
+			writeStatus(st, err)
+			return
 		}
 		settle(gas)
 		if s.tamper != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
@@ -70,6 +71,21 @@ func (c *cluster) add(serve bool) *llmNode { return c.addNode(serve, false, 0) }
 // addNode starts a member, or a guest proving work, serving stages with mem
 // bytes (0: the default) if serve is set.
 func (c *cluster) addNode(serve, guest bool, mem int64) *llmNode {
+	return c.addOpts(nodeOpts{serve: serve, guest: guest, mem: mem, speed: 1})
+}
+
+// nodeOpts describes a test node: serving stages or not, member or guest,
+// its memory for stages, its GPU, and the speed it advertises.
+type nodeOpts struct {
+	serve, guest bool
+	mem          int64
+	dev          *gpu.Device
+	devBytes     int64
+	speed        float64
+}
+
+func (c *cluster) addOpts(o nodeOpts) *llmNode {
+	serve, guest, mem := o.serve, o.guest, o.mem
 	t := c.t
 	sk, _, _ := crypto.GenerateEd25519Key(rand.Reader)
 	id, _ := peer.IDFromPrivateKey(sk)
@@ -90,7 +106,7 @@ func (c *cluster) addNode(serve, guest bool, mem int64) *llmNode {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := blob.OpenStore(t.TempDir(), 1<<30)
+	store, err := blob.OpenStore(t.TempDir(), 4<<30)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +116,8 @@ func (c *cluster) addNode(serve, guest bool, mem int64) *llmNode {
 			t.Fatal(err)
 		}
 	}
-	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve, MemoryBytes: mem, Trust: n.trust}); err != nil {
+	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve, MemoryBytes: mem, Trust: n.trust,
+		Device: o.dev, DeviceBytes: o.devBytes, Speed: o.speed}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { n.close() })

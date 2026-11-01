@@ -108,6 +108,20 @@ export interface Status {
   pow_bits?: number;
   load: Load;
   members: Member[];
+  /** Nodes serving language model stages, fastest first. */
+  llm?: LLMNode[];
+}
+
+export interface LLMNode {
+  id: string;
+  /** The GPU holding its weights; absent for the CPU. */
+  device?: string;
+  /** How fast it streams weights through products, in GB/s. */
+  speed: number;
+  /** Memory left for weights (on the GPU, if any), in bytes. */
+  free_mem: number;
+  /** RAM left for caches, when weights live on a GPU. */
+  free_cache?: number;
 }
 
 export class TaskError extends Error {
