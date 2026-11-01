@@ -106,3 +106,28 @@ for await (const item of mesh.map({ module, inputs: ['a', 'b', 'c'] })) {
 | `sdk/js/examples/thumbnails.js` | обработка фото нативными kernels изображений |
 | `sdk/js/examples/inference.js` + `sdk/as/examples/mlp.ts` | пакетный инференс нейросети, веса в прикреплённом блобе, tensor kernels |
 | `sdk/js/examples/chat.js`, `story.js` | языковые модели, разрезанные по узлам |
+
+## JSON-конфиг узла
+
+Всё, что нужно демону, можно держать в одном файле: настройки, приватный ключ узла и сертификат сети.
+
+```sh
+rakkan-node config init -network <ID сети> -key node.key -cert node.cert -out node.json
+rakkan-node daemon -config node.json
+```
+
+```json
+{
+  "network": "12D3Koo...",
+  "private_key": "<base64 ключа узла>",
+  "certificate": { "body": "...", "sig": "..." },
+  "bootstrap": ["/ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo..."],
+  "workers": 4,
+  "status": "1m"
+}
+```
+
+- `private_key` и `certificate` заменяют файлы `-key` и `-cert`. Без `certificate` узел входит гостем.
+- Остальные поля называются как флаги `daemon`: строки, числа, булевы значения; длительности — строкой (`"30s"`), списки адресов — массивом. Неизвестное поле — ошибка.
+- Флаг в командной строке сильнее файла, в том числе `-key` и `-cert`.
+- Файл содержит приватный ключ, поэтому должен быть доступен только владельцу (`chmod 600`); иначе демон не запустится. `config init` создаёт его с правами 0600 и не перезаписывает существующий.

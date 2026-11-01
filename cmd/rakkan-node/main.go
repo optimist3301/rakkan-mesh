@@ -18,7 +18,8 @@ import (
 const usage = `usage: rakkan-node <command> [flags]
 
 commands:
-  daemon            join a network and keep running
+  daemon            join a network and keep running (-config node.json)
+  config init       write a JSON config with the node's key and certificate
   id                print this node's peer ID, creating its key if needed
   network init      create a network: its root key and ID
   network issue     issue a node certificate
@@ -49,6 +50,8 @@ func main() {
 		os.Exit(idCmd(os.Args[2:]))
 	case "daemon":
 		os.Exit(daemonCmd(os.Args[2:]))
+	case "config":
+		os.Exit(configCmd(os.Args[2:]))
 	case "network":
 		os.Exit(networkCmd(os.Args[2:]))
 	default:

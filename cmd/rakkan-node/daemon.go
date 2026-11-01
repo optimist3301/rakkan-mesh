@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
@@ -33,6 +34,7 @@ import (
 
 func daemonCmd(args []string) int {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
+	configPath := flags.String("config", "", "JSON config with the node's settings, private key and network certificate; command-line flags override it")
 	network := flags.String("network", "", "network ID (required)")
 	keyPath := flags.String("key", "node.key", "node private key")
 	certPath := flags.String("cert", "node.cert", "node certificate; without one the node joins an open network as a guest")
@@ -64,6 +66,26 @@ func daemonCmd(args []string) int {
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
+	var cf *nodeConfig
+	if *configPath != "" {
+		var err error
+		if cf, err = loadConfig(*configPath); err != nil {
+			return fail(err)
+		}
+		if err := cf.apply(flags); err != nil {
+			return fail(err)
+		}
+		// Explicit -key and -cert files win over the embedded ones.
+		flags.Visit(func(f *flag.Flag) {
+			switch f.Name {
+			case "key":
+				cf.key = nil
+			case "cert":
+				cf.cert = nil
+			}
+		})
+	}
+
 	if *gpuFlag == "list" {
 		return listGPUs()
 	}
@@ -71,13 +93,22 @@ func daemonCmd(args []string) int {
 	if err != nil {
 		return fail(fmt.Errorf("-network: %w", err))
 	}
-	key, err := membership.LoadKey(*keyPath)
-	if err != nil {
-		return fail(err)
+	var key crypto.PrivKey
+	var cert *membership.SignedCert
+	if cf != nil {
+		key, cert = cf.key, cf.cert
 	}
-	cert, err := membership.LoadCert(*certPath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fail(err)
+	if key == nil {
+		if key, err = membership.LoadKey(*keyPath); err != nil {
+			return fail(err)
+		}
+	}
+	// A config with its own key and no certificate describes a guest.
+	if cert == nil && (cf == nil || cf.key == nil) {
+		cert, err = membership.LoadCert(*certPath)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fail(err)
+		}
 	}
 	reachability, err := mesh.ParseReachability(*reach)
 	if err != nil {
