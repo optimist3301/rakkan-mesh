@@ -9,11 +9,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"runtime"
 	"time"
 
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
+
+// version is set at release build time: -ldflags "-X main.version=...".
+var version = "dev"
 
 const usage = `usage: rakkan-node <command> [flags]
 
@@ -28,6 +32,7 @@ commands:
   network close     stop admitting guests
   network show      print a certificate, revocation list or policy
   run <task.wasm>   execute a task locally in the sandbox
+  version           print the version
 `
 
 func main() {
@@ -50,6 +55,9 @@ func main() {
 		os.Exit(idCmd(os.Args[2:]))
 	case "daemon":
 		os.Exit(daemonCmd(os.Args[2:]))
+	case "version", "-version", "--version":
+		fmt.Println("rakkan-node", version, runtime.GOOS+"/"+runtime.GOARCH, runtime.Version())
+		os.Exit(0)
 	case "config":
 		os.Exit(configCmd(os.Args[2:]))
 	case "network":

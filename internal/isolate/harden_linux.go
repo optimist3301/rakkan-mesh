@@ -280,3 +280,6 @@ func currentVirtualSize() (int64, error) {
 	}
 	return 0, fmt.Errorf("VmSize not found in /proc/self/status")
 }
+
+// isSeccompKill reports whether sig is how seccomp kills a worker.
+func isSeccompKill(sig syscall.Signal) bool { return sig == syscall.SIGSYS }

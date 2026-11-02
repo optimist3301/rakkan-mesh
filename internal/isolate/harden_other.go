@@ -45,3 +45,7 @@ func (*workerCgroup) oomKilled() bool { return false }
 func (*workerCgroup) remove() {}
 
 func setCgroupFD(*syscall.SysProcAttr, *workerCgroup) {}
+
+// isSeccompKill reports whether sig is how seccomp kills a worker; there is
+// no seccomp outside Linux.
+func isSeccompKill(sig syscall.Signal) bool { return false }

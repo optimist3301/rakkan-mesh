@@ -473,7 +473,7 @@ func exitDescription(ps *os.ProcessState) string {
 		return "unknown exit"
 	}
 	if ws, ok := ps.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-		if ws.Signal() == syscall.SIGSYS {
+		if isSeccompKill(ws.Signal()) {
 			return "killed by seccomp (SIGSYS)"
 		}
 		return "killed by " + ws.Signal().String()
