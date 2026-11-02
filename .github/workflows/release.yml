@@ -17,6 +17,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Ubuntu runners forbid the user namespaces the worker isolation uses.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: make test
       - run: make dist VERSION=${GITHUB_REF_NAME#v}
       - uses: softprops/action-gh-release@v2

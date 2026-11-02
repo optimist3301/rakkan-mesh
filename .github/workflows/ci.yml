@@ -17,5 +17,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      # Ubuntu runners forbid the user namespaces the worker isolation uses.
+      - name: Allow unprivileged user namespaces
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: go build ./...
       - run: go test ./...
