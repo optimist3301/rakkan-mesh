@@ -142,3 +142,23 @@ rakkan-node version
 ```
 
 cgo не нужен, поэтому все платформы собираются с любой машины. Релиз делает GitHub Actions: тег `v*` (например `v0.002-alpha`) запускает `.github/workflows/release.yml`, который прогоняет тесты, собирает архивы и публикует релиз; теги с `alpha`, `beta` или `rc` помечаются как пре-релиз. Изоляция воркеров (seccomp, namespaces, cgroup) работает только на Linux.
+
+## Установщики
+
+Установка для текущего пользователя, без прав администратора. Скрипт показывает логотип, спрашивает язык, сеть (**публичная открытая** `12D3KooWJRPbdQ6Q8TXSctKQ8B4ZYHtKArqbKKReeQdx4iojLx7s` или **своя**), способ входа (гостем или по сертификату), тип узла (рабочий, клиент, ретранслятор, LLM), число задач, диск, адреса известных узлов и автозапуск. Скачанный архив проверяется по `SHA256SUMS`. Результат — один JSON-конфиг с ключом и сертификатом (см. выше), права только владельцу.
+
+```sh
+# Linux и macOS
+curl -fsSL https://raw.githubusercontent.com/optimist3301/rakkan-mesh/main/scripts/install.sh -o install.sh
+bash install.sh                  # --yes: без вопросов; --uninstall [--purge]: удалить
+```
+
+```powershell
+# Windows (PowerShell)
+Invoke-WebRequest https://raw.githubusercontent.com/optimist3301/rakkan-mesh/main/scripts/install.ps1 -OutFile install.ps1
+.\install.ps1                    # -Yes: без вопросов; -Uninstall [-Purge]: удалить
+```
+
+Автозапуск: systemd `--user` на Linux, LaunchAgent на macOS, задача планировщика при входе на Windows. Строгая изоляция задач (namespaces + seccomp) есть только на Linux, и только если ядро разрешает user namespaces; иначе установщик ставит `"isolation": "process"`. На macOS и Windows всегда `process`.
+
+На вопросы можно ответить заранее переменными `RAKKAN_NETWORK` (`public` или ID), `RAKKAN_NODE_TYPE`, `RAKKAN_CERT`, `RAKKAN_BOOTSTRAP`, `RAKKAN_AUTOSTART`, `RAKKAN_LANG` и другими (список в начале скриптов); вместе с `--yes` это даёт установку без участия человека.
