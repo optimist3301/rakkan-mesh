@@ -20,6 +20,10 @@ import (
 // guest can learn the work it must prove from any node, trusted or not.
 const policyProtocol = protocol.ID("/rakkan/policy/1.0.0")
 
+// policyDropGrace is how long a guest the new policy no longer admits stays
+// connected, so that the policy can reach it.
+const policyDropGrace = time.Second
+
 func (n *Node) policyTopic() string { return "/rakkan/" + n.tag() + "/policy/1" }
 
 func (n *Node) startPolicyGossip() error {
@@ -98,8 +102,17 @@ func (n *Node) applyPolicy(s *membership.SignedPolicy) (bool, error) {
 		}
 	}
 	n.mu.Unlock()
+	// Give the policy a moment to reach the guests on its way out: they
+	// learn the new difficulty from it, and a dropped connection would lose
+	// the message still queued for them.
 	for _, p := range dropped {
-		n.deny(p, denyAfterFailure, errors.New("the policy no longer admits this guest"))
+		n.wg.Go(func() {
+			select {
+			case <-time.After(policyDropGrace):
+				n.deny(p, denyAfterFailure, errors.New("the policy no longer admits this guest"))
+			case <-n.ctx.Done():
+			}
+		})
 	}
 	if n.cfg.Cert == nil && pol.Open {
 		n.mu.Lock()

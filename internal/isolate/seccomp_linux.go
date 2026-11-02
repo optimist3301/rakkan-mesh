@@ -24,6 +24,7 @@ const (
 	offNr    = 0
 	offArch  = 4
 	offArg0  = 16 // low 32 bits on little-endian architectures
+	offArg1  = 24
 	bpfLd    = unix.BPF_LD | unix.BPF_W | unix.BPF_ABS
 	bpfJeq   = unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K
 	bpfJge   = unix.BPF_JMP | unix.BPF_JGE | unix.BPF_K
@@ -31,6 +32,10 @@ const (
 	bpfRet   = unix.BPF_RET | unix.BPF_K
 	x32Bit   = 0x40000000
 	cloneThr = unix.CLONE_THREAD
+
+	// prctl(2) option and sub-option the Go runtime uses to name mappings.
+	prSetVMA         = 0x53564d41
+	prSetVMAAnonName = 0
 )
 
 // seccompDefaultAction applies to system calls not listed. Set it to
@@ -71,6 +76,19 @@ func seccompProgram() []unix.SockFilter {
 		jump(bpfJeq, uint32(unix.SYS_CLONE), 0, 4),
 		stmt(bpfLd, offArg0),
 		jump(bpfJset, cloneThr, 0, 1),
+		allow,
+		kill,
+	)
+	// The Go runtime (1.25 and later) names its anonymous memory mappings
+	// with prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, ...) on kernels that
+	// support it. That only labels the process's own memory, so allow
+	// exactly that call and no other prctl.
+	prog = append(prog,
+		jump(bpfJeq, uint32(unix.SYS_PRCTL), 0, 6),
+		stmt(bpfLd, offArg0),
+		jump(bpfJeq, prSetVMA, 0, 3),
+		stmt(bpfLd, offArg1),
+		jump(bpfJeq, prSetVMAAnonName, 0, 1),
 		allow,
 		kill,
 	)

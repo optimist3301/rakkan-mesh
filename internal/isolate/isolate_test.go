@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 
@@ -103,6 +104,23 @@ func probe(name string) string {
 			return result(err)
 		}
 		return fmt.Sprintf("caps: %x %x %x", data[0].Effective, data[0].Permitted, data[0].Inheritable)
+	case "prctl-vma":
+		// What the Go runtime does to name its memory. Kernels without
+		// support answer EINVAL; either way the call must not be fatal.
+		mem, err := syscall.Mmap(-1, 0, 4096, syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_ANON|syscall.MAP_PRIVATE)
+		if err != nil {
+			return result(err)
+		}
+		name := []byte("probe\x00")
+		_, _, errno := syscall.Syscall6(syscall.SYS_PRCTL, 0x53564d41, 0,
+			uintptr(unsafe.Pointer(&mem[0])), 4096, uintptr(unsafe.Pointer(&name[0])), 0)
+		if errno != 0 && errno != syscall.EINVAL {
+			return "denied: " + errno.Error()
+		}
+		return "allowed"
+	case "prctl-other":
+		_, _, errno := syscall.Syscall(syscall.SYS_PRCTL, 15 /* PR_SET_NAME */, 0, 0)
+		return result(errno)
 	case "alloc":
 		b := make([]byte, 1<<30)
 		for i := range b {
@@ -537,6 +555,8 @@ func TestHardenedWorkerConfinement(t *testing.T) {
 		{strict, "socket", deniedOrKilled},
 		{strict, "fork", deniedOrKilled},
 		{strict, "mount", deniedOrKilled},
+		{strict, "prctl-vma", func(s string) bool { return s == "allowed" }},
+		{strict, "prctl-other", func(s string) bool { return s == "killed: bad system call" }},
 	}
 	for _, c := range cases {
 		name := c.probe
