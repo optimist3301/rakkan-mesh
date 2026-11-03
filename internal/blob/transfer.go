@@ -2,6 +2,7 @@ package blob
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 
+	"github.com/optimist3301/rakkan-mesh/internal/framing"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 )
@@ -87,11 +89,9 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 	}
 	n := binary.BigEndian.Uint32(hdr[:])
 	if uint64(n) > uint64(limit) {
-		return nil, fmt.Errorf("frame of %d bytes exceeds %d", n, limit)
+		return nil, fmt.Errorf("%w: frame of %d bytes exceeds %d", ErrTooLarge, n, limit)
 	}
-	b := make([]byte, n)
-	_, err := io.ReadFull(r, b)
-	return b, err
+	return framing.ReadFull(r, int(n))
 }
 
 func (s *Service) handle(st network.Stream, _ *membership.Cert) {
@@ -192,15 +192,12 @@ func (s *Service) fetch(ctx context.Context, id ID, providers []peer.ID, maxSize
 	var m *Manifest
 	var lastErr error
 	for _, p := range providers {
-		if m, lastErr = s.fetchManifest(ctx, p, id); lastErr == nil {
+		if m, lastErr = s.fetchManifest(ctx, p, id, maxSize); lastErr == nil {
 			break
 		}
 	}
 	if m == nil {
 		return fmt.Errorf("blob %s: %w", id, lastErr)
-	}
-	if m.Size > maxSize {
-		return fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, m.Size, maxSize)
 	}
 	// Hold every chunk, present or not, until the manifest is recorded.
 	s.store.hold(m.Chunks...)
@@ -212,7 +209,17 @@ func (s *Service) fetch(ctx context.Context, id ID, providers []peer.ID, maxSize
 	return err
 }
 
-func (s *Service) fetchManifest(ctx context.Context, p peer.ID, id ID) (*Manifest, error) {
+// manifestLen is the encoded length of the manifest of a blob of size
+// bytes, at most that of the largest blob.
+func manifestLen(size int64) int {
+	chunks := min((max(size, 0)+ChunkSize-1)/ChunkSize, maxChunks)
+	return 20 + int(chunks)*sha256.Size
+}
+
+// fetchManifest asks p for a blob's manifest, refusing blobs over maxSize
+// before reading more manifest than such a blob has: the provider is
+// untrusted, and a manifest for the largest blob is 128 MiB.
+func (s *Service) fetchManifest(ctx context.Context, p peer.ID, id ID, maxSize int64) (*Manifest, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	st, err := s.node.NewStream(ctx, p, Protocol)
@@ -236,9 +243,9 @@ func (s *Service) fetchManifest(ctx context.Context, p peer.ID, id ID) (*Manifes
 	if !stt.OK {
 		return nil, fmt.Errorf("%s: %s", p.ShortString(), stt.Error)
 	}
-	b, err = readFrame(st, 20+maxChunks*32)
+	b, err = readFrame(st, manifestLen(maxSize))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("manifest from %s: %w", p.ShortString(), err)
 	}
 	m, err := DecodeManifest(b)
 	if err != nil {
@@ -246,6 +253,9 @@ func (s *Service) fetchManifest(ctx context.Context, p peer.ID, id ID) (*Manifes
 	}
 	if m.ID() != id {
 		return nil, fmt.Errorf("%w: manifest from %s", ErrCorrupt, p.ShortString())
+	}
+	if m.Size > maxSize {
+		return nil, fmt.Errorf("%w: %d bytes, limit %d", ErrTooLarge, m.Size, maxSize)
 	}
 	return m, nil
 }

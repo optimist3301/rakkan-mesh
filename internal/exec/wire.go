@@ -11,6 +11,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/core/protocol"
 
+	"github.com/optimist3301/rakkan-mesh/internal/framing"
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
@@ -91,9 +92,7 @@ func readFrame(r io.Reader, limit int) ([]byte, error) {
 	if uint64(n) > uint64(limit) {
 		return nil, fmt.Errorf("frame of %d bytes exceeds %d", n, limit)
 	}
-	b := make([]byte, n)
-	_, err := io.ReadFull(r, b)
-	return b, err
+	return framing.ReadFull(r, int(n))
 }
 
 func writeJSON(w io.Writer, v any) error {

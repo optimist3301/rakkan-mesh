@@ -69,6 +69,10 @@ type Config struct {
 	// this node by their credit, and has results from guests checked
 	// against independent runs. Without it every peer is trusted.
 	Trust *trust.Service
+	// MaxBlobBytes bounds each blob attached to a task this node runs.
+	// Attached blobs are read on demand, but their manifests are held whole.
+	// Default 64 GiB, a manifest of 2 MiB.
+	MaxBlobBytes int64
 	// MaxAttempts bounds executors tried per task. Default 3.
 	MaxAttempts int
 	// LoadInterval is how often load is gossiped. Default 3s.
@@ -135,6 +139,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.ModuleCacheBytes <= 0 {
 		cfg.ModuleCacheBytes = 256 << 20
+	}
+	if cfg.MaxBlobBytes <= 0 {
+		cfg.MaxBlobBytes = 64 << 30
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 3
@@ -524,7 +531,7 @@ func (s *Service) openBlobs(ctx context.Context, ids []blob.ID, providers []peer
 	}
 	var sources []sandbox.BlobSource
 	for _, id := range ids {
-		src, err := s.cfg.Blobs.OpenRemote(ctx, id, providers)
+		src, err := s.cfg.Blobs.OpenRemote(ctx, id, providers, s.cfg.MaxBlobBytes)
 		if err != nil {
 			closeAll()
 			return nil, nil, fmt.Errorf("%w: %v", sandbox.ErrBlobUnavailable, err)

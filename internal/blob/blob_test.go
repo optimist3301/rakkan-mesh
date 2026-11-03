@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -346,7 +349,7 @@ func TestOpenRemoteFetchesOnlyWhatIsRead(t *testing.T) {
 	data := randomBytes(40 << 20) // 40 chunks
 	id, _ := src.blobs.Store().PutBytes(data)
 
-	r, err := dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()})
+	r, err := dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()}, 1<<40)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +370,7 @@ func TestOpenRemoteFetchesOnlyWhatIsRead(t *testing.T) {
 	}
 
 	// Reading everything completes the blob in the store.
-	r, _ = dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()})
+	r, _ = dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()}, 1<<40)
 	all := make([]byte, len(data))
 	if n, err := r.ReadAt(all, 0); n != len(data) || err != nil || !bytes.Equal(all, data) {
 		t.Fatalf("full read %d, %v", n, err)
@@ -376,4 +379,84 @@ func TestOpenRemoteFetchesOnlyWhatIsRead(t *testing.T) {
 	if !dst.blobs.Store().Has(id) {
 		t.Fatal("fully read blob not recorded")
 	}
+}
+
+func TestManifestLen(t *testing.T) {
+	for _, tc := range []struct {
+		size int64
+		want int
+	}{{0, 20}, {1, 52}, {ChunkSize, 52}, {ChunkSize + 1, 84}, {-5, 20}, {1 << 62, 20 + maxChunks*32}} {
+		if got := manifestLen(tc.size); got != tc.want {
+			t.Errorf("manifestLen(%d) = %d, want %d", tc.size, got, tc.want)
+		}
+	}
+	m := &Manifest{Size: 3*ChunkSize + 7, Chunks: make([]Hash, 4)}
+	if got := len(m.Encode()); got != manifestLen(m.Size) {
+		t.Errorf("encoded %d bytes, manifestLen %d", got, manifestLen(m.Size))
+	}
+}
+
+// lieAboutManifests makes tn answer every manifest request by announcing
+// the largest manifest there is and sending a few bytes of it.
+func lieAboutManifests(tn *testNode) {
+	tn.node.Handle(Protocol, func(st network.Stream, _ *membership.Cert) {
+		defer st.Close()
+		if _, err := readFrame(st, 64<<10); err != nil {
+			return
+		}
+		ok, _ := json.Marshal(status{OK: true})
+		writeFrame(st, ok)
+		var hdr [4]byte
+		binary.BigEndian.PutUint32(hdr[:], 20+maxChunks*32)
+		st.Write(hdr[:])
+		st.Write(make([]byte, 100))
+	})
+}
+
+func TestProviderCannotMakeFetcherAllocate(t *testing.T) {
+	c := newCluster(t)
+	liar, good, dst := c.add(), c.add(), c.add()
+	connect(t, dst, liar, good)
+	lieAboutManifests(liar)
+	data := randomBytes(3<<20 + 5)
+	id, _ := good.blobs.Store().PutBytes(data)
+
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	// The liar is asked first; its 128 MiB manifest is neither read nor
+	// allocated, and the honest provider serves the blob.
+	if err := dst.blobs.Fetch(t.Context(), id, []peer.ID{liar.id(), good.id()}, 1<<30); err != nil {
+		t.Fatal(err)
+	}
+	r, err := dst.blobs.OpenRemote(t.Context(), IDOf([]byte("elsewhere")), []peer.ID{liar.id()}, 1<<40)
+	if err == nil {
+		r.Close()
+		t.Fatal("opened a blob nobody holds")
+	}
+	runtime.ReadMemStats(&after)
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 64<<20 {
+		t.Fatalf("allocated %d MiB fetching a 3 MiB blob", alloc>>20)
+	}
+	if got, _ := dst.blobs.Store().ReadAll(id, 1<<30); !bytes.Equal(got, data) {
+		t.Fatal("fetched blob differs")
+	}
+}
+
+func TestOpenRemoteRefusesLargeBlobs(t *testing.T) {
+	c := newCluster(t)
+	src, dst := c.add(), c.add()
+	connect(t, dst, src)
+	id, _ := src.blobs.Store().PutBytes(randomBytes(3 * ChunkSize))
+	if _, err := dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()}, ChunkSize); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("got %v, want ErrTooLarge", err)
+	}
+	// Held locally, it is refused too.
+	if _, err := src.blobs.OpenRemote(t.Context(), id, nil, ChunkSize); !errors.Is(err, ErrTooLarge) {
+		t.Fatalf("local: got %v, want ErrTooLarge", err)
+	}
+	r, err := dst.blobs.OpenRemote(t.Context(), id, []peer.ID{src.id()}, 3*ChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Close()
 }
