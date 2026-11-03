@@ -1,6 +1,9 @@
 package num
 
 import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -319,5 +322,55 @@ func TestRecipRsqrt(t *testing.T) {
 	}
 	if Recip32(4) != 0.25 || Rsqrt32(4) != 0.5 || Rsqrt32(1) != 1 {
 		t.Fatalf("exact cases: %v %v %v", Recip32(4), Rsqrt32(4), Rsqrt32(1))
+	}
+}
+
+func TestLog(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 8))
+	ulp := func(a, b float64) float64 {
+		return math.Abs(a-b) / math.Abs(math.Nextafter(b, math.Inf(1))-b)
+	}
+	worst := 0.0
+	for range 200000 {
+		x := math.Ldexp(1+rng.Float64(), rng.IntN(200)-100)
+		worst = max(worst, ulp(Log(x), math.Log(x)))
+		y := math.Ldexp(rng.Float64(), -rng.IntN(60))
+		worst = max(worst, ulp(Log1p(y), math.Log1p(y)))
+	}
+	if worst > 2 {
+		t.Errorf("Log/Log1p within %.1f ulp of math", worst)
+	}
+	if Log(1) != 0 || !math.IsInf(Log(0), -1) || !math.IsNaN(Log(-1)) || Log1p(0) != 0 {
+		t.Error("special cases")
+	}
+}
+
+// transcendentalDigest hashes the bits of Log, Log1p, Exp32 and Sincos on
+// fixed inputs. It must be the same on every architecture: run the test on
+// arm64 too (the package's tests run there under CI and qemu).
+func transcendentalDigest() string {
+	rng := rand.New(rand.NewPCG(9, 10))
+	h := sha256.New()
+	var b [8]byte
+	put := func(v uint64) {
+		binary.LittleEndian.PutUint64(b[:], v)
+		h.Write(b[:])
+	}
+	for range 100000 {
+		x := math.Ldexp(1+rng.Float64(), rng.IntN(120)-60)
+		put(math.Float64bits(Log(x)))
+		put(math.Float64bits(Log1p(math.Ldexp(rng.Float64(), -rng.IntN(40)))))
+		put(uint64(math.Float32bits(Exp32(float32(rng.Float64()*160 - 100)))))
+		s, c := Sincos((rng.Float64() - 0.5) * 2e5)
+		put(math.Float64bits(s))
+		put(math.Float64bits(c))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func TestTranscendentalsSameEverywhere(t *testing.T) {
+	const want = "43b203a6bb66e8e00a6e5e93f3c6029caf93551144941dcc17aeec595f992bf2"
+	if got := transcendentalDigest(); got != want {
+		t.Errorf("digest %s, want %s", got, want)
 	}
 }
