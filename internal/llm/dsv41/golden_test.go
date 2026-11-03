@@ -23,7 +23,11 @@ type golden map[string]*Tensor
 
 func loadFixture(t testing.TB) (*Model, golden) {
 	t.Helper()
-	tables, err := LoadEngramTables(filepath.Join(fixture, "engram.json"))
+	cfg, err := LoadConfig(filepath.Join(fixture, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := BuildEngramTables(cfg, tokenizer(t))
 	if err != nil {
 		t.Fatal(err)
 	}

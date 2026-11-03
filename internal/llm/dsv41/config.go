@@ -50,8 +50,12 @@ type Config struct {
 	EngramRows              []int
 	EngramMaxNgram          int
 	EngramHeads, EngramDim  int
-	MTPLayers               int
-	BOS, EOS                int
+	// EngramVocab is where each table's search for prime sizes starts,
+	// EngramPad the token filling n-grams with no history, and
+	// EngramCompressed the size of the compressed token map.
+	EngramVocab, EngramPad, EngramCompressed int
+	MTPLayers                                int
+	BOS, EOS                                 int
 }
 
 type hfConfig struct {
@@ -113,6 +117,9 @@ type hfConfig struct {
 		EngramMaxNgram     int     `json:"engram_max_ngram_size"`
 		EngramHeads        int     `json:"engram_n_heads"`
 		EngramDim          int     `json:"engram_head_dim"`
+		EngramVocab        int     `json:"engram_vocab_size"`
+		EngramPad          int     `json:"engram_pad_token_id"`
+		EngramCompressed   int     `json:"engram_compressed_vocab_size"`
 		MTPLayers          int     `json:"num_nextn_predict_layers"`
 	} `json:"text_config"`
 }
@@ -167,6 +174,7 @@ func ParseConfig(b []byte) (*Config, error) {
 		HCMult: t.HCMult, HCSinkhornIters: t.HCSinkhornIters, HCEps: float32(t.HCEps),
 		EngramLayers: t.EngramLayers, EngramRows: t.EngramRows, EngramMaxNgram: t.EngramMaxNgram,
 		EngramHeads: t.EngramHeads, EngramDim: t.EngramDim, MTPLayers: t.MTPLayers,
+		EngramVocab: t.EngramVocab, EngramPad: t.EngramPad, EngramCompressed: t.EngramCompressed,
 		BOS: h.BOS, EOS: h.EOS,
 	}
 	if t.CandidateSource != nil {

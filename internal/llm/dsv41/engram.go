@@ -12,23 +12,24 @@ import (
 // EngramTables are what hashing n-grams needs besides the tokens: the
 // compressed token map, and per Engram layer the bucket primes, row
 // offsets and hash multipliers (docs/dev/deepseek-v41.md, section 8). They
-// depend only on the tokenizer and the config.
-//
-// TODO(stage 2): build them from the tokenizer in Go. Until then they come
-// from a file in the format tools/llmref/dsv41 writes (engram.json).
+// depend only on the tokenizer and the config: BuildEngramTables computes
+// them. The JSON form is the reference's (tools/llmref/dsv41 writes it),
+// for tests.
 type EngramTables struct {
-	MaxNgram   int     `json:"max_ngram_size"`
-	Heads      int     `json:"n_heads"`
-	Compressed int     `json:"compressed_vocab_size"`
-	Pad        int64   `json:"pad_id"`
-	TokenMap   []int64 `json:"token_map"`
-	Layers     []struct {
-		Layer       int       `json:"layer"`
-		Rows        int       `json:"num_embeddings"`
-		Primes      [][]int64 `json:"primes"`      // [ngram size - 2][head]
-		Offsets     []int64   `json:"offsets"`     // [(ngram size - 2)·heads + head]
-		Multipliers []int64   `json:"multipliers"` // [lookback]
-	} `json:"layers"`
+	MaxNgram   int           `json:"max_ngram_size"`
+	Heads      int           `json:"n_heads"`
+	Compressed int           `json:"compressed_vocab_size"`
+	Pad        int64         `json:"pad_id"`
+	TokenMap   []int64       `json:"token_map"`
+	Layers     []engramLayer `json:"layers"`
+}
+
+type engramLayer struct {
+	Layer       int       `json:"layer"`
+	Rows        int       `json:"num_embeddings"`
+	Primes      [][]int64 `json:"primes"`      // [ngram size - 2][head]
+	Offsets     []int64   `json:"offsets"`     // [(ngram size - 2)·heads + head]
+	Multipliers []int64   `json:"multipliers"` // [lookback]
 }
 
 // LoadEngramTables reads tables in the engram.json format.
