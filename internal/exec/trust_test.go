@@ -2,6 +2,7 @@ package exec
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -230,5 +231,55 @@ func TestBilledGas(t *testing.T) {
 		if got := billedGas(tc.res, tc.err, lim); got != tc.want {
 			t.Errorf("%s: billed %d, want %d", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestGuestsRefusingTasksDoNotStarveThem(t *testing.T) {
+	// Guests claiming more free slots than the member draw tasks first, then
+	// refuse them. Each may waste one round trip, after which the task goes
+	// to the member and later tasks leave the guests out.
+	for _, status := range []string{offerRejected, offerBusy} {
+		t.Run(status, func(t *testing.T) {
+			c := newOpenCluster(t)
+			req := c.addNode(nodeSpec{trust: &trust.Config{}})
+			member := c.addNode(nodeSpec{slots: 1, trust: &trust.Config{}})
+			var guests []*testNode
+			for range 3 {
+				g := c.addNode(nodeSpec{slots: 4, guest: true, trust: &trust.Config{}})
+				g.svc.testOffer.Store(status)
+				guests = append(guests, g)
+			}
+			settle(t, req, append([]*testNode{member}, guests...)...)
+
+			for i := range 6 {
+				ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+				res, err := req.svc.Run(ctx, Request{Module: w.Echo(), Input: []byte{byte(i)}, Limits: limits()})
+				cancel()
+				if err != nil {
+					t.Fatalf("task %d: %v", i, err)
+				}
+				if res.Node != member.node.ID() {
+					t.Fatalf("task %d ran on %s", i, res.Node.ShortString())
+				}
+			}
+			var refused int64
+			for _, g := range guests {
+				refused += g.svc.testRefused.Load()
+			}
+			if refused > int64(len(guests)) {
+				t.Fatalf("guests refused %d times; each should have been tried once", refused)
+			}
+		})
+	}
+}
+
+func TestImplausibleLoadsAreIgnored(t *testing.T) {
+	for _, l := range []Load{{Slots: -1}, {Slots: maxSlots + 1}, {Slots: 4, Busy: -5}, {Slots: 4, Queued: -1}} {
+		if l.plausible() {
+			t.Errorf("%+v accepted", l)
+		}
+	}
+	if l := (Load{Slots: 4, Busy: 4, Queued: 2, CPUs: 8}); !l.plausible() {
+		t.Errorf("%+v rejected", l)
 	}
 }

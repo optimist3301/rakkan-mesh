@@ -102,15 +102,20 @@ type Service struct {
 	inflight atomic.Int64 // tasks admitted for local execution
 	changed  chan struct{}
 
-	// For tests: modules received, and a hook that tampers with results.
+	// For tests: modules received, a hook that tampers with results, and
+	// an offer status to answer every task with.
 	modulesReceived atomic.Int64
 	tamper          func(*sandbox.Result)
+	testOffer       atomic.Value // string
+	testRefused     atomic.Int64
 
 	mu      sync.Mutex
 	loads   map[peer.ID]Load
 	pending map[peer.ID]int           // our tasks in flight at each executor
 	placed  map[peer.ID]map[Hash]bool // modules an executor is known to hold
 	caps    map[Hash][]string         // capabilities each module needs
+	// penalties exclude guests that failed tasks from scheduling.
+	penalties map[peer.ID]*penalty
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -156,6 +161,8 @@ func New(cfg Config) (*Service, error) {
 		pending: map[peer.ID]int{},
 		placed:  map[peer.ID]map[Hash]bool{},
 		caps:    map[Hash][]string{},
+
+		penalties: map[peer.ID]*penalty{},
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
@@ -253,13 +260,87 @@ func (s *Service) receiveLoads(sub *pubsub.Subscription) {
 			continue
 		}
 		var l Load
-		if json.Unmarshal(m.Data, &l) != nil {
+		if json.Unmarshal(m.Data, &l) != nil || !l.plausible() {
 			continue
 		}
 		l.received = time.Now()
 		s.mu.Lock()
 		s.loads[from] = l
 		s.mu.Unlock()
+	}
+}
+
+// maxSlots bounds the slots a gossiped load may claim.
+const maxSlots = 1024
+
+// plausible rejects loads no node could have. A load is a claim: within
+// these bounds it is believed until the node fails to honour it (see
+// penalize).
+func (l *Load) plausible() bool {
+	return l.Slots >= 0 && l.Slots <= maxSlots && l.Busy >= 0 && l.Queued >= 0 && l.CPUs >= 0
+}
+
+// Guests that refuse or fail tasks their gossiped load invited are left
+// out of scheduling for a while, doubling each time, so that a guest
+// claiming capacity it does not give cannot keep drawing tasks away from
+// executors that would run them. Members, whom the root vouched for, are
+// not penalized: a busy or failing member is handled as before.
+const (
+	minPenalty = time.Second
+	maxPenalty = 5 * time.Minute
+)
+
+type penalty struct {
+	until   time.Time
+	backoff time.Duration
+}
+
+// penalize excludes p from scheduling if it is a guest.
+func (s *Service) penalize(p peer.ID) {
+	if p == s.node.ID() || s.node.IsCertified(p) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pen := s.penalties[p]
+	if pen == nil {
+		if len(s.penalties) >= 4096 {
+			s.prunePenalties()
+		}
+		pen = &penalty{}
+		s.penalties[p] = pen
+	}
+	pen.backoff = min(max(2*pen.backoff, minPenalty), maxPenalty)
+	pen.until = time.Now().Add(pen.backoff)
+	s.log.Info("guest failed a task; not scheduling on it", "peer", p.ShortString(), "for", pen.backoff)
+}
+
+// forgive clears p's penalty once it has returned a result. A task error
+// does not count: claimed by a guest, it is a verdict that may go unchecked
+// (see runChecked).
+func (s *Service) forgive(p peer.ID) {
+	s.mu.Lock()
+	delete(s.penalties, p)
+	s.mu.Unlock()
+}
+
+// penalized reports whether p is excluded from scheduling; s.mu is held.
+func (s *Service) penalized(p peer.ID) bool {
+	pen, ok := s.penalties[p]
+	return ok && time.Now().Before(pen.until)
+}
+
+// prunePenalties drops expired penalties, or all of them if none has
+// expired, to bound memory against many identities; s.mu is held.
+func (s *Service) prunePenalties() {
+	now := time.Now()
+	for p, pen := range s.penalties {
+		if now.After(pen.until) {
+			delete(s.penalties, p)
+		}
+	}
+	if len(s.penalties) >= 4096 {
+		clear(s.penalties)
 	}
 }
 
@@ -285,6 +366,11 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	var h header
 	if err := readJSON(st, &h); err != nil {
 		st.Reset()
+		return
+	}
+	if o, _ := s.testOffer.Load().(string); o != "" {
+		s.testRefused.Add(1)
+		writeJSON(st, offer{Status: o, Reason: "test"})
 		return
 	}
 	hash, ok := ParseHash(h.ModuleHash)
