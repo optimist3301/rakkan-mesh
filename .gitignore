@@ -7,3 +7,5 @@ sdk/js/node_modules/
 !sdk/as/build/*.wasm
 !sdk/js/test/fixtures/tiny-*.bin
 /dist/
+tools/llmref/.venv/
+__pycache__/
