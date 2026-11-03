@@ -50,12 +50,13 @@ func sigmoid(x float32) float32 { return 1 / (1 + num.Exp32(-x)) }
 // silu is x·sigmoid(x), as x / (1 + e^-x).
 func silu(x float32) float32 { return x / (1 + num.Exp32(-x)) }
 
-// softplus is log(1 + e^x), x itself above 20 (PyTorch's threshold).
+// softplus is log(1 + e^x), x itself above 20 (PyTorch's threshold), in
+// float32 (num.Log1p32) as a GPU can compute it too.
 func softplus(x float32) float32 {
 	if x > 20 {
 		return x
 	}
-	return float32(num.Log1p(float64(num.Exp32(x))))
+	return num.Log1p32(num.Exp32(x))
 }
 
 func sqrt32(x float32) float32 { return float32(math.Sqrt(float64(x))) }

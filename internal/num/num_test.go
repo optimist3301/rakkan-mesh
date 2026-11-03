@@ -374,3 +374,35 @@ func TestTranscendentalsSameEverywhere(t *testing.T) {
 		t.Errorf("digest %s, want %s", got, want)
 	}
 }
+
+func TestLog32(t *testing.T) {
+	r := rand.New(rand.NewPCG(11, 12))
+	worst := 0.0
+	for i := range 2000000 {
+		var x float32
+		switch i % 3 {
+		case 0:
+			x = float32(math.Exp(r.Float64()*40 - 20))
+		case 1:
+			x = float32(1 + (r.Float64()-0.5)*1e-3)
+		default:
+			x = math.Float32frombits(uint32(r.Uint64()) & 0x7f7fffff)
+		}
+		if x <= 0 {
+			continue
+		}
+		got, want := float64(Log32(x)), math.Log(float64(x))
+		if want != 0 {
+			ulp := math.Abs(float64(math.Nextafter32(float32(want), float32(math.Inf(1))) - float32(want)))
+			worst = max(worst, math.Abs(got-want)/ulp)
+		}
+		v := float32(math.Exp(r.Float64()*30 - 25))
+		got, want = float64(Log1p32(v)), math.Log1p(float64(v))
+		ulp := math.Abs(float64(math.Nextafter32(float32(want), float32(math.Inf(1))) - float32(want)))
+		worst = max(worst, math.Abs(got-want)/ulp)
+	}
+	if worst > 2 {
+		t.Fatalf("Log32/Log1p32 off by %.2f ulp", worst)
+	}
+	t.Logf("worst %.2f ulp", worst)
+}

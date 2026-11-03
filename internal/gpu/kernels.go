@@ -52,6 +52,7 @@ const (
 	kindFP8
 	kindFP4
 	kindActFP8
+	kindMathTest
 	kindCount
 )
 
@@ -88,6 +89,8 @@ func kernel(k kernelKind, modes floatModes) []uint32 {
 		return mxKernel(k, modes)
 	case kindActFP8:
 		return actFP8Kernel(modes)
+	case kindMathTest:
+		return mathTestKernel(modes)
 	}
 	panic("gpu: unknown kernel")
 }

@@ -1,12 +1,16 @@
 package dsv41
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 )
 
 // Real layers of DeepSeek-V4.1-Flash against the reference on real
@@ -224,4 +228,101 @@ func common(a, b []int) int {
 		}
 	}
 	return n
+}
+
+// TestRealLayersGPU runs the real layers on a GPU (not a software one) and
+// on the CPU, position by position on the reference's input, and wants
+// the same bits: the stream, the mix, the selections and the cache
+// entries.
+func TestRealLayersGPU(t *testing.T) {
+	dir := os.Getenv("RAKKAN_DSV41_REAL")
+	if dir == "" {
+		t.Skip("RAKKAN_DSV41_REAL not set")
+	}
+	var dev *gpu.Device
+	for _, d := range gpuDevices(t) {
+		if d.Info().Type != "cpu" {
+			dev = d
+			break
+		}
+	}
+	if dev == nil {
+		t.Skip("no hardware GPU")
+	}
+	cfg, err := LoadConfig("../../../tools/llmref/dsv41/upstream/config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, layer := range []int{2, 20} {
+		t.Run(fmt.Sprintf("layer%d", layer), func(t *testing.T) {
+			g, err := ReadSafetensors(filepath.Join(dir, fmt.Sprintf("layer%d.safetensors", layer)))
+			if err != nil {
+				t.Skipf("no reference inputs: %v", err)
+			}
+			tensors, err := ReadSafetensors(filepath.Join(dir, fmt.Sprintf("model-%05d-of-00048.safetensors", layer+3)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			part, err := NewPart(cfg, layerTensors(tensors, layer, layer+1), layer, layer+1, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gp, err := part.ToGPU(dev)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gp.Free()
+			input := golden(g).f32(t, "input")
+			decode := 0
+			for k := range g {
+				if strings.HasPrefix(k, "topk.decode") {
+					decode++
+				}
+			}
+			T := len(golden(g).ints(t, "tokens"))
+			P := T - decode
+			gs, err := gp.NewStage(T)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gs.Close()
+			cs := part.NewStage()
+			width := cfg.HCMult * cfg.Dim
+			hashes := make([][]int64, len(cfg.EngramLayers))
+			for i := range hashes {
+				hashes[i] = make([]int64, (cfg.EngramMaxNgram-1)*cfg.EngramHeads)
+			}
+			var cpuTime, gpuTime time.Duration
+			for pos := range T {
+				prefill := 0
+				if pos < P {
+					prefill = P
+				}
+				mk := func() *Payload {
+					p := &Payload{Prefill: prefill, H: slices.Clone(input[pos*width : (pos+1)*width]), PreMix: make([]float32, cfg.HCMult),
+						Hashes: hashes, Source: sourceBefore(cfg, layer)}
+					p.PreMix[0] = 1
+					return p
+				}
+				pc, pg := mk(), mk()
+				start := time.Now()
+				if err := cs.Forward(pc, pos); err != nil {
+					t.Fatal(err)
+				}
+				cpuTime += time.Since(start)
+				start = time.Now()
+				if err := gs.Forward(pg, pos); err != nil {
+					t.Fatal(err)
+				}
+				gpuTime += time.Since(start)
+				want, _ := AppendPayload(nil, cfg, pc)
+				got, _ := AppendPayload(nil, cfg, pg)
+				if !bytes.Equal(got, want) {
+					t.Fatalf("position %d: %s", pos, payloadDiff(cfg, pg, pc))
+				}
+			}
+			t.Logf("%d positions bit for bit; CPU %s, GPU (%s) %s per position", T, (cpuTime / time.Duration(T)).Round(time.Millisecond),
+				dev.Info().Name, (gpuTime / time.Duration(T)).Round(time.Millisecond))
+		})
+	}
 }

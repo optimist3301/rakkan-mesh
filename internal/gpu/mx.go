@@ -182,7 +182,17 @@ const mxRows = 4
 // rows 4g to 4g+3; per chunk of 32 blocks lane q of the group adds row
 // 4g+q's terms in order. Push rows, cols, gridX, outOff, qxOff, xsOff,
 // and raw: if set, the sums are not rounded to bfloat16 (for tests).
-func mxKernel(kind kernelKind, modes floatModes) []uint32 {
+func mxKernel(kind kernelKind, modes floatModes) []uint32 { return mxKernelGen(kind, modes, false) }
+
+// mxKernelIndexed is mxKernel on E2M1 experts stacked in one matrix part,
+// rows apart, for slots selected experts: workgroup row y is a slot, whose
+// expert is at word ids+y; experts outside the part's [e0, e1) are left to
+// another part's dispatch. Each slot has its own input (qx, xs strides)
+// and output (out stride). Push rows (per expert), cols, gridX, out, qx,
+// xs, raw, ids, e0, e1, qxStride, xsStride, outStride.
+func mxKernelIndexed(modes floatModes) []uint32 { return mxKernelGen(kindFP4, modes, true) }
+
+func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 	k := newKernel(modes, laneCount, 2)
 	w, ws := k.storageBuffer(0, true), k.storageBuffer(1, true)
 	terms := k.workgroupFloats(laneCount * 2 * mxRows)
@@ -193,56 +203,71 @@ func mxKernel(kind kernelKind, modes floatModes) []uint32 {
 	}
 	lid, wid := k.ids()
 	lane, ly := k.component(lid, 0), k.component(lid, 1)
-	group := k.iadd(k.imul(k.component(wid, 1), k.p(2)), k.component(wid, 0))
-	base := k.iadd(k.imul(group, k.u32(2*mxRows)), k.imul(ly, k.u32(mxRows)))
 	rows, cols, outOff, qxOff, xsOff, raw := k.p(0), k.p(1), k.p(3), k.p(4), k.p(5), k.p(6)
+	group := k.iadd(k.imul(k.component(wid, 1), k.p(2)), k.component(wid, 0))
+	inPart := k.ieq(k.u32(0), k.u32(0))
+	rowOff := k.u32(0) // of the expert's rows in the part
+	if indexed {
+		slot := k.component(wid, 1)
+		group = k.component(wid, 0)
+		e := k.iget(k.at(k.p(7), slot))
+		inPart = k.land(k.uge(e, k.p(8)), k.ult(e, k.p(9)))
+		rowOff = k.imul(k.op(opISub, k.tU32, e, k.p(8)), rows)
+		qxOff = k.iadd(qxOff, k.imul(slot, k.p(10)))
+		xsOff = k.iadd(xsOff, k.imul(slot, k.p(11)))
+		outOff = k.iadd(outOff, k.imul(slot, k.p(12)))
+	}
+	base := k.iadd(k.imul(group, k.u32(2*mxRows)), k.imul(ly, k.u32(mxRows)))
 	nb := k.shr(cols, k.u32(5))
 	chunks := k.shr(k.iadd(nb, k.u32(laneCount-1)), k.u32(5))
 	// The row lane q < mxRows adds up.
 	myRow := k.iadd(base, lane)
 	k.store(acc, k.f32(0))
 	k.store(chunk, k.u32(0))
-	k.loop(func() id { return k.ult(k.load(k.tU32, chunk), chunks) }, func() {
-		c := k.load(k.tU32, chunk)
-		blk := k.iadd(k.imul(c, k.u32(laneCount)), lane)
-		for q := range term {
-			k.store(term[q], k.f32(0))
-		}
-		k.ifThen(k.land(k.ult(base, rows), k.ult(blk, nb)), func() {
-			xbase := k.iadd(qxOff, k.imul(blk, k.u32(32)))
-			xs := make([]id, 32)
-			for e := range xs {
-				xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
+	// The whole workgroup takes the same branch: its barriers stay uniform.
+	k.ifThen(inPart, func() {
+		k.loop(func() id { return k.ult(k.load(k.tU32, chunk), chunks) }, func() {
+			c := k.load(k.tU32, chunk)
+			blk := k.iadd(k.imul(c, k.u32(laneCount)), lane)
+			for q := range term {
+				k.store(term[q], k.f32(0))
 			}
-			xsc := k.get(k.at(xsOff, blk))
+			k.ifThen(k.land(k.ult(base, rows), k.ult(blk, nb)), func() {
+				xbase := k.iadd(qxOff, k.imul(blk, k.u32(32)))
+				xs := make([]id, 32)
+				for e := range xs {
+					xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
+				}
+				xsc := k.get(k.at(xsOff, blk))
+				for q := range uint32(mxRows) {
+					row := k.iadd(base, k.u32(q))
+					k.ifThen(k.ult(row, rows), func() {
+						k.store(term[q], k.mxBlock(kind, w, ws, k.iadd(rowOff, row), cols, nb, blk, xs, xsc))
+					})
+				}
+			})
 			for q := range uint32(mxRows) {
-				row := k.iadd(base, k.u32(q))
-				k.ifThen(k.ult(row, rows), func() {
-					k.store(term[q], k.mxBlock(kind, w, ws, row, cols, nb, blk, xs, xsc))
-				})
+				slot := k.iadd(k.imul(k.iadd(k.imul(ly, k.u32(mxRows)), k.u32(q)), k.u32(laneCount)), lane)
+				k.store(k.shared(terms, slot), k.load(k.tF32, term[q]))
 			}
+			k.barrier()
+			// Lane q adds its row's terms of the chunk's blocks that exist, in order.
+			k.ifThen(k.ult(lane, k.u32(mxRows)), func() {
+				rowBase := k.imul(k.iadd(k.imul(ly, k.u32(mxRows)), lane), k.u32(laneCount))
+				first := k.imul(c, k.u32(laneCount))
+				for j := range uint32(laneCount) {
+					k.ifThen(k.ult(k.iadd(first, k.u32(j)), nb), func() {
+						t := k.load(k.tF32, k.shared(terms, k.iadd(rowBase, k.u32(j))))
+						k.store(acc, k.fadd(k.load(k.tF32, acc), t))
+					})
+				}
+			})
+			k.barrier()
+		}, func() { k.store(chunk, k.iadd(k.load(k.tU32, chunk), k.u32(1))) })
+		k.ifThen(k.land(k.ult(lane, k.u32(mxRows)), k.ult(myRow, rows)), func() {
+			v := k.load(k.tF32, acc)
+			k.put(k.at(outOff, myRow), k.selF(k.ieq(raw, k.u32(0)), k.roundBF16(v), v))
 		})
-		for q := range uint32(mxRows) {
-			slot := k.iadd(k.imul(k.iadd(k.imul(ly, k.u32(mxRows)), k.u32(q)), k.u32(laneCount)), lane)
-			k.store(k.shared(terms, slot), k.load(k.tF32, term[q]))
-		}
-		k.barrier()
-		// Lane q adds its row's terms of the chunk's blocks that exist, in order.
-		k.ifThen(k.ult(lane, k.u32(mxRows)), func() {
-			rowBase := k.imul(k.iadd(k.imul(ly, k.u32(mxRows)), lane), k.u32(laneCount))
-			first := k.imul(c, k.u32(laneCount))
-			for j := range uint32(laneCount) {
-				k.ifThen(k.ult(k.iadd(first, k.u32(j)), nb), func() {
-					t := k.load(k.tF32, k.shared(terms, k.iadd(rowBase, k.u32(j))))
-					k.store(acc, k.fadd(k.load(k.tF32, acc), t))
-				})
-			}
-		})
-		k.barrier()
-	}, func() { k.store(chunk, k.iadd(k.load(k.tU32, chunk), k.u32(1))) })
-	k.ifThen(k.land(k.ult(lane, k.u32(mxRows)), k.ult(myRow, rows)), func() {
-		v := k.load(k.tF32, acc)
-		k.put(k.at(outOff, myRow), k.selF(k.ieq(raw, k.u32(0)), k.roundBF16(v), v))
 	})
 	return k.finish()
 }

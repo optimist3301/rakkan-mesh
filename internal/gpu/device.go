@@ -32,6 +32,11 @@ type Info struct {
 	// kernels need to match the CPU bit for bit: denormals preserved and
 	// round-to-nearest-even (or a CPU implementation, which has them).
 	Exact bool `json:"exact"`
+	// Denormals reports whether the device promises to keep denormal
+	// floats. Without, float32 arithmetic whose operands or results are
+	// denormal may differ from the CPU's (llvmpipe says it does not keep
+	// them); DeepSeek-V4.1's kernels meet them only with extreme values.
+	Denormals bool `json:"denormals"`
 
 	pd       uintptr
 	apiMajor uint32
@@ -154,6 +159,7 @@ func Devices() ([]Info, error) {
 			info.modes = floatModes{signedZeroInfNan: fc.flags[1] != 0, denormPreserve: fc.flags[4] != 0, roundRTE: fc.flags[10] != 0}
 		}
 		info.Exact = info.Type == "cpu" || info.modes.denormPreserve && info.modes.roundRTE
+		info.Denormals = info.modes.denormPreserve
 		var mem [520]byte
 		vk.GetPhysicalDeviceMemoryProperties(pd, &mem)
 		heaps := binary.LittleEndian.Uint32(mem[260:])
@@ -208,8 +214,8 @@ type Device struct {
 
 	setLayouts [2]uint64 // set 0: weights or vectors; set 1: an arena
 	layout     uint64
-	kernels    [kindCount]*pipeline
-	setPool    uint64 // descriptor sets of arenas and vectors
+	kernels    [kindAllCount]*pipeline // DeepSeek's built on first use
+	setPool    uint64                  // descriptor sets of arenas and vectors
 
 	host *Arena // for MulVecs: input, output and quantized input
 
@@ -565,6 +571,9 @@ type Format struct {
 	// scales' bytes in E8M0. The products are rounded to bfloat16.
 	FP8, FP4 []byte
 	E8M0     []byte
+	// AlignRows, if set, keeps runs of that many rows (an expert's) in one
+	// part when the matrix is split.
+	AlignRows int
 }
 
 // Upload copies a rows×cols matrix to the device.
@@ -597,7 +606,9 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	default:
 		return nil, errors.New("gpu: empty matrix")
 	}
-	if cols > maxCols || rows > maxRows || len(data) != rows*rowBytes {
+	// Rows beyond maxRows are for products into an arena (stacked experts);
+	// MulVecs, through the host's arena, checks its own outputs.
+	if cols > maxCols || rows > 1<<24 || len(data) != rows*rowBytes {
 		return nil, fmt.Errorf("gpu: matrix %d×%d out of range", rows, cols)
 	}
 	if (m.kind == kindQ8 || m.kind == kindQ4) && (cols%num.QBlock != 0 || len(f.Scales) != rows*cols/num.QBlock) {
@@ -625,6 +636,12 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	per := max(int(limit)/rowBytes, 1)
 	if m.kind == kindFP8 {
 		per = max(per/32*32, 32)
+	}
+	if a := f.AlignRows; a > 0 {
+		if rows%a != 0 || m.kind == kindFP8 && a%32 != 0 {
+			return nil, errors.New("gpu: rows not a whole number of aligned runs")
+		}
+		per = max(per/a*a, a)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()

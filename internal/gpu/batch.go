@@ -177,6 +177,16 @@ func (b *Batch) dispatch(k kernelKind, set0 uint64, gx, gy int, push ...uint32) 
 		return
 	}
 	d := b.a.d
+	if d.kernels[k] == nil {
+		// A DeepSeek-V4.1 kernel, built when first used: llama models never
+		// pay for them. The batch holds the device.
+		p, err := d.newPipeline(dsKernel(k, d.info.modes))
+		if err != nil {
+			b.err = fmt.Errorf("kernel %d: %w", k, err)
+			return
+		}
+		d.kernels[k] = p
+	}
 	vk.CmdBindPipeline(b.cb, bindPointCompute, d.kernels[k].pipe)
 	if set0 != 0 {
 		vk.CmdBindDescriptorSets(b.cb, bindPointCompute, d.layout, 0, 1, &set0, 0, nil)

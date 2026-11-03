@@ -41,6 +41,14 @@ func (b *builder) gomax(x, y id) id {
 	return b.selF(b.lor(b.isNaN(x), b.isNaN(y)), b.toF(b.u32(0x7fc00000)), r)
 }
 
+// ldexp32 is v·2^k rounded once to float32, for positive normal v.
+func (b *builder) ldexp32(v, k id) id {
+	bits := b.toU(v)
+	m := b.or(b.and(bits, b.u32(0x7fffff)), b.u32(1<<23))
+	e := b.iaddS(b.isubS(b.toI(b.and(b.shr(bits, b.u32(23)), b.u32(0xff))), b.i32(150)), k)
+	return b.roundPack(m, b.u32(23), e, b.ieq(b.u32(0), b.u32(1)), b.u32(0))
+}
+
 // exp32 is num.Exp32.
 func (b *builder) exp32(x id) id {
 	n := b.roundEven(b.fmul(x, b.fc(1.4426950408889634)))
@@ -50,8 +58,9 @@ func (b *builder) exp32(x id) id {
 	for _, c := range []float64{1.0 / 120, 1.0 / 24, 1.0 / 6, 0.5, 1, 1} {
 		p = b.fadd(b.fmul(p, r), b.fc(c))
 	}
-	// math.Ldexp, then rounding to float32: one rounding, as scale2.
-	v := b.scale2(p, b.op(opConvertFToS, b.tI32, n))
+	// math.Ldexp, then rounding to float32: one rounding, in integers so
+	// that a denormal result does not depend on the device keeping them.
+	v := b.ldexp32(p, b.op(opConvertFToS, b.tI32, n))
 	inf := b.toF(b.u32(0x7f800000))
 	v = b.selF(b.fgt(x, b.fc(88.72)), inf, b.selF(b.flt(x, b.fc(-103.97)), b.f32(0), v))
 	return b.selF(b.isNaN(x), b.toF(b.u32(0x7fc00000)), v)
