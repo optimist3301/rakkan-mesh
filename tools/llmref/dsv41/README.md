@@ -1,7 +1,9 @@
 # Эталон DeepSeek-V4.1-Flash
 
 Инструменты, с которыми движок `internal/llm` сверяет свою реализацию
-DeepSeek-V4.1-Flash. Что именно движок должен воспроизвести, описано в
+DeepSeek-V4.1-Flash. Это только инструменты разработки: узел запускает
+модель без Python, а здесь снимаются эталонные значения для тестов Go.
+Что именно движок должен воспроизвести, описано в
 [docs/dev/deepseek-v41.md](../../../docs/dev/deepseek-v41.md).
 
 | Файл | Что делает |
@@ -13,6 +15,7 @@ DeepSeek-V4.1-Flash. Что именно движок должен воспро�
 | `test_kernel_cpu.py` | Сверяет `kernel_cpu` с прямыми определениями |
 | `run.py` | Загружает неизменённый `model.py` с `kernel_cpu` и правилом top-K движка |
 | `tiny.py` | Строит крошечную модель и снимает с неё эталонные выходы |
+| `vectors.py` | Эталонные значения для Go-реализаций того, что эталон берёт из библиотек Python (токенайзер, хеш Engram) |
 | `check_kernels.py` | На машине с GPU NVIDIA сверяет `kernel_cpu` с настоящими ядрами |
 
 ## Установка (CPU)
@@ -37,7 +40,8 @@ cd tools/llmref/dsv41
 python test_kernel_cpu.py
 (cd upstream/encoding && python -m pytest -q -p no:cacheprovider)   # формат чата, 55 тестов
 python tiny.py ../../../internal/llm/testdata/dsv41-tiny
-git status --short ../../../internal/llm/testdata/dsv41-tiny   # должно быть пусто
+python vectors.py ../../../internal/llm/testdata/dsv41-vectors.json.gz
+git status --short ../../../internal/llm/testdata   # должно быть пусто
 ```
 
 `tiny.py` детерминирован: повторный запуск с теми же версиями пакетов даёт
