@@ -56,7 +56,11 @@ def e8m0_to_f32(s):
     """Decode float8_e8m0fnu (or pass float32 through)."""
     if s.dtype == torch.float8_e8m0fnu:
         e = s.view(torch.uint8).int()
-        return ((e << 23)).view(torch.float32)  # biased exponent 127 sits where float32 wants it
+        # The biased exponent sits where float32 wants it; byte 0 is 2^-127,
+        # a float32 subnormal, and byte 255 is NaN.
+        f = (e << 23).view(torch.float32)
+        f = torch.where(e == 0, torch.tensor(2.0**-127, dtype=torch.float32), f)
+        return torch.where(e == 255, torch.tensor(float("nan")), f)
     return s.float()
 
 

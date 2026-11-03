@@ -16,6 +16,7 @@ DeepSeek-V4.1-Flash. Это только инструменты разработ
 | `run.py` | Загружает неизменённый `model.py` с `kernel_cpu` и правилом top-K движка |
 | `tiny.py` | Строит крошечную модель и снимает с неё эталонные выходы |
 | `vectors.py` | Эталонные значения для Go-реализаций того, что эталон берёт из библиотек Python (токенайзер, хеш Engram) |
+| `num_vectors.py` | Эталонные значения для арифметики FP8/FP4/bf16 движка (`internal/num`) |
 | `check_kernels.py` | На машине с GPU NVIDIA сверяет `kernel_cpu` с настоящими ядрами |
 
 ## Установка (CPU)
@@ -41,7 +42,8 @@ python test_kernel_cpu.py
 (cd upstream/encoding && python -m pytest -q -p no:cacheprovider)   # формат чата, 55 тестов
 python tiny.py ../../../internal/llm/testdata/dsv41-tiny
 python vectors.py ../../../internal/llm/testdata/dsv41-vectors.json.gz
-git status --short ../../../internal/llm/testdata   # должно быть пусто
+python num_vectors.py ../../../internal/num/testdata/dsv41-mx.json.gz
+git status --short ../../../internal   # должно быть пусто
 ```
 
 `tiny.py` детерминирован: повторный запуск с теми же версиями пакетов даёт
