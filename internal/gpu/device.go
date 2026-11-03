@@ -315,11 +315,11 @@ func (d *Device) init() error {
 		d.kernels[k] = p
 	}
 	var err error
-	d.host, err = d.NewArena(maxCols+maxRows+maxCols/4+maxCols/num.QBlock, maxCols+maxRows)
+	d.host, err = d.NewArena(maxCols+maxRows+maxCols+maxCols/num.QBlock, maxCols+maxRows)
 	if err != nil {
 		return err
 	}
-	d.host.SetQuantScratch(maxCols+maxRows, maxCols+maxRows+maxCols/4)
+	d.host.SetQuantScratch(maxCols+maxRows, maxCols+maxRows+maxCols)
 	return nil
 }
 
@@ -538,9 +538,11 @@ type Matrix struct {
 	d          *Device
 	kind       kernelKind
 	rows, cols int
-	pool       uint64
-	parts      []part
-	bytes      int64
+	// unrounded leaves FP8 and FP4 products in float32 (for tests).
+	unrounded bool
+	pool      uint64
+	parts     []part
+	bytes     int64
 }
 
 // part is a run of rows small enough for one storage buffer binding.
@@ -557,6 +559,12 @@ type Format struct {
 	Q8     []int8
 	Q4     []byte
 	Scales []float32
+	// DeepSeek-V4.1's formats (package num): E4M3 codes with one E8M0
+	// scale per 32×32 block ([ceil(rows/32)][cols/32]), or E2M1 codes,
+	// two to a byte, with one per 32 of a row ([rows][cols/32]); the
+	// scales' bytes in E8M0. The products are rounded to bfloat16.
+	FP8, FP4 []byte
+	E8M0     []byte
 }
 
 // Upload copies a rows×cols matrix to the device.
@@ -580,6 +588,12 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	case f.Q4 != nil:
 		m.kind, rowBytes, scaleBytes = kindQ4, cols/2, 4*cols/num.QBlock
 		data = f.Q4
+	case f.FP8 != nil:
+		m.kind, rowBytes = kindFP8, cols
+		data = f.FP8
+	case f.FP4 != nil:
+		m.kind, rowBytes = kindFP4, cols/2
+		data = f.FP4
 	default:
 		return nil, errors.New("gpu: empty matrix")
 	}
@@ -590,10 +604,28 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		return nil, errors.New("gpu: quantized matrix of the wrong shape")
 	}
 	scales := floatBytes(f.Scales)
+	mx := m.kind == kindFP8 || m.kind == kindFP4
+	if mx {
+		blocks := rows * cols / num.QBlock // one scale per 32 of a row
+		if m.kind == kindFP8 {
+			blocks = (rows + 31) / 32 * (cols / num.QBlock)
+		}
+		if cols%num.QBlock != 0 || len(f.E8M0) != blocks {
+			return nil, errors.New("gpu: block-scaled matrix of the wrong shape")
+		}
+		if m.kind == kindFP8 && !num.ValidE4M3(f.FP8) {
+			return nil, errors.New("gpu: NaN in E4M3 weights")
+		}
+		scales = f.E8M0
+	}
 
-	// Split rows so each part fits a binding, and a gigabyte at most.
+	// Split rows so each part fits a binding, and a gigabyte at most: for
+	// E4M3 weights, whole blocks of 32 rows sharing scales.
 	limit := min(d.info.maxRange, 1<<30)
 	per := max(int(limit)/rowBytes, 1)
+	if m.kind == kindFP8 {
+		per = max(per/32*32, 32)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	size := vkDescriptorPoolSize{typ: descriptorStorageBuffer, count: uint32(2 * ((rows + per - 1) / per))}
@@ -605,8 +637,17 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		n := min(per, rows-r)
 		p := part{row0: r, rows: n}
 		var err error
-		if p.w, err = d.upload(data[r*rowBytes : (r+n)*rowBytes]); err == nil && scaleBytes > 0 {
-			p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
+		if p.w, err = d.upload(data[r*rowBytes : (r+n)*rowBytes]); err == nil {
+			// Byte scales are padded to whole words, which kernels read.
+			nb := cols / num.QBlock
+			switch {
+			case m.kind == kindFP8:
+				p.s, err = d.upload(padWords(scales[r/32*nb : (r+n+31)/32*nb]))
+			case m.kind == kindFP4:
+				p.s, err = d.upload(padWords(scales[r*nb : (r+n)*nb]))
+			case scaleBytes > 0:
+				p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
+			}
 		}
 		if err == nil {
 			bufs := []*buffer{p.w}
@@ -630,6 +671,14 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	d.used += m.bytes
 	runtime.KeepAlive(f)
 	return m, nil
+}
+
+// padWords pads bytes to whole words.
+func padWords(b []byte) []byte {
+	if len(b)%4 == 0 {
+		return b
+	}
+	return append(append([]byte(nil), b...), make([]byte, 4-len(b)%4)...)
 }
 
 // SameDevice reports whether two matrices are on the same device.

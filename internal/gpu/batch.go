@@ -48,9 +48,10 @@ func (d *Device) NewArena(words, stagingWords int) (*Arena, error) {
 	return a, nil
 }
 
-// SetQuantScratch reserves room for an input quantized to Q8_0: the bytes
-// at word qxOff (a quarter of the input's length) and the scales at word
-// xsOff (a thirty-second).
+// SetQuantScratch reserves room for a quantized input: for Q8_0 the bytes
+// at word qxOff (a quarter of the input's length), for E4M3 (FP8 and FP4
+// products) the values (the input's length), and the scales at word xsOff
+// (a thirty-second).
 func (a *Arena) SetQuantScratch(qxOff, xsOff int) { a.qxOff, a.xsOff = qxOff, xsOff }
 
 // Bytes is the device memory the arena holds.
@@ -194,10 +195,29 @@ func groups(n, per int) int { return (n + per - 1) / per }
 // MatVecs computes ms[i]·x into word outOffs[i], x at word inOff; an
 // input for quantized matrices is quantized once, into the scratch.
 func (b *Batch) MatVecs(ms []*Matrix, outOffs []int, inOff int) {
-	quantized := false
+	quantized, quantizedFP8 := false, false
 	for _, m := range ms {
 		if m.d != b.a.d {
 			b.err = errors.New("gpu: matrix on another device")
+			return
+		}
+		if m.kind == kindFP8 || m.kind == kindFP4 {
+			if quantized {
+				b.err = errors.New("gpu: Q8_0 and FP8 products of one input")
+				return
+			}
+			if !quantizedFP8 {
+				if b.a.qxOff < 0 {
+					b.err = errors.New("gpu: arena has no scratch for quantized inputs")
+					return
+				}
+				b.QuantizeFP8(inOff, m.cols)
+				quantizedFP8 = true
+			}
+			continue
+		}
+		if quantizedFP8 && (m.kind == kindQ8 || m.kind == kindQ4) {
+			b.err = errors.New("gpu: Q8_0 and FP8 products of one input")
 			return
 		}
 		if (m.kind == kindQ8 || m.kind == kindQ4) && !quantized {
@@ -216,13 +236,25 @@ func (b *Batch) MatVecs(ms []*Matrix, outOffs []int, inOff int) {
 			gx := min(g, 65535)
 			gy := groups(g, gx)
 			out := uint32(outOffs[i] + pt.row0)
-			if m.kind == kindQ8 || m.kind == kindQ4 {
+			if m.kind == kindFP8 || m.kind == kindFP4 {
+				raw := uint32(0)
+				if m.unrounded {
+					raw = 1
+				}
+				b.dispatch(m.kind, pt.set, gx, gy, uint32(pt.rows), uint32(m.cols), uint32(gx), out, uint32(b.a.qxOff), uint32(b.a.xsOff), raw)
+			} else if m.kind == kindQ8 || m.kind == kindQ4 {
 				b.dispatch(m.kind, pt.set, gx, gy, uint32(pt.rows), uint32(m.cols), uint32(gx), out, uint32(b.a.qxOff), uint32(b.a.xsOff))
 			} else {
 				b.dispatch(m.kind, pt.set, gx, gy, uint32(pt.rows), uint32(m.cols), uint32(gx), out, uint32(inOff))
 			}
 		}
 	}
+}
+
+// QuantizeFP8 quantizes n floats at word in into the arena's scratch as
+// num.QuantizeActFP8 does: the E4M3 values, unscaled, and block scales.
+func (b *Batch) QuantizeFP8(in, n int) {
+	b.dispatch(kindActFP8, 0, groups(n/32, flatGroup), 1, uint32(n), uint32(in), uint32(b.a.qxOff), uint32(b.a.xsOff))
 }
 
 // Quantize quantizes n floats at word in into the arena's scratch.

@@ -311,6 +311,18 @@ func matVecFP8(out []float32, w, scales []byte, x *ActFP8, bf16 bool) {
 	})
 }
 
+// MatVecFP8Unrounded is MatVecFP8 with the sums left in float32, not
+// rounded to bfloat16: for checking other implementations, whose last
+// bits the rounding would mostly hide.
+func MatVecFP8Unrounded(out []float32, w, scales []byte, x *ActFP8) {
+	matVecFP8(out, w, scales, x, false)
+}
+
+// MatVecFP4Unrounded is MatVecFP4 with the sums left in float32.
+func MatVecFP4Unrounded(out []float32, w, scales []byte, x *ActFP8) {
+	matVecFP4(out, w, scales, x, false)
+}
+
 // MatVecFP4 is MatVecFP8 for an E2M1 weight matrix, packed (rows ×
 // cols/2 bytes), with one E8M0 scale per 32 weights of a row ([rows][cols/32]).
 func MatVecFP4(out []float32, w, scales []byte, x *ActFP8) {

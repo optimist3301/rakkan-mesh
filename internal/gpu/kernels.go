@@ -49,6 +49,9 @@ const (
 	kindWSum
 	kindResidual
 	kindSiluMul
+	kindFP8
+	kindFP4
+	kindActFP8
 	kindCount
 )
 
@@ -81,14 +84,21 @@ func kernel(k kernelKind, modes floatModes) []uint32 {
 		return residualKernel(modes)
 	case kindSiluMul:
 		return siluMulKernel(modes)
+	case kindFP8, kindFP4:
+		return mxKernel(k, modes)
+	case kindActFP8:
+		return actFP8Kernel(modes)
 	}
 	panic("gpu: unknown kernel")
 }
 
 // groupRows is how many rows a matrix kernel's workgroup computes.
 func groupRows(kind kernelKind) int {
-	if kind == kindBF16 {
+	switch kind {
+	case kindBF16:
 		return bf16Rows
+	case kindFP8, kindFP4:
+		return 2 * mxRows
 	}
 	return rowsPerGroup
 }
