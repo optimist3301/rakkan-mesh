@@ -10,7 +10,10 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/libp2p/go-libp2p/core/peer"
+
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 )
@@ -211,5 +214,95 @@ func TestDeepSeekGuestStageIsWitnessed(t *testing.T) {
 	}
 	if !coord.trust.Suspect(guest.node.ID()) {
 		t.Fatal("cheater not marked")
+	}
+}
+
+// testDevice picks a hardware GPU, else a software one.
+func testDevice(t *testing.T) *gpu.Device {
+	t.Helper()
+	var dev *gpu.Device
+	for _, d := range gpuDevices(t) {
+		if dev == nil || d.Info().Type != "cpu" && dev.Info().Type == "cpu" {
+			dev = d
+		}
+	}
+	return dev
+}
+
+// A node with a GPU runs its DeepSeek stage there, next to a CPU node's,
+// and the text is one process's.
+func TestDeepSeekOnGPUNode(t *testing.T) {
+	dev := testDevice(t)
+	c := newCluster(t)
+	coord := c.add(false)
+	fast := c.addOpts(nodeOpts{serve: true, dev: dev, devBytes: 1 << 30, mem: 1 << 30, speed: 50})
+	slow := c.addOpts(nodeOpts{serve: true, mem: 1 << 30, speed: 5})
+	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 2)
+	want := localDeepSeek(t, tok, dsPrompt, 20)
+	got, stats := generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 20, Stages: 2}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("tokens %v, one process %v", got, want)
+	}
+	t.Logf("%s: stages %+v", dev.Info().Name, stats.Stages)
+	nodes := map[peer.ID]bool{}
+	for _, st := range stats.Stages {
+		nodes[st.Node] = true
+	}
+	if len(stats.Stages) != 2 || !nodes[fast.node.ID()] || !nodes[slow.node.ID()] {
+		t.Fatalf("stages %+v: want one on each node", stats.Stages)
+	}
+	if fast.llm.cfg.Device.Used() == 0 {
+		t.Fatal("the GPU node's layers are not on its GPU")
+	}
+	fast.llm.mu.Lock()
+	for _, l := range fast.llm.shards {
+		if l.dsGPU == nil {
+			t.Error("a DeepSeek shard of the GPU node runs on its CPU")
+		}
+	}
+	fast.llm.mu.Unlock()
+
+	// The GPU node fails mid-generation: its stage moves to the CPU node,
+	// whose replay of the stage's inputs rebuilds the same caches.
+	var forwards atomic.Int64
+	fast.llm.failNext = func(Shard) bool { return forwards.Add(1) == 6 }
+	got, stats = generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 20, Stages: 2}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("after the GPU node failed: tokens %v, one process %v", got, want)
+	}
+	if stats.Failovers == 0 || stats.Stages[0].Node != slow.node.ID() {
+		t.Fatalf("stages %+v, %d failovers: want the GPU stage moved to the CPU node", stats.Stages, stats.Failovers)
+	}
+}
+
+// A guest's GPU stage is witnessed by a member's CPU: the bits agree, so
+// the guest earns trust and is caught at nothing.
+func TestDeepSeekGPUGuestWitnessedByCPU(t *testing.T) {
+	dev := testDevice(t)
+	c := newCluster(t)
+	var err error
+	if c.open, err = membership.IssuePolicy(c.root, membership.Policy{Network: c.net.ID, Seq: 1, Open: true, PowBits: 8}); err != nil {
+		t.Fatal(err)
+	}
+	coord := c.add(false)
+	member := c.addNode(true, false, 1<<30)
+	guest := c.addOpts(nodeOpts{serve: true, guest: true, dev: dev, devBytes: 1 << 30, mem: 2 << 30, speed: 1})
+	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 2)
+	want := localDeepSeek(t, tok, dsPrompt, 12)
+	got, stats := generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 12, Stages: 1}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("tokens %v, one process %v", got, want)
+	}
+	st := stats.Stages[0]
+	if st.Node != guest.node.ID() || st.Witness != member.node.ID() || stats.Caught != 0 {
+		t.Fatalf("stage %+v, caught %d", st, stats.Caught)
+	}
+	if guest.llm.cfg.Device.Used() == 0 {
+		t.Fatal("the guest's stage is not on its GPU")
+	}
+	if coord.trust.Score(guest.node.ID()) == 0 {
+		t.Fatal("witnessed GPU stages earned the guest no trust")
 	}
 }

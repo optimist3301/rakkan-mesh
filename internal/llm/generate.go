@@ -283,7 +283,13 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 			s.release(l)
 			return nil, err
 		}
-		return &localStage{stageConn: l.open(positions), release: func() {
+		conn, err := l.open(positions)
+		if err != nil {
+			unreserve()
+			s.release(l)
+			return nil, err
+		}
+		return &localStage{stageConn: conn, release: func() {
 			unreserve()
 			s.release(l)
 		}}, nil

@@ -19,6 +19,7 @@ type Model struct {
 	layers   []*block // by layer; nil outside [from, to)
 	from, to int
 	ropes    [2]*rope // without and with compression
+	hostless bool     // weights only on a GPU (DropHostWeights)
 }
 
 // Head is what a pipeline's coordinator runs itself: the embedding, the

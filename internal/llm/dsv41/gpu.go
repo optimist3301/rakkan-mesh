@@ -221,11 +221,79 @@ type gpuLayout struct {
 // position, compressed at the one before (a group's first, for ratio 2).
 const csSlots = 3
 
+// Bytes is the device memory the part's weights take.
+func (p *GPUPart) Bytes() int64 {
+	var n int64
+	for _, m := range p.mats {
+		n += m.Bytes()
+	}
+	return n
+}
+
+// StageBytes is the device memory a stage of positions takes.
+func (p *GPUPart) StageBytes(positions int) int64 {
+	l, _ := p.layout(positions)
+	return 4 * int64(l.words)
+}
+
+// DropHostWeights lets the host copy of the part's weight matrices go,
+// once on the GPU: the CPU can no longer run the part.
+func (m *Model) DropHostWeights() {
+	drop := func(l *linear) {
+		if l != nil {
+			l.q, l.scales, l.bf, l.f = nil, nil, nil, nil
+		}
+	}
+	for _, b := range m.layers {
+		if b == nil {
+			continue
+		}
+		a := b.attn
+		for _, l := range []*linear{b.hcAttn.fn, b.hcFFN.fn, a.wqA, a.wqB, a.wkv, a.woA, a.woB, a.compWKV, a.compGate,
+			a.idxWK, a.idxWqB, a.idxWeights, b.ffn.gate, b.ffn.shared.w1, b.ffn.shared.w2, b.ffn.shared.w3} {
+			drop(l)
+		}
+		for i := range b.ffn.experts {
+			e := &b.ffn.experts[i]
+			drop(e.w1)
+			drop(e.w2)
+			drop(e.w3)
+		}
+		if b.engram != nil {
+			drop(b.engram.wkv)
+		}
+	}
+	m.hostless = true
+}
+
 // NewStage starts a generation of up to positions on the part.
 func (p *GPUPart) NewStage(positions int) (*GPUStage, error) {
 	c := p.m.Cfg
 	s := &GPUStage{p: p, positions: positions, compN: make([]int, c.Layers), source: -1}
-	l := &s.l
+	l, staging := p.layout(positions)
+	s.l = l
+	s.maxEntries = positions + 1
+	s.maxRows = c.Window
+	a, err := p.d.NewArena(l.words, staging)
+	if err != nil {
+		return nil, err
+	}
+	a.SetQuantScratch(l.qx, l.xs)
+	s.a = a
+	b := a.Begin()
+	b.Write(l.vecs, p.vecs)
+	if err := b.Submit(); err != nil {
+		a.Free()
+		return nil, err
+	}
+	return s, nil
+}
+
+// layout places a stage's data in its arena, and sizes its staging.
+func (p *GPUPart) layout(positions int) (gpuLayout, int) {
+	c := p.m.Cfg
+	var lay gpuLayout
+	l := &lay
 	at := 0
 	alloc := func(n int) int {
 		off := at
@@ -239,8 +307,6 @@ func (p *GPUPart) NewStage(positions int) (*GPUStage, error) {
 	if c.EngramDim > 0 {
 		maxCols = max(maxCols, (c.EngramMaxNgram-1)*c.EngramHeads*c.EngramDim)
 	}
-	s.maxEntries = positions + 1
-	s.maxRows = c.Window
 	l.vecs = alloc(len(p.vecs))
 	l.h, l.res, l.preMix, l.mix = alloc(hc*dim), alloc(hc*dim), alloc(hc), alloc((2+hc)*hc)
 	l.aPre, l.aPost, l.aComb = alloc(hc), alloc(hc), alloc(hc*hc)
@@ -286,19 +352,7 @@ func (p *GPUPart) NewStage(positions int) (*GPUStage, error) {
 	if c.EngramDim > 0 {
 		staging += (c.EngramMaxNgram - 1) * c.EngramHeads * c.EngramDim * len(c.EngramLayers)
 	}
-	a, err := p.d.NewArena(at, max(staging, len(p.vecs)))
-	if err != nil {
-		return nil, err
-	}
-	a.SetQuantScratch(l.qx, l.xs)
-	s.a = a
-	b := a.Begin()
-	b.Write(l.vecs, p.vecs)
-	if err := b.Submit(); err != nil {
-		a.Free()
-		return nil, err
-	}
-	return s, nil
+	return lay, max(staging, len(p.vecs))
 }
 
 // Close releases the stage's arena.

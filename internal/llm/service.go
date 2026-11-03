@@ -135,8 +135,9 @@ type loaded struct {
 	manifest *Manifest
 	layers   []*Layer // a llama model's
 	rope     *Rope
-	ds       *dsv41.Model // a DeepSeek model's blocks
-	dsClose  func()       // releases their Engram tables
+	ds       *dsv41.Model   // a DeepSeek model's blocks
+	dsGPU    *dsv41.GPUPart // their weights on the GPU, if there
+	dsClose  func()         // releases their Engram tables
 	bytes    int64
 	onDevice bool // bytes are device memory
 	users    int
@@ -147,13 +148,21 @@ type loaded struct {
 
 func (l *loaded) isLoaded() bool { return l.layers != nil || l.ds != nil }
 
-// open starts a stage of a generation of positions on the shard.
-func (l *loaded) open(positions int) stageConn {
+// open starts a stage of a generation of positions on the shard: on the
+// GPU if its weights are there.
+func (l *loaded) open(positions int) (stageConn, error) {
+	if l.dsGPU != nil {
+		st, err := l.dsGPU.NewStage(positions)
+		if err != nil {
+			return nil, err
+		}
+		return &deepseekStage{c: l.manifest.ds, stage: st, positions: positions, done: st.Close}, nil
+	}
 	if l.ds != nil {
-		return &deepseekStage{c: l.manifest.ds, stage: l.ds.NewStage(), positions: positions}
+		return &deepseekStage{c: l.manifest.ds, stage: l.ds.NewStage(), positions: positions}, nil
 	}
 	c := l.manifest.Config
-	return &llamaStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim}
+	return &llamaStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim}, nil
 }
 
 // llamaStage runs a llama stage on activations.
@@ -370,9 +379,14 @@ func (s *Service) acquire(ctx context.Context, model blob.ID, from, to int, prov
 				got.bytes, got.onDevice = devBytes, true
 			}
 		}
+		if err == nil && got.ds != nil {
+			if part, devBytes, ok := s.deepseekToDevice(got.manifest, got.ds, from, to); ok {
+				got.dsGPU, got.bytes, got.onDevice = part, devBytes, true
+			}
+		}
 		s.mu.Lock()
 		if err == nil {
-			l.manifest, l.layers, l.rope, l.ds, l.dsClose, l.bytes, l.onDevice = got.manifest, got.layers, got.rope, got.ds, got.dsClose, got.bytes, got.onDevice
+			l.manifest, l.layers, l.rope, l.ds, l.dsGPU, l.dsClose, l.bytes, l.onDevice = got.manifest, got.layers, got.rope, got.ds, got.dsGPU, got.dsClose, got.bytes, got.onDevice
 		}
 		l.err = err
 		if l.err != nil {
@@ -505,7 +519,12 @@ func (s *Service) reserveCache(l *loaded, from, to, positions int) (func(), erro
 		}
 		return func() { s.unreserve(n) }, nil
 	}
-	n := ArenaBytes(c, layers, positions)
+	var n int64
+	if l.dsGPU != nil {
+		n = l.dsGPU.StageBytes(positions)
+	} else {
+		n = ArenaBytes(c, layers, positions)
+	}
 	s.mu.Lock()
 	if s.devUsed+n > s.cfg.DeviceBytes {
 		s.evictDevice(n)
@@ -555,6 +574,9 @@ func (s *Service) drop(k Shard) {
 	if l.onDevice {
 		for _, layer := range l.layers {
 			layer.release(l.manifest.Config)
+		}
+		if l.dsGPU != nil {
+			l.dsGPU.Free()
 		}
 		s.devUsed -= l.bytes
 	} else {
@@ -683,7 +705,11 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		return
 	}
 	defer func() { unreserve(); s.notify() }()
-	stage := l.open(positions)
+	stage, err := l.open(positions)
+	if err != nil {
+		writeStatus(st, err)
+		return
+	}
 	defer stage.close()
 	if writeStatus(st, nil) != nil {
 		return

@@ -96,7 +96,12 @@ func (m *Model) NewStage() *Stage { return &Stage{st: m.NewState()} }
 // Forward runs the blocks on the Payload of position pos in place.
 // Positions come in order from 0; a failed stage is replaced by a new one
 // replaying them.
-func (s *Stage) Forward(p *Payload, pos int) error { return s.st.run(p, pos) }
+func (s *Stage) Forward(p *Payload, pos int) error {
+	if s.st.m.hostless {
+		return errors.New("dsv41: the part's weights are on a GPU only")
+	}
+	return s.st.run(p, pos)
+}
 
 // Pos is the next position the stage expects.
 func (s *Stage) Pos() int { return s.st.pos }

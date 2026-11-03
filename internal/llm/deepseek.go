@@ -356,11 +356,14 @@ func (s *Service) loadDeepSeek(ctx context.Context, m *Manifest, from, to int, p
 	return part, closer, size, nil
 }
 
-// deepseekStage runs a DeepSeek stage on Payloads.
+// deepseekStage runs a DeepSeek stage on Payloads, on the CPU or a GPU.
 type deepseekStage struct {
-	c         *dsv41.Config
-	stage     *dsv41.Stage
+	c     *dsv41.Config
+	stage interface {
+		Forward(p *dsv41.Payload, pos int) error
+	}
 	positions int
+	done      func() // releases a GPU stage's arena
 }
 
 func (d *deepseekStage) forward(in []byte, pos, tokens int) ([]byte, error) {
@@ -376,7 +379,49 @@ func (d *deepseekStage) forward(in []byte, pos, tokens int) ([]byte, error) {
 	return dsv41.EncodePayloads(d.c, ps)
 }
 
-func (d *deepseekStage) close() {}
+func (d *deepseekStage) close() {
+	if d.done != nil {
+		d.done()
+	}
+}
+
+// deepseekToDevice moves a loaded DeepSeek shard's weights to the GPU
+// within its budget, letting the host copy go. It reports the device
+// memory taken; on failure the shard stays on the CPU.
+func (s *Service) deepseekToDevice(m *Manifest, part *dsv41.Model, from, to int) (*dsv41.GPUPart, int64, bool) {
+	d := s.cfg.Device
+	if d == nil {
+		return nil, 0, false
+	}
+	// The estimate bounds what the upload takes; the actual size replaces it.
+	var need int64
+	for i := from; i < to; i++ {
+		need += dsv41.LayerBytes(m.ds, i)
+	}
+	s.mu.Lock()
+	if s.devUsed+need > s.cfg.DeviceBytes {
+		s.evictDevice(need)
+	}
+	ok := s.devUsed+need <= s.cfg.DeviceBytes
+	if ok {
+		s.devUsed += need
+	}
+	s.mu.Unlock()
+	if !ok {
+		s.log.Warn("GPU memory full; serving DeepSeek layers from the CPU")
+		return nil, 0, false
+	}
+	gp, err := part.ToGPU(d)
+	if err != nil {
+		s.unreserveDevice(need)
+		s.log.Warn("could not move DeepSeek layers to the GPU; serving them from the CPU", "err", err)
+		return nil, 0, false
+	}
+	size := gp.Bytes()
+	s.unreserveDevice(need - size)
+	part.DropHostWeights()
+	return gp, size, true
+}
 
 // deepseekCoord is a coordinator's part of a DeepSeek model.
 type deepseekCoord struct {
