@@ -66,8 +66,9 @@ func (l *linear) applyRowsFP8(out []float32, lo int, act *num.ActFP8) {
 
 // weights reads tensors of a checkpoint by name.
 type weights struct {
-	t    map[string]*Tensor
-	used map[string]bool
+	t      map[string]*Tensor
+	used   map[string]bool
+	engram map[int]EngramTable // Engram tables kept apart, by layer
 }
 
 func (w *weights) get(name string) (*Tensor, error) {

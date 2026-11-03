@@ -63,9 +63,12 @@ type Stats struct {
 // itself.
 type coordModel struct {
 	manifest *Manifest
-	embed    Matrix
-	head     *Head
-	tok      Codec
+	// A llama model's embedding, head and tokenizer.
+	embed Matrix
+	head  *Head
+	tok   Codec
+	// A DeepSeek model's.
+	ds *deepseekCoord
 }
 
 // ErrNoStages means no member can serve the model's layers.
@@ -82,6 +85,29 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 	if err != nil {
 		return nil, err
 	}
+	cm = &coordModel{manifest: m}
+	if m.ds != nil {
+		if cm.ds, err = s.deepseekCoordinator(ctx, m, providers); err != nil {
+			return nil, err
+		}
+	} else if err := s.llamaCoordinator(ctx, cm, providers); err != nil {
+		return nil, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if prev, ok := s.coords[model]; ok {
+		// A concurrent generation loaded it first: keep one copy.
+		if cm.head != nil && cm.head.Wcls.dev != nil {
+			cm.head.Wcls.dev.Free()
+		}
+		return prev, nil
+	}
+	s.coords[model] = cm
+	return cm, nil
+}
+
+func (s *Service) llamaCoordinator(ctx context.Context, cm *coordModel, providers []peer.ID) error {
+	m := cm.manifest
 	c := m.Config
 	part := func(idStr string, max int64) ([]byte, error) {
 		id, _ := blob.ParseID(idStr)
@@ -90,20 +116,19 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 		}
 		return s.blobs.Store().ReadAll(id, max)
 	}
-	cm = &coordModel{manifest: m}
 	embedSize := EmbedBytes(c)
 	data, err := part(m.Embed, embedSize)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if cm.embed, err = LoadEmbed(c, data); err != nil {
-		return nil, err
+		return err
 	}
 	if data, err = part(m.Head, embedSize+int64(4*c.Dim)); err != nil {
-		return nil, err
+		return err
 	}
 	if cm.head, err = LoadHead(c, data, cm.embed); err != nil {
-		return nil, err
+		return err
 	}
 	if d := s.cfg.Device; d != nil {
 		// The classifier is the coordinator's largest product. The host copy
@@ -113,32 +138,85 @@ func (s *Service) coordinator(ctx context.Context, model blob.ID, providers []pe
 		}
 	}
 	if data, err = part(m.Tokenizer, 64<<20); err != nil {
-		return nil, err
+		return err
 	}
-	if cm.tok, err = readCodec(m, data); err != nil {
-		return nil, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if prev, ok := s.coords[model]; ok {
-		// A concurrent generation loaded it first: keep one copy.
-		if cm.head.Wcls.dev != nil {
-			cm.head.Wcls.dev.Free()
-		}
-		return prev, nil
-	}
-	s.coords[model] = cm
-	return cm, nil
+	cm.tok, err = readCodec(m, data)
+	return err
 }
 
-// stageConn runs one stage of a generation, remotely or in this process.
+// prompt encodes a generation's prompt.
+func (cm *coordModel) prompt(req GenerateRequest) ([]int, error) {
+	if cm.ds != nil {
+		return cm.ds.prompt(req.Prompt, req.Chat)
+	}
+	m := cm.manifest
+	prompt := req.Prompt
+	if req.Chat {
+		if m.Chat == nil {
+			return nil, errors.New("the model has no chat format")
+		}
+		prompt = m.Chat.Prefix + prompt + m.Chat.Suffix
+	}
+	tokens := cm.tok.Encode(prompt)
+	if bos := m.bos(); bos >= 0 {
+		tokens = append([]int{bos}, tokens...)
+	}
+	return tokens, nil
+}
+
+func (cm *coordModel) stop() []int {
+	if cm.ds != nil {
+		return []int{cm.ds.head.Cfg.EOS}
+	}
+	return cm.manifest.stop()
+}
+
+func (cm *coordModel) piece(prev, next int) []byte {
+	if cm.ds != nil {
+		return cm.ds.tok.Piece(prev, next)
+	}
+	return cm.tok.Piece(prev, next)
+}
+
+// inputs are the first stage's input for positions from.. of tokens, the
+// prompt being their first prompt.
+func (cm *coordModel) inputs(tokens []int, from, prompt int) ([]byte, error) {
+	if cm.ds != nil {
+		return cm.ds.inputs(tokens, from, prompt)
+	}
+	c := cm.manifest.Config
+	xs := make([]float32, 0, (len(tokens)-from)*c.Dim)
+	for _, t := range tokens[from:] {
+		xs = append(xs, Embed(c, cm.embed, t)...)
+	}
+	return encodeActs(xs), nil
+}
+
+// logits are the next token's scores, from the last stage's output for
+// count positions.
+func (cm *coordModel) logits(out []byte, count, positions int) ([]float32, error) {
+	if cm.ds != nil {
+		return cm.ds.logits(out, count, positions)
+	}
+	c := cm.manifest.Config
+	if len(out) != 4*count*c.Dim {
+		return nil, errors.New("stage returned activations of the wrong size")
+	}
+	last := decodeActs(out[4*(count-1)*c.Dim:])
+	return cm.head.Logits(c, last), nil
+}
+
+// stageConn runs one stage of a generation, remotely or in this process,
+// on what passes between stages: activations for a llama model, dsv41's
+// Payloads for DeepSeek.
 type stageConn interface {
-	forward(xs []float32, pos, tokens int) error // in place
+	forward(in []byte, pos, tokens int) ([]byte, error)
 	close()
 }
 
 type remoteStage struct {
-	st network.Stream
+	st    network.Stream
+	shape shape
 	// perToken estimates a forward's duration per token, to tell a dead
 	// node from a slow one quickly: a killed process closes no connection,
 	// and QUIC would otherwise notice only after its idle timeout.
@@ -154,27 +232,23 @@ func (r *remoteStage) deadline(tokens int) time.Duration {
 	return 2*time.Second + time.Duration(tokens)*10*r.perToken
 }
 
-func (r *remoteStage) forward(xs []float32, pos, tokens int) error {
+func (r *remoteStage) forward(in []byte, pos, tokens int) ([]byte, error) {
 	start := time.Now()
 	r.st.SetDeadline(start.Add(r.deadline(tokens)))
 	b, _ := json.Marshal(request{Op: "forward", Pos: pos, Tokens: tokens})
 	if err := writeFrame(r.st, b); err != nil {
-		return err
+		return nil, err
 	}
-	if err := writeFrame(r.st, encodeActs(xs)); err != nil {
-		return err
+	if err := writeFrame(r.st, in); err != nil {
+		return nil, err
 	}
 	if err := readStatus(r.st); err != nil {
-		return err
+		return nil, err
 	}
-	out, err := readFrame(r.st, 4*len(xs))
+	out, err := readFrame(r.st, r.shape.payloadBytes(tokens))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if len(out) != 4*len(xs) {
-		return errors.New("stage returned activations of the wrong size")
-	}
-	copy(xs, decodeActs(out))
 	// Exponentially weighted average, per token.
 	sample := time.Since(start) / time.Duration(tokens)
 	if r.perToken == 0 {
@@ -182,23 +256,18 @@ func (r *remoteStage) forward(xs []float32, pos, tokens int) error {
 	} else {
 		r.perToken = (7*r.perToken + sample) / 8
 	}
-	return nil
+	return out, nil
 }
 
 func (r *remoteStage) close() { r.st.Close() }
 
 type localStage struct {
-	stage   *Stage
-	dim     int
+	stageConn
 	release func()
 }
 
-func (l *localStage) forward(xs []float32, pos, tokens int) error {
-	return l.stage.ForwardMany(xs, pos, tokens)
-}
-
 func (l *localStage) close() {
-	l.stage.Close()
+	l.stageConn.close()
 	l.release()
 }
 
@@ -209,13 +278,12 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 		if err != nil {
 			return nil, err
 		}
-		c := l.manifest.Config
-		unreserve, err := s.reserveCache(l, positions)
+		unreserve, err := s.reserveCache(l, from, to, positions)
 		if err != nil {
 			s.release(l)
 			return nil, err
 		}
-		return &localStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim, release: func() {
+		return &localStage{stageConn: l.open(positions), release: func() {
 			unreserve()
 			s.release(l)
 		}}, nil
@@ -239,7 +307,7 @@ func (s *Service) openStage(ctx context.Context, node peer.ID, model blob.ID, fr
 		st.Reset()
 		return nil, fmt.Errorf("%s: %w", node.ShortString(), err)
 	}
-	return &remoteStage{st: st}, nil
+	return &remoteStage{st: st, shape: s.manifestShape(model)}, nil
 }
 
 // planned is a stage of a running generation.
@@ -253,7 +321,7 @@ type planned struct {
 	// unwitnessed is set when no trusted node could witness the stage on
 	// its current node; it is not looked for again until the stage moves.
 	unwitnessed bool
-	inputs      []float32 // activations entering the stage, every position so far
+	inputs      []byte // what entered the stage, every position so far
 }
 
 // witness runs a stage placed on an untrusted guest a second time, on a
@@ -268,11 +336,11 @@ type witness struct {
 // positions, those already holding the range first, then the fastest.
 func (s *Service) candidates(model blob.ID, from, to, positions int, exclude map[peer.ID]bool) []peer.ID {
 	key := Shard{model.String(), from, to}
-	c := s.manifestConfig(model)
+	sh := s.manifestShape(model)
 	servers := s.servers()
 	var nodes []stageNode
-	for _, n := range s.stageNodes(model.String(), c, positions, exclude) {
-		if n.layers >= to-from {
+	for _, n := range s.stageNodes(model.String(), sh, positions, exclude) {
+		if n.fits(from, to) {
 			nodes = append(nodes, n)
 		}
 	}
@@ -288,6 +356,11 @@ func (s *Service) candidates(model blob.ID, from, to, positions int, exclude map
 	return append(loaded, others...)
 }
 
+// deepseekMaxTokens is a DeepSeek generation's default length: its
+// context of a million positions would have every stage reserve caches
+// for all of them.
+const deepseekMaxTokens = 4096
+
 // Generate runs a generation across the network, calling emit for every
 // token. A stage whose node fails is moved to another node and its cache
 // rebuilt from the inputs it had received, so the output is exactly what
@@ -302,37 +375,37 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	if err != nil {
 		return nil, err
 	}
-	c := cm.manifest.Config
-
 	m := cm.manifest
-	prompt := req.Prompt
-	if req.Chat {
-		if m.Chat == nil {
-			return nil, errors.New("the model has no chat format")
-		}
-		prompt = m.Chat.Prefix + prompt + m.Chat.Suffix
-	}
-	tokens := cm.tok.Encode(prompt)
-	if bos := m.bos(); bos >= 0 {
-		tokens = append([]int{bos}, tokens...)
+	sh := m.shape()
+	layers, seqLen := sh.numLayers(), m.seqLen()
+
+	tokens, err := cm.prompt(req)
+	if err != nil {
+		return nil, err
 	}
 	if len(tokens) == 0 {
 		return nil, errors.New("empty prompt")
 	}
-	if len(tokens) >= c.SeqLen {
-		return nil, fmt.Errorf("prompt of %d tokens fills the context of %d", len(tokens), c.SeqLen)
+	if len(tokens) >= seqLen {
+		return nil, fmt.Errorf("prompt of %d tokens fills the context of %d", len(tokens), seqLen)
 	}
 	stats := &Stats{PromptTokens: len(tokens)}
 	sampler := NewSampler(req.Temperature, req.Seed)
-	maxTokens := c.SeqLen - len(tokens)
+	maxTokens := seqLen - len(tokens)
 	if req.MaxTokens > 0 {
 		maxTokens = min(req.MaxTokens, maxTokens)
+	} else if m.ds != nil {
+		maxTokens = min(deepseekMaxTokens, maxTokens)
 	}
 	// Stages keep caches for exactly this many positions.
 	positions := len(tokens) + maxTokens
 
 	// Assign layers by the nodes' speed and memory.
-	spans, err := planStages(c.Layers, s.stageNodes(req.Model.String(), c, positions, nil), min(req.Stages, c.Layers))
+	cost := make([]int64, layers)
+	for i := range cost {
+		cost[i] = sh.readBytes(i)
+	}
+	spans, err := planStages(cost, s.stageNodes(req.Model.String(), sh, positions, nil), min(req.Stages, layers))
 	if err != nil {
 		return nil, err
 	}
@@ -364,27 +437,31 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	}
 
 	// Prefill: the whole prompt through each stage in one request.
-	xs := make([]float32, 0, len(tokens)*c.Dim)
-	for _, t := range tokens {
-		xs = append(xs, Embed(c, cm.embed, t)...)
+	prompt := len(tokens)
+	in, err := cm.inputs(tokens, 0, prompt)
+	if err != nil {
+		return nil, err
 	}
-	stop := m.stop()
+	stop := cm.stop()
 	var pending []byte // bytes of a character split across tokens
 	pos := 0
 	for stats.Tokens < maxTokens {
-		count := len(xs) / c.Dim
+		count := len(tokens) - pos
 		for _, st := range stages {
-			if err := s.runStage(ctx, req.Model, st, xs, pos, count, stages, providers, stats); err != nil {
+			if in, err = s.runStage(ctx, req.Model, st, in, pos, count, stages, providers, stats); err != nil {
 				return nil, err
 			}
 		}
+		logits, err := cm.logits(in, count, positions)
+		if err != nil {
+			return nil, err
+		}
 		pos += count
-		last := xs[(count-1)*c.Dim:]
-		next := sampler.Sample(cm.head.Logits(c, last))
+		next := sampler.Sample(logits)
 		if slices.Contains(stop, next) {
 			break
 		}
-		pending = append(pending, cm.tok.Piece(tokens[len(tokens)-1], next)...)
+		pending = append(pending, cm.piece(tokens[len(tokens)-1], next)...)
 		var text []byte
 		text, pending = validUTF8Prefix(pending)
 		if err := emit(Event{Token: next, Text: string(text)}); err != nil {
@@ -393,7 +470,9 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		pending = slices.Clone(pending)
 		tokens = append(tokens, next)
 		stats.Tokens++
-		xs = Embed(c, cm.embed, next)
+		if in, err = cm.inputs(tokens, pos, prompt); err != nil {
+			return nil, err
+		}
 	}
 	stats.Elapsed = time.Since(started)
 	for _, st := range stages {
@@ -425,26 +504,24 @@ func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude
 	return fmt.Errorf("layers %d..%d: %w", st.from, st.to, lastErr)
 }
 
-// runStage forwards activations through a stage, moving it to another
-// node if its node fails: the replacement's cache is rebuilt by replaying
-// the inputs the stage received so far, which the coordinator keeps. A
-// stage on an untrusted guest runs on a witness too, and the outputs are
-// compared; on a mismatch the witness takes the stage over and the guest
-// is reported as cheating.
-func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs []float32, pos, count int, all []*planned, providers []peer.ID, stats *Stats) error {
-	in := slices.Clone(xs)
-	gas := StageGas(s.manifestConfig(model), st.to-st.from, count)
+// runStage forwards a stage's input through it and returns its output,
+// moving the stage to another node if its node fails: the replacement's
+// cache is rebuilt by replaying the inputs the stage received so far,
+// which the coordinator keeps. A stage on an untrusted guest runs on a
+// witness too, and the outputs are compared byte for byte; on a mismatch
+// the witness takes the stage over and the guest is reported as cheating.
+func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, in []byte, pos, count int, all []*planned, providers []peer.ID, stats *Stats) ([]byte, error) {
+	gas := s.manifestShape(model).gas(st.from, st.to, count)
 	for attempt := 0; ; attempt++ {
 		s.ensureWitness(ctx, model, st, pos, providers)
-		var check []float32
+		var check []byte
 		var checkErr error
 		var wg sync.WaitGroup
 		w := st.witness
 		if w != nil {
-			check = slices.Clone(in)
-			wg.Go(func() { checkErr = w.conn.forward(check, pos, count) })
+			wg.Go(func() { check, checkErr = w.conn.forward(in, pos, count) })
 		}
-		err := st.conn.forward(xs, pos, count)
+		out, err := st.conn.forward(in, pos, count)
 		wg.Wait()
 		if w != nil {
 			switch {
@@ -458,14 +535,13 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs [
 				s.log.Warn("stage failed, its witness takes over", "node", st.node.ShortString(), "err", err)
 				st.conn.close()
 				st.node, st.conn, st.witness = w.node, w.conn, nil
-				copy(xs, check)
+				out, err = check, nil
 				stats.Failovers++
-				err = nil
-			case !bytes.Equal(encodeActs(xs), encodeActs(check)):
+			case !bytes.Equal(out, check):
 				s.cfg.Trust.Cheated(st.node, fmt.Sprintf("layers %d..%d: outputs differ from a trusted witness", st.from, st.to))
 				st.conn.close()
 				st.node, st.conn, st.witness = w.node, w.conn, nil
-				copy(xs, check)
+				out = check
 				stats.Caught++
 			default:
 				s.cfg.Trust.Verified(st.node)
@@ -477,13 +553,13 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs [
 				s.cfg.Trust.Consumed(st.node, gas)
 			}
 			st.inputs = append(st.inputs, in...)
-			return nil
+			return out, nil
 		}
 		if ctx.Err() != nil {
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 		if attempt >= 3 {
-			return fmt.Errorf("layers %d..%d: %w", st.from, st.to, err)
+			return nil, fmt.Errorf("layers %d..%d: %w", st.from, st.to, err)
 		}
 		s.log.Warn("stage failed, moving it", "node", st.node.ShortString(), "from", st.from, "to", st.to, "err", err)
 		if s.cfg.Trust != nil {
@@ -499,17 +575,15 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, xs [
 		if err := s.place(ctx, model, st, exclude, providers); err != nil {
 			// Doubling up on a node already in the pipeline beats failing.
 			if err = s.place(ctx, model, st, map[peer.ID]bool{st.node: true}, providers); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if pos > 0 {
-			replay := slices.Clone(st.inputs)
-			if err := st.conn.forward(replay, 0, pos); err != nil {
+			if _, err := st.conn.forward(st.inputs, 0, pos); err != nil {
 				continue
 			}
 		}
 		stats.Failovers++
-		copy(xs, in)
 	}
 }
 
@@ -534,7 +608,7 @@ func (s *Service) ensureWitness(ctx context.Context, model blob.ID, st *planned,
 			continue
 		}
 		if pos > 0 {
-			if err := conn.forward(slices.Clone(st.inputs), 0, pos); err != nil {
+			if _, err := conn.forward(st.inputs, 0, pos); err != nil {
 				conn.close()
 				continue
 			}
@@ -546,9 +620,9 @@ func (s *Service) ensureWitness(ctx context.Context, model blob.ID, st *planned,
 	s.log.Warn("no trusted node to witness a guest's stage; it runs unchecked", "node", st.node.ShortString(), "from", st.from, "to", st.to)
 }
 
-// manifestConfig returns the configuration of a model being coordinated.
-func (s *Service) manifestConfig(model blob.ID) Config {
+// manifestShape returns the shape of a model being coordinated.
+func (s *Service) manifestShape(model blob.ID) shape {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.coords[model].manifest.Config
+	return s.coords[model].manifest.shape()
 }

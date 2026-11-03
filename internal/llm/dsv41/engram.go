@@ -90,13 +90,26 @@ func (t *EngramTables) hash(hist []int64) [][]int64 {
 }
 
 // apply adds the layer's n-gram memory to the stream h ([hc][dim]): each
-// copy is gated by how well it matches that copy's key.
-func (e *engram) apply(h []float32, ids []int64, c *Config, act *num.ActFP8) {
+// copy is gated by how well it matches that copy's key. Only reading the
+// table can fail.
+func (e *engram) apply(h []float32, ids []int64, c *Config, act *num.ActFP8) error {
 	dim, hc := c.Dim, c.HCMult
+	rows := int64(c.EngramRows[e.index])
+	if len(ids) != (c.EngramMaxNgram-1)*c.EngramHeads {
+		return fmt.Errorf("dsv41: %d Engram rows for a position, want %d", len(ids), (c.EngramMaxNgram-1)*c.EngramHeads)
+	}
 	emb := make([]float32, len(ids)*e.dim)
+	q, sc := make([]byte, e.dim), make([]byte, e.dim/32)
 	for i, row := range ids {
-		q := e.rows[row*int64(e.dim) : (row+1)*int64(e.dim)]
-		sc := e.rowScales[row*int64(e.dim/32) : (row+1)*int64(e.dim/32)]
+		if row < 0 || row >= rows {
+			return fmt.Errorf("dsv41: Engram row %d outside the table's %d", row, rows)
+		}
+		if _, err := e.table.Rows.ReadAt(q, row*int64(e.dim)); err != nil {
+			return fmt.Errorf("dsv41: Engram table: %w", err)
+		}
+		if _, err := e.table.Scales.ReadAt(sc, row*int64(e.dim/32)); err != nil {
+			return fmt.Errorf("dsv41: Engram scales: %w", err)
+		}
 		for j, v := range q {
 			emb[i*e.dim+j] = bf16(num.DecodeE4M3(v) * num.DecodeE8M0(sc[j/32]))
 		}
@@ -119,4 +132,5 @@ func (e *engram) apply(h []float32, ids []int64, c *Config, act *num.ActFP8) {
 			x[d] = bf16(x[d] + float32(g*value[d]))
 		}
 	}
+	return nil
 }

@@ -1,6 +1,7 @@
 package dsv41
 
 import (
+	"fmt"
 	"math"
 	"slices"
 
@@ -23,7 +24,7 @@ type State struct {
 	compKV   [][][]float32 // [layer][group]: compressed KV of KV sources
 	indexK   [][][]float32 // [layer][group]: indexer keys of KV sources
 	compBuf  []compressorState
-	engram   []int64 // compressed ids of the last tokens, oldest first
+	tokens   []int // the last tokens, oldest first, for Engram's n-grams
 	act      num.ActFP8
 	prefillN int // prompt length while prefilling, else 0
 
@@ -62,70 +63,109 @@ func (s *State) Pos() int { return s.pos }
 
 // Prefill runs the prompt and returns the logits after its last token.
 func (s *State) Prefill(tokens []int) []float32 {
-	s.prefillN = len(tokens)
-	defer func() { s.prefillN = 0 }()
 	var logits []float32
 	for i, t := range tokens {
-		logits = s.step(t, i == len(tokens)-1)
+		logits = s.step(t, len(tokens), i == len(tokens)-1)
 	}
 	return logits
 }
 
 // Decode runs one token and returns the logits after it.
-func (s *State) Decode(token int) []float32 { return s.step(token, true) }
+func (s *State) Decode(token int) []float32 { return s.step(token, 0, true) }
 
 // shared is what attention layers hand down within a step: the latest
 // source's compressed KV and indexer keys, the latest selection and the
-// candidate pool (the reference's SharedAttentionRuntime).
+// candidate pool (the reference's SharedAttentionRuntime). source is the
+// latest KV source run, -1 for none, and newKV and newIdxK what it cached
+// at this position, if anything: a later pipeline stage's copy of its
+// caches grows by them.
 type shared struct {
 	compKV, indexK *[][]float32
 	topk           []int
 	candidates     []bool
+	source         int
+	newKV, newIdxK []float32
 }
 
-func (s *State) step(token int, wantLogits bool) []float32 {
-	m, c := s.m, s.m.Cfg
-	dim, hc := c.Dim, c.HCMult
-	pos := s.pos
-	s.pos++
-
-	h := make([]float32, hc*dim)
-	for k := range hc {
-		for d := range dim {
-			h[k*dim+d] = num.BF16(m.embed[token*dim+d])
-		}
+// step runs a whole model on one token, in one process.
+func (s *State) step(token, prefill int, wantLogits bool) []float32 {
+	h := s.m.head
+	s.tokens = append(s.tokens, token)
+	if len(s.tokens) > max(s.m.Cfg.EngramMaxNgram, 1) {
+		s.tokens = s.tokens[1:]
 	}
-	preMix := make([]float32, hc)
-	preMix[0] = 1
-
-	var hashes [][]int64
-	if m.engram != nil && len(c.EngramLayers) > 0 {
-		s.engram = append(s.engram, m.engram.TokenMap[token])
-		if len(s.engram) > m.engram.MaxNgram {
-			s.engram = s.engram[1:]
-		}
-		hashes = m.engram.hash(s.engram)
+	p, err := h.Embed(s.tokens, prefill)
+	if err == nil {
+		err = s.run(p, s.pos)
 	}
-
-	var sh shared
-	for i, b := range m.layers {
-		if b.engram != nil {
-			b.engram.apply(h, hashes[b.engram.index], c, &s.act)
-		}
-		preMix = s.block(b, h, preMix, pos, &sh)
-		if s.AfterBlock != nil {
-			s.AfterBlock(i, pos, h, preMix)
-		}
+	if err != nil {
+		panic(err) // a whole model in memory: only a bad token gets here
 	}
 	if !wantLogits {
 		return nil
 	}
-	x := make([]float32, dim)
-	hcPre(x, h, preMix)
-	rmsNorm(x, x, m.norm, c.NormEps)
-	logits := make([]float32, c.Vocab)
-	m.head.apply(logits, x, &s.act)
-	return logits
+	return h.Logits(p)
+}
+
+// run runs the blocks the model has on the payload of position pos, which
+// must be the state's next: the payload leaves as the next stage's input.
+func (s *State) run(p *Payload, pos int) error {
+	m, c := s.m, s.m.Cfg
+	if pos != s.pos {
+		return fmt.Errorf("dsv41: position %d, the stage expects %d", pos, s.pos)
+	}
+	if want := sourceBefore(c, m.from); p.Source != want {
+		return fmt.Errorf("dsv41: payload from the KV source %d, layer %d follows %d", p.Source, m.from, want)
+	}
+	sh := shared{source: p.Source, newKV: p.CompKV, newIdxK: p.IndexK, topk: p.TopK, candidates: p.Candidates}
+	if src := p.Source; src >= 0 {
+		// A copy of an earlier stage's caches.
+		if p.CompKV != nil {
+			s.compKV[src] = append(s.compKV[src], p.CompKV)
+		}
+		if p.IndexK != nil {
+			s.indexK[src] = append(s.indexK[src], p.IndexK)
+		}
+		if len(s.compKV[src]) > pos+1 || len(s.indexK[src]) > pos+1 {
+			return fmt.Errorf("dsv41: more compressed entries than positions")
+		}
+		sh.compKV, sh.indexK = &s.compKV[src], &s.indexK[src]
+		for _, g := range p.TopK {
+			if g >= len(s.compKV[src]) {
+				return fmt.Errorf("dsv41: selected entry %d of %d", g, len(s.compKV[src]))
+			}
+		}
+	} else if len(p.TopK) > 0 || p.CompKV != nil || p.IndexK != nil {
+		return fmt.Errorf("dsv41: compressed entries before any KV source")
+	}
+	s.pos++
+	s.prefillN = p.Prefill
+	for i := m.from; i < m.to; i++ {
+		b := m.layers[i]
+		if b.engram != nil {
+			if err := b.engram.apply(p.H, p.Hashes[b.engram.index], c, &s.act); err != nil {
+				return err
+			}
+		}
+		p.PreMix = s.block(b, p.H, p.PreMix, pos, &sh)
+		if s.AfterBlock != nil {
+			s.AfterBlock(i, pos, p.H, p.PreMix)
+		}
+	}
+	p.Source, p.CompKV, p.IndexK, p.TopK, p.Candidates = sh.source, sh.newKV, sh.newIdxK, sh.topk, sh.candidates
+	return nil
+}
+
+// sourceBefore is the latest KV source before layer l, -1 for none: whose
+// caches the layers from l on read until they reach a source of their own.
+func sourceBefore(c *Config, l int) int {
+	src := -1
+	for _, k := range c.KVSources {
+		if k < l && c.isKVSource(k) {
+			src = max(src, k)
+		}
+	}
+	return src
 }
 
 // mixes computes a sublayer's hyper-connection coefficients from the
@@ -288,6 +328,7 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 		if a.kvSource {
 			latent = s.compress(b, x, pos)
 			sh.compKV, sh.indexK = &s.compKV[b.id], &s.indexK[b.id]
+			sh.source, sh.newKV, sh.newIdxK = b.id, nil, nil
 		}
 		if a.idxSrc {
 			sh.topk = s.indexer(b, x, qr, latent, pos, sh)
@@ -299,6 +340,7 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 			a.rope.apply(latent[hd-rd:], pos+1-a.ratio, false)
 			num.FP4QuantInPlace(latent, num.FP4ScaleE4M3)
 			s.compKV[b.id] = append(s.compKV[b.id], latent)
+			sh.newKV = latent
 		}
 		for _, g := range sh.topk {
 			if g < 0 {
@@ -421,6 +463,7 @@ func (s *State) indexer(b *block, x, qr, latent []float32, pos int, sh *shared) 
 		a.rope.apply(k[id-rd:], pos+1-a.ratio, false)
 		num.FP4QuantInPlace(k, num.FP4ScaleE8M0)
 		s.indexK[b.id] = append(s.indexK[b.id], k)
+		sh.newIdxK = k
 	}
 	q := make([]float32, ih*id)
 	a.idxWqB.apply(q, qr, &s.act)

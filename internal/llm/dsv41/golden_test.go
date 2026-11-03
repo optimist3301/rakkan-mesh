@@ -261,12 +261,14 @@ func TestEngramMatchesReference(t *testing.T) {
 		var hist []int64
 		var d diff
 		for pos := range promptLen {
-			hist = append(hist, m.engram.TokenMap[tokens[pos]])
-			if len(hist) > m.engram.MaxNgram {
+			hist = append(hist, m.head.engram.TokenMap[tokens[pos]])
+			if len(hist) > m.head.engram.MaxNgram {
 				hist = hist[1:]
 			}
 			h := slices.Clone(row(g.f32(t, fmt.Sprintf("prefill.layer%d.h", layer-1)), pos, width))
-			b.engram.apply(h, m.engram.hash(hist)[b.engram.index], c, &act)
+			if err := b.engram.apply(h, m.head.engram.hash(hist)[b.engram.index], c, &act); err != nil {
+				t.Fatal(err)
+			}
 			d.add(h, row(g.f32(t, fmt.Sprintf("prefill.layer%d.engram", layer)), pos, width))
 		}
 		if d.same != d.n {

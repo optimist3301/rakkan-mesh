@@ -1,7 +1,9 @@
 package dsv41
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -9,15 +11,31 @@ import (
 )
 
 // Model is a loaded DeepSeek-V4.1 (the backbone; DSpark and vision are
-// not loaded yet).
+// not loaded yet), or a part of one: the blocks of a pipeline stage
+// (NewPart), without the head.
 type Model struct {
+	Cfg      *Config
+	head     *Head
+	layers   []*block // by layer; nil outside [from, to)
+	from, to int
+	ropes    [2]*rope // without and with compression
+}
+
+// Head is what a pipeline's coordinator runs itself: the embedding, the
+// Engram hashes over the token history, the final norm and the classifier.
+type Head struct {
 	Cfg    *Config
 	embed  []uint16 // [vocab, dim] bf16
 	norm   []float32
 	head   *linear // bf16 widened to float32, float32 logits
-	layers []*block
 	engram *EngramTables
-	ropes  [2]*rope // without and with compression
+}
+
+// EngramTable is the n-gram memory of an Engram layer, which may stay on
+// disk: FP8 rows [rows, engram dim] and their E8M0 scales [rows, dim/32].
+// A step reads 24 rows of it. Both must allow concurrent reads.
+type EngramTable struct {
+	Rows, Scales io.ReaderAt
 }
 
 type block struct {
@@ -64,12 +82,11 @@ type moe struct {
 type expert struct{ w1, w2, w3 *linear }
 
 type engram struct {
-	index     int    // which Engram layer, for its hash tables
-	rows      []byte // FP8 [rows, dim]
-	rowScales []byte // E8M0 [rows, dim/32]
-	dim       int
-	wkv       *linear
-	qk        []float32 // q_weight·k_weight, [hc, model dim]
+	index int // which Engram layer, for its hash tables
+	table EngramTable
+	dim   int
+	wkv   *linear
+	qk    []float32 // q_weight·k_weight, [hc, model dim]
 }
 
 // Load reads a model from a directory with config.json, the safetensors
@@ -103,8 +120,47 @@ func Load(dir string, tables *EngramTables) (*Model, error) {
 // checkpoint.
 func New(cfg *Config, tensors map[string]*Tensor, tables *EngramTables) (*Model, error) {
 	w := &weights{t: tensors, used: map[string]bool{}}
-	c := cfg
-	m := &Model{Cfg: c, engram: tables, ropes: [2]*rope{newRope(c, false), newRope(c, true)}}
+	h, err := newHead(w, cfg, tables)
+	if err != nil {
+		return nil, err
+	}
+	m, err := newPart(w, cfg, 0, cfg.Layers, nil)
+	if err != nil {
+		return nil, err
+	}
+	m.head = h
+	return m, w.unused()
+}
+
+// NewPart builds blocks [from, to) of a model, for a pipeline stage, from
+// their tensors. The Engram tables of its Engram layers are read through
+// engram (by layer) when given, else they must be among the tensors.
+func NewPart(cfg *Config, tensors map[string]*Tensor, from, to int, engram map[int]EngramTable) (*Model, error) {
+	if from < 0 || to > cfg.Layers || from >= to {
+		return nil, fmt.Errorf("dsv41: layers %d..%d outside the model's %d", from, to, cfg.Layers)
+	}
+	w := &weights{t: tensors, used: map[string]bool{}, engram: engram}
+	m, err := newPart(w, cfg, from, to, engram)
+	if err != nil {
+		return nil, err
+	}
+	return m, w.unused()
+}
+
+// NewHead builds a coordinator's part of a model from its tensors
+// (embed.weight, norm.weight, head.weight). tables are the Engram hash
+// tables (BuildEngramTables), needed when the model has Engram layers.
+func NewHead(cfg *Config, tensors map[string]*Tensor, tables *EngramTables) (*Head, error) {
+	w := &weights{t: tensors, used: map[string]bool{}}
+	h, err := newHead(w, cfg, tables)
+	if err != nil {
+		return nil, err
+	}
+	return h, w.unused()
+}
+
+func newHead(w *weights, c *Config, tables *EngramTables) (*Head, error) {
+	h := &Head{Cfg: c, engram: tables}
 	if len(c.EngramLayers) > 0 {
 		if err := tables.check(c); err != nil {
 			return nil, err
@@ -117,23 +173,34 @@ func New(cfg *Config, tensors map[string]*Tensor, tables *EngramTables) (*Model,
 	if t.DType != "BF16" || !shapeIs(t, c.Vocab, c.Dim) {
 		return nil, fmt.Errorf("dsv41: embed.weight %s %v", t.DType, t.Shape)
 	}
-	m.embed = toBF16(t)
-	if m.norm, err = w.vec("norm.weight", c.Dim); err != nil {
+	h.embed = toBF16(t)
+	if h.norm, err = w.vec("norm.weight", c.Dim); err != nil {
 		return nil, err
 	}
-	if m.head, err = w.lin("head", c.Vocab, c.Dim, kindBF16F32); err != nil {
+	if h.head, err = w.lin("head", c.Vocab, c.Dim, kindBF16F32); err != nil {
 		return nil, err
 	}
-	for i := range c.Layers {
+	return h, nil
+}
+
+func newPart(w *weights, c *Config, from, to int, engram map[int]EngramTable) (*Model, error) {
+	m := &Model{Cfg: c, from: from, to: to, ropes: [2]*rope{newRope(c, false), newRope(c, true)}}
+	m.layers = make([]*block, c.Layers)
+	for i := from; i < to; i++ {
 		b, err := m.loadBlock(w, i)
 		if err != nil {
 			return nil, err
 		}
-		m.layers = append(m.layers, b)
+		m.layers[i] = b
 	}
-	// Everything but DSpark, vision and the image routing biases is used.
+	return m, nil
+}
+
+// unused reports tensors given and not used, but for DSpark's, vision's
+// and the image routing biases.
+func (w *weights) unused() error {
 	var unused []string
-	for name := range tensors {
+	for name := range w.t {
 		if !w.used[name] && !strings.HasPrefix(name, "mtp.") && !strings.HasPrefix(name, "vision.") &&
 			!strings.HasPrefix(name, "aligner.") && !strings.HasPrefix(name, "image_") && !strings.HasSuffix(name, ".bias_vl") {
 			unused = append(unused, name)
@@ -141,10 +208,13 @@ func New(cfg *Config, tensors map[string]*Tensor, tables *EngramTables) (*Model,
 	}
 	if len(unused) > 0 {
 		sort.Strings(unused)
-		return nil, fmt.Errorf("dsv41: unexpected tensors: %v", unused)
+		return fmt.Errorf("dsv41: unexpected tensors: %v", unused)
 	}
-	return m, nil
+	return nil
 }
+
+// Head is the coordinator's part of a whole model.
+func (m *Model) Head() *Head { return m.head }
 
 func (m *Model) loadBlock(w *weights, i int) (*block, error) {
 	c := m.Cfg
@@ -235,16 +305,20 @@ func (m *Model) loadBlock(w *weights, i int) (*block, error) {
 
 	if k := slices.Index(c.EngramLayers, i); k >= 0 && err == nil {
 		e := &engram{index: k, dim: c.EngramDim}
-		var emb, sc *Tensor
-		if emb, err = w.get(p + "engram.embed.weight"); err == nil {
-			sc, err = w.get(p + "engram.embed.scale")
-		}
-		if err == nil && (emb.DType != "F8_E4M3" || !shapeIs(emb, c.EngramRows[k], c.EngramDim) ||
-			sc.DType != "F8_E8M0" || !shapeIs(sc, c.EngramRows[k], c.EngramDim/32)) {
-			err = fmt.Errorf("dsv41: layer %d: engram table %s %v, scales %s %v", i, emb.DType, emb.Shape, sc.DType, sc.Shape)
-		}
-		if err == nil {
-			e.rows, e.rowScales = emb.Data, sc.Data
+		if tab, ok := w.engram[i]; ok {
+			e.table = tab
+		} else {
+			var emb, sc *Tensor
+			if emb, err = w.get(p + "engram.embed.weight"); err == nil {
+				sc, err = w.get(p + "engram.embed.scale")
+			}
+			if err == nil && (emb.DType != "F8_E4M3" || !shapeIs(emb, c.EngramRows[k], c.EngramDim) ||
+				sc.DType != "F8_E8M0" || !shapeIs(sc, c.EngramRows[k], c.EngramDim/32)) {
+				err = fmt.Errorf("dsv41: layer %d: engram table %s %v, scales %s %v", i, emb.DType, emb.Shape, sc.DType, sc.Shape)
+			}
+			if err == nil {
+				e.table = EngramTable{Rows: bytes.NewReader(emb.Data), Scales: bytes.NewReader(sc.Data)}
+			}
 		}
 		cols := (c.EngramMaxNgram - 1) * c.EngramHeads
 		lin(&e.wkv, "engram.wkv", c.Dim*(c.HCMult+1), cols*c.EngramDim, kindFP8)

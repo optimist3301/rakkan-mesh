@@ -357,9 +357,9 @@ func TestGuestStageIsWitnessed(t *testing.T) {
 	// Once cheating, the guest corrupts one activation on its 6th forward.
 	var cheating atomic.Bool
 	var forwards atomic.Int64
-	guest.llm.tamper = func(_ Shard, xs []float32) {
+	guest.llm.tamper = func(_ Shard, out []byte) {
 		if cheating.Load() && forwards.Add(1) == 6 {
-			xs[0] += 1e-6
+			out[0] ^= 1 // the lowest bit of the first activation
 		}
 	}
 

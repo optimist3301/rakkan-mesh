@@ -56,6 +56,8 @@ type Config struct {
 	EngramVocab, EngramPad, EngramCompressed int
 	MTPLayers                                int
 	BOS, EOS                                 int
+	// MaxPositions is the longest context the model was trained for.
+	MaxPositions int
 }
 
 type hfConfig struct {
@@ -83,6 +85,7 @@ type hfConfig struct {
 		Act         string  `json:"hidden_act"`
 		SwiGLULimit float64 `json:"swiglu_limit"`
 		NormEps     float64 `json:"rms_norm_eps"`
+		MaxPos      int     `json:"max_position_embeddings"`
 		RopeTheta   float64 `json:"rope_theta"`
 		RopeScaling struct {
 			Type     string  `json:"rope_type"`
@@ -169,6 +172,7 @@ func ParseConfig(b []byte) (*Config, error) {
 		RopeTheta: t.RopeTheta, CompressRopeTheta: t.CompressRopeTheta,
 		RopeFactor: t.RopeScaling.Factor, BetaFast: t.RopeScaling.BetaFast, BetaSlow: t.RopeScaling.BetaSlow,
 		OriginalSeqLen: t.RopeScaling.Original,
+		MaxPositions:   t.MaxPos,
 		IndexHeads:     t.IndexHeads, IndexDim: t.IndexDim, IndexTopK: t.IndexTopK,
 		CandidateSource: -1, CandidateBlocks: t.CandidateBlocks, CandidateBlockSize: t.CandidateBlockSize,
 		HCMult: t.HCMult, HCSinkhornIters: t.HCSinkhornIters, HCEps: float32(t.HCEps),

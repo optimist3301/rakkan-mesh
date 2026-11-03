@@ -588,6 +588,19 @@ func (s *Server) importHF(w http.ResponseWriter, req importRequest, read func(st
 		defer r.Close()
 		src.Weights = append(src.Weights, r)
 	}
+	if llm.IsDeepSeek(src.Config) {
+		if req.Quant != "" {
+			badRequest(w, "DeepSeek-V4.1 keeps its own quantization")
+			return
+		}
+		id, m, err := llm.ImportDeepSeek(s.Blobs, src, req.Name)
+		if err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.ModelConfig, "chat": true})
+		return
+	}
 	id, m, err := llm.ImportHF(s.Blobs, src, req.Name)
 	if err != nil {
 		badRequest(w, "%v", err)

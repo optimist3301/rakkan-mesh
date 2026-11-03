@@ -1,0 +1,475 @@
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"slices"
+	"sort"
+	"sync"
+
+	"github.com/libp2p/go-libp2p/core/peer"
+
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
+)
+
+// DeepSeek-V4.1 (package dsv41) in the pipeline. Its blocks are stored a
+// blob each, as safetensors with the checkpoint's own tensors, but for the
+// Engram tables (tens of GiB each): those are blobs of their own, which a
+// stage reads a few rows of per token from its blob store instead of
+// holding them in memory. What passes between stages is dsv41's Payload,
+// and a coordinator embeds, hashes n-grams and classifies itself.
+
+func parseManifestV2(m *Manifest) (*Manifest, error) {
+	if m.Arch != "dsv41" {
+		return nil, fmt.Errorf("model manifest: architecture %q", m.Arch)
+	}
+	c, err := dsv41.ParseConfig(m.ModelConfig)
+	if err != nil {
+		return nil, fmt.Errorf("model manifest: %w", err)
+	}
+	if len(m.Layers) != c.Layers || len(m.Engram) != c.Layers {
+		return nil, fmt.Errorf("model manifest lists %d layers and %d Engram tables, config says %d", len(m.Layers), len(m.Engram), c.Layers)
+	}
+	ids := append([]string{m.Head, m.Tokenizer}, m.Layers...)
+	for i, e := range m.Engram {
+		if (e != "") != slices.Contains(c.EngramLayers, i) {
+			return nil, fmt.Errorf("model manifest: Engram table of layer %d", i)
+		}
+		if e != "" {
+			ids = append(ids, e)
+		}
+	}
+	for _, id := range ids {
+		if _, err := blob.ParseID(id); err != nil {
+			return nil, fmt.Errorf("model manifest: %w", err)
+		}
+	}
+	m.ds = c
+	return m, nil
+}
+
+// shape returns what planning needs of the model's layers.
+func (m *Manifest) shape() shape {
+	if m.ds != nil {
+		return dsShape{m.ds}
+	}
+	return llamaShape{m.Config}
+}
+
+func (m *Manifest) layers() int { return m.shape().numLayers() }
+
+// seqLen is the longest generation the model runs.
+func (m *Manifest) seqLen() int {
+	if m.ds != nil {
+		return m.ds.MaxPositions
+	}
+	return m.Config.SeqLen
+}
+
+type llamaShape struct{ c Config }
+
+func (s llamaShape) numLayers() int       { return s.c.Layers }
+func (s llamaShape) layerBytes(int) int64 { return LayerBytes(s.c) }
+func (s llamaShape) diskBytes(int) int64  { return 0 }
+func (s llamaShape) readBytes(int) int64  { return LayerBytes(s.c) }
+func (s llamaShape) cacheBytes(from, to, positions int) int64 {
+	return CacheBytes(s.c, to-from, positions)
+}
+func (s llamaShape) gas(from, to, tokens int) int64 { return StageGas(s.c, to-from, tokens) }
+func (s llamaShape) payloadBytes(tokens int) int    { return 4 * tokens * s.c.Dim }
+
+type dsShape struct{ c *dsv41.Config }
+
+func (s dsShape) numLayers() int         { return s.c.Layers }
+func (s dsShape) layerBytes(i int) int64 { return dsv41.LayerBytes(s.c, i) }
+func (s dsShape) diskBytes(i int) int64  { return dsv41.EngramTableBytes(s.c, i) }
+func (s dsShape) readBytes(i int) int64  { return dsv41.ActiveBytes(s.c, i) }
+func (s dsShape) cacheBytes(from, to, positions int) int64 {
+	return dsv41.CacheBytes(s.c, from, to, positions)
+}
+
+// gas is eight per weight a token is multiplied by, as for llama models:
+// the experts a token is routed to, not all of them.
+func (s dsShape) gas(from, to, tokens int) int64 {
+	var n int64
+	for i := from; i < to; i++ {
+		n += dsv41.ActiveParams(s.c, i)
+	}
+	return 8 * n * int64(tokens)
+}
+func (s dsShape) payloadBytes(tokens int) int { return tokens * dsv41.MaxPayloadBytes(s.c) }
+
+// IsDeepSeek reports whether a config.json is DeepSeek-V4.1's, which
+// ImportDeepSeek imports rather than ImportHF.
+func IsDeepSeek(config []byte) bool {
+	var c struct {
+		Text struct {
+			ModelType string `json:"model_type"`
+		} `json:"text_config"`
+	}
+	return json.Unmarshal(config, &c) == nil && c.Text.ModelType == "deepseek_v41_text"
+}
+
+// ImportDeepSeek stores a DeepSeek-V4.1 checkpoint (config.json,
+// tokenizer.json and the safetensors shards) as blobs and returns the
+// model's ID. Tensors are copied from the shards a block at a time, so
+// memory stays small whatever the checkpoint's size.
+func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Manifest, error) {
+	c, err := dsv41.ParseConfig(src.Config)
+	if err != nil {
+		return blob.ID{}, nil, err
+	}
+	if _, err := ReadBPE(src.Tokenizer, c.Vocab); err != nil {
+		return blob.ID{}, nil, err
+	}
+	tensors := map[string]*stTensor{}
+	for _, f := range src.Weights {
+		if err := readSafetensors(f, tensors); err != nil {
+			return blob.ID{}, nil, err
+		}
+	}
+	groups := map[int][]string{}
+	var head []string
+	for name := range tensors {
+		if l, ok := dsv41.TensorLayer(name); ok && l < c.Layers {
+			groups[l] = append(groups[l], name)
+		} else if dsv41.IsHeadTensor(name) {
+			head = append(head, name)
+		}
+		// The rest is DSpark and vision, not run yet.
+	}
+	m := &Manifest{Version: 2, Name: name, Arch: "dsv41", ModelConfig: src.Config, TokenizerFormat: "hf"}
+	put := func(r io.Reader) (string, error) {
+		id, _, err := store.Put(r)
+		return id.String(), err
+	}
+	if m.Head, err = put(safetensorsReader(tensors, head)); err != nil {
+		return blob.ID{}, nil, err
+	}
+	for i := range c.Layers {
+		names := groups[i]
+		engram := ""
+		if slices.Contains(c.EngramLayers, i) {
+			p := fmt.Sprintf("layers.%d.engram.embed.", i)
+			rows, scales := tensors[p+"weight"], tensors[p+"scale"]
+			if rows == nil || scales == nil {
+				return blob.ID{}, nil, fmt.Errorf("layer %d: Engram table missing", i)
+			}
+			if engram, err = put(io.MultiReader(rows.reader(), scales.reader())); err != nil {
+				return blob.ID{}, nil, err
+			}
+			names = slices.DeleteFunc(names, func(n string) bool { return n == p+"weight" || n == p+"scale" })
+		}
+		id, err := put(safetensorsReader(tensors, names))
+		if err != nil {
+			return blob.ID{}, nil, err
+		}
+		m.Layers = append(m.Layers, id)
+		m.Engram = append(m.Engram, engram)
+	}
+	if m.Tokenizer, err = put(bytesReader(src.Tokenizer)); err != nil {
+		return blob.ID{}, nil, err
+	}
+	data, _ := json.Marshal(m)
+	parsed, err := ParseManifest(data)
+	if err != nil {
+		return blob.ID{}, nil, err
+	}
+	// Each part must load: shapes and types as the config says.
+	if err := checkDeepSeekParts(store, parsed); err != nil {
+		return blob.ID{}, nil, err
+	}
+	id, err := store.PutBytes(data)
+	return id, parsed, err
+}
+
+// checkDeepSeekParts loads each block of an imported model once.
+func checkDeepSeekParts(store *blob.Store, m *Manifest) error {
+	c := m.ds
+	for i := range c.Layers {
+		_, closer, err := loadDeepSeekPart(store.ReadAll, store.Open, m, i, i+1)
+		if err != nil {
+			return fmt.Errorf("layer %d: %w", i, err)
+		}
+		closer()
+	}
+	tok, err := store.ReadAll(mustID(m.Tokenizer), 64<<20)
+	if err != nil {
+		return err
+	}
+	_, err = newDeepseekCoord(m, tok, func(max int64) ([]byte, error) { return store.ReadAll(mustID(m.Head), max) })
+	return err
+}
+
+func mustID(s string) blob.ID {
+	id, _ := blob.ParseID(s)
+	return id
+}
+
+// safetensorsReader streams a safetensors file of the named tensors,
+// sorted by name, from the shards they are in.
+func safetensorsReader(tensors map[string]*stTensor, names []string) io.Reader {
+	names = slices.Clone(names)
+	sort.Strings(names)
+	type entry struct {
+		DType   string   `json:"dtype"`
+		Shape   []int    `json:"shape"`
+		Offsets [2]int64 `json:"data_offsets"`
+	}
+	h := map[string]entry{}
+	var off int64
+	var parts []io.Reader
+	for _, n := range names {
+		t := tensors[n]
+		size := t.Offsets[1] - t.Offsets[0]
+		h[n] = entry{t.DType, t.Shape, [2]int64{off, off + size}}
+		off += size
+		parts = append(parts, t.reader())
+	}
+	hdr, _ := json.Marshal(h)
+	// The header is padded with spaces to 8 bytes, as the format asks.
+	for len(hdr)%8 != 0 {
+		hdr = append(hdr, ' ')
+	}
+	var n [8]byte
+	for i := range 8 {
+		n[i] = byte(uint64(len(hdr)) >> (8 * i))
+	}
+	return io.MultiReader(append([]io.Reader{bytesReader(n[:]), bytesReader(hdr)}, parts...)...)
+}
+
+func (t *stTensor) reader() io.Reader {
+	return io.NewSectionReader(t.file, t.base+t.Offsets[0], t.Offsets[1]-t.Offsets[0])
+}
+
+type byteSlice []byte
+
+func bytesReader(b []byte) io.Reader { return io.NewSectionReader(byteSlice(b), 0, int64(len(b))) }
+
+func (b byteSlice) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(b)) {
+		return 0, io.EOF
+	}
+	n := copy(p, b[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// loadDeepSeekPart builds blocks [from, to) of a model from its blobs:
+// read reads a block's blob whole, open opens an Engram table's for reads
+// as the blocks run. close releases the tables.
+func loadDeepSeekPart(read func(blob.ID, int64) ([]byte, error), open func(blob.ID) (*blob.Reader, error),
+	m *Manifest, from, to int) (*dsv41.Model, func(), error) {
+	c := m.ds
+	tensors := map[string]*dsv41.Tensor{}
+	engram := map[int]dsv41.EngramTable{}
+	var readers []*blob.Reader
+	closer := func() {
+		for _, r := range readers {
+			r.Close()
+		}
+	}
+	fail := func(err error) (*dsv41.Model, func(), error) {
+		closer()
+		return nil, nil, err
+	}
+	for i := from; i < to; i++ {
+		data, err := read(mustID(m.Layers[i]), dsv41.LayerBytes(c, i))
+		if err != nil {
+			return fail(err)
+		}
+		ts, err := dsv41.ParseSafetensors(data)
+		if err != nil {
+			return fail(fmt.Errorf("layer %d: %w", i, err))
+		}
+		for name, t := range ts {
+			if l, ok := dsv41.TensorLayer(name); !ok || l != i {
+				return fail(fmt.Errorf("layer %d: tensor %s", i, name))
+			}
+			tensors[name] = t
+		}
+		if m.Engram[i] != "" {
+			r, err := open(mustID(m.Engram[i]))
+			if err != nil {
+				return fail(err)
+			}
+			readers = append(readers, r)
+			size := dsv41.EngramTableBytes(c, i)
+			if r.Size() != size {
+				return fail(fmt.Errorf("layer %d: Engram table of %d bytes, want %d", i, r.Size(), size))
+			}
+			at := &lockedReaderAt{r: r}
+			rows := size / 33 * 32
+			engram[i] = dsv41.EngramTable{Rows: io.NewSectionReader(at, 0, rows), Scales: io.NewSectionReader(at, rows, size-rows)}
+		}
+	}
+	part, err := dsv41.NewPart(c, tensors, from, to, engram)
+	if err != nil {
+		return fail(err)
+	}
+	return part, closer, nil
+}
+
+// lockedReaderAt serializes reads of a blob: its reader caches a chunk.
+type lockedReaderAt struct {
+	mu sync.Mutex
+	r  *blob.Reader
+}
+
+func (l *lockedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.r.ReadAt(p, off)
+}
+
+// loadDeepSeek loads a shard of a DeepSeek model on a serving node.
+func (s *Service) loadDeepSeek(ctx context.Context, m *Manifest, from, to int, providers []peer.ID) (*dsv41.Model, func(), int64, error) {
+	sh := m.shape()
+	var size int64
+	for i := from; i < to; i++ {
+		size += sh.layerBytes(i)
+	}
+	if err := s.reserve(size); err != nil {
+		return nil, nil, 0, err
+	}
+	defer s.unreserve(size) // accounted by the caller once loaded
+	for i := from; i < to; i++ {
+		if err := s.blobs.Fetch(ctx, mustID(m.Layers[i]), providers, sh.layerBytes(i)); err != nil {
+			return nil, nil, 0, err
+		}
+		if m.Engram[i] != "" {
+			if err := s.blobs.Fetch(ctx, mustID(m.Engram[i]), providers, sh.diskBytes(i)); err != nil {
+				return nil, nil, 0, err
+			}
+		}
+	}
+	store := s.blobs.Store()
+	part, closer, err := loadDeepSeekPart(store.ReadAll, store.Open, m, from, to)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	return part, closer, size, nil
+}
+
+// deepseekStage runs a DeepSeek stage on Payloads.
+type deepseekStage struct {
+	c         *dsv41.Config
+	stage     *dsv41.Stage
+	positions int
+}
+
+func (d *deepseekStage) forward(in []byte, pos, tokens int) ([]byte, error) {
+	ps, err := dsv41.DecodePayloads(in, d.c, tokens, d.positions)
+	if err != nil {
+		return nil, err
+	}
+	for t, p := range ps {
+		if err := d.stage.Forward(p, pos+t); err != nil {
+			return nil, err
+		}
+	}
+	return dsv41.EncodePayloads(d.c, ps)
+}
+
+func (d *deepseekStage) close() {}
+
+// deepseekCoord is a coordinator's part of a DeepSeek model.
+type deepseekCoord struct {
+	head *dsv41.Head
+	tok  *BPE
+}
+
+func (s *Service) deepseekCoordinator(ctx context.Context, m *Manifest, providers []peer.ID) (*deepseekCoord, error) {
+	part := func(idStr string, max int64) ([]byte, error) {
+		id := mustID(idStr)
+		if err := s.blobs.Fetch(ctx, id, providers, max); err != nil {
+			return nil, err
+		}
+		return s.blobs.Store().ReadAll(id, max)
+	}
+	data, err := part(m.Tokenizer, 64<<20)
+	if err != nil {
+		return nil, err
+	}
+	return newDeepseekCoord(m, data, func(max int64) ([]byte, error) { return part(m.Head, max) })
+}
+
+// newDeepseekCoord builds a coordinator's part from the tokenizer and the
+// head's blob: the Engram hash tables come from the tokenizer.
+func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func(max int64) ([]byte, error)) (*deepseekCoord, error) {
+	c := m.ds
+	tok, err := ReadBPE(tokenizer, c.Vocab)
+	if err != nil {
+		return nil, err
+	}
+	var tables *dsv41.EngramTables
+	if len(c.EngramLayers) > 0 {
+		if tables, err = dsv41.BuildEngramTables(c, tok); err != nil {
+			return nil, err
+		}
+	}
+	data, err := readHead(dsv41.HeadBytes(c))
+	if err != nil {
+		return nil, err
+	}
+	ts, err := dsv41.ParseSafetensors(data)
+	if err != nil {
+		return nil, err
+	}
+	head, err := dsv41.NewHead(c, ts, tables)
+	if err != nil {
+		return nil, err
+	}
+	return &deepseekCoord{head: head, tok: tok}, nil
+}
+
+// prompt encodes a generation's prompt: in the chat format, as one user
+// message answered without reasoning, if asked.
+func (d *deepseekCoord) prompt(text string, chat bool) ([]int, error) {
+	c := d.head.Cfg
+	if !chat {
+		return append([]int{c.BOS}, d.tok.Encode(text)...), nil
+	}
+	msg := dsv41.NewObject()
+	msg.Set("role", dsv41.NewString("user"))
+	msg.Set("content", dsv41.NewString(text))
+	p, _, err := dsv41.EncodeChat([]*dsv41.Value{msg}, dsv41.ChatOptions{ThinkingMode: "chat"})
+	if err != nil {
+		return nil, err
+	}
+	return d.tok.Encode(p), nil
+}
+
+// inputs are the Payloads of positions from.. of tokens; prompt is the
+// prompt's length.
+func (d *deepseekCoord) inputs(tokens []int, from, prompt int) ([]byte, error) {
+	var b []byte
+	for pos := from; pos < len(tokens); pos++ {
+		prefill := 0
+		if pos < prompt {
+			prefill = prompt
+		}
+		p, err := d.head.Embed(tokens[:pos+1], prefill)
+		if err != nil {
+			return nil, err
+		}
+		if b, err = dsv41.AppendPayload(b, d.head.Cfg, p); err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
+// logits are the scores after the last of count positions' Payloads.
+func (d *deepseekCoord) logits(out []byte, count, positions int) ([]float32, error) {
+	ps, err := dsv41.DecodePayloads(out, d.head.Cfg, count, positions)
+	if err != nil {
+		return nil, err
+	}
+	return d.head.Logits(ps[count-1]), nil
+}

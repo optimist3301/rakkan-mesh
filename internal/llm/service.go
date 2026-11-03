@@ -20,6 +20,7 @@ import (
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/gpu"
+	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
@@ -73,6 +74,9 @@ type advert struct {
 	// Device is set. FreeCache, if set, is memory for caches apart.
 	FreeMem   int64 `json:"free_mem"`
 	FreeCache int64 `json:"free_cache,omitempty"`
+	// FreeDisk is the blob store's room, for parts read from disk as
+	// they are used (DeepSeek-V4.1's Engram tables).
+	FreeDisk int64 `json:"free_disk,omitempty"`
 	// Speed is how fast the node streams weights through a product, in
 	// GB/s: what a forward pass costs it, per byte of layers.
 	Speed    float64 `json:"speed"`
@@ -123,14 +127,16 @@ type Service struct {
 	cancel   context.CancelFunc
 	wg       sync.WaitGroup
 	changed  chan struct{}
-	failNext func(Shard) bool       // for tests: fail a stage's next forward
-	tamper   func(Shard, []float32) // for tests: alter a stage's outputs
+	failNext func(Shard) bool    // for tests: fail a stage's next forward
+	tamper   func(Shard, []byte) // for tests: alter a stage's outputs
 }
 
 type loaded struct {
 	manifest *Manifest
-	layers   []*Layer
+	layers   []*Layer // a llama model's
 	rope     *Rope
+	ds       *dsv41.Model // a DeepSeek model's blocks
+	dsClose  func()       // releases their Engram tables
 	bytes    int64
 	onDevice bool // bytes are device memory
 	users    int
@@ -138,6 +144,36 @@ type loaded struct {
 	ready    chan struct{} // closed once loaded
 	err      error
 }
+
+func (l *loaded) isLoaded() bool { return l.layers != nil || l.ds != nil }
+
+// open starts a stage of a generation of positions on the shard.
+func (l *loaded) open(positions int) stageConn {
+	if l.ds != nil {
+		return &deepseekStage{c: l.manifest.ds, stage: l.ds.NewStage(), positions: positions}
+	}
+	c := l.manifest.Config
+	return &llamaStage{stage: NewStage(c, l.layers, l.rope, positions), dim: c.Dim}
+}
+
+// llamaStage runs a llama stage on activations.
+type llamaStage struct {
+	stage *Stage
+	dim   int
+}
+
+func (l *llamaStage) forward(in []byte, pos, tokens int) ([]byte, error) {
+	if len(in) != 4*tokens*l.dim {
+		return nil, errors.New("activations of the wrong size")
+	}
+	xs := decodeActs(in)
+	if err := l.stage.ForwardMany(xs, pos, tokens); err != nil {
+		return nil, err
+	}
+	return encodeActs(xs), nil
+}
+
+func (l *llamaStage) close() { l.stage.Close() }
 
 // NewService starts a service.
 func NewService(cfg ServiceConfig) (*Service, error) {
@@ -184,12 +220,12 @@ func (s *Service) Close() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for k, l := range s.shards {
-		if l.users == 0 && l.layers != nil {
+		if l.users == 0 && l.isLoaded() {
 			s.drop(k)
 		}
 	}
 	for _, cm := range s.coords {
-		if cm.head.Wcls.dev != nil {
+		if cm.head != nil && cm.head.Wcls.dev != nil {
 			cm.head.Wcls.dev.Free()
 		}
 	}
@@ -235,14 +271,14 @@ func (s *Service) deviceName() string {
 func (s *Service) advert() advert {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used, Speed: s.speed}
+	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used, Speed: s.speed, FreeDisk: s.blobs.Store().Room()}
 	if s.cfg.Device != nil {
 		// Weights and caches share the GPU's memory.
 		a.Device = s.deviceName()
 		a.FreeMem = s.cfg.DeviceBytes - s.devUsed
 	}
 	for sh, l := range s.shards {
-		if l.err == nil && l.layers != nil {
+		if l.err == nil && l.isLoaded() {
 			a.Shards = append(a.Shards, sh)
 		}
 	}
@@ -328,19 +364,20 @@ func (s *Service) acquire(ctx context.Context, model blob.ID, from, to int, prov
 		s.mu.Unlock()
 		// Loaded outside the lock, published under it: adverts read the
 		// shard meanwhile.
-		manifest, layers, rope, size, err := s.load(ctx, model, from, to, providers)
-		onDevice := false
-		if err == nil {
-			var devBytes int64
-			if devBytes, onDevice = s.toDevice(manifest.Config, layers); onDevice {
-				size = devBytes
+		got, err := s.load(ctx, model, from, to, providers)
+		if err == nil && got.layers != nil {
+			if devBytes, ok := s.toDevice(got.manifest.Config, got.layers); ok {
+				got.bytes, got.onDevice = devBytes, true
 			}
 		}
 		s.mu.Lock()
-		l.manifest, l.layers, l.rope, l.bytes, l.err, l.onDevice = manifest, layers, rope, size, err, onDevice
+		if err == nil {
+			l.manifest, l.layers, l.rope, l.ds, l.dsClose, l.bytes, l.onDevice = got.manifest, got.layers, got.rope, got.ds, got.dsClose, got.bytes, got.onDevice
+		}
+		l.err = err
 		if l.err != nil {
 			delete(s.shards, key)
-		} else if !onDevice {
+		} else if !l.onDevice {
 			s.used += l.bytes
 		}
 		close(l.ready)
@@ -371,25 +408,33 @@ func (s *Service) release(l *loaded) {
 	s.mu.Unlock()
 }
 
-func (s *Service) load(ctx context.Context, model blob.ID, from, to int, providers []peer.ID) (*Manifest, []*Layer, *Rope, int64, error) {
+func (s *Service) load(ctx context.Context, model blob.ID, from, to int, providers []peer.ID) (*loaded, error) {
 	m, err := s.fetchManifest(ctx, model, providers)
 	if err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
-	if from < 0 || to > m.Config.Layers || from >= to {
-		return nil, nil, nil, 0, fmt.Errorf("layers %d..%d outside the model's %d", from, to, m.Config.Layers)
+	if from < 0 || to > m.layers() || from >= to {
+		return nil, fmt.Errorf("layers %d..%d outside the model's %d", from, to, m.layers())
+	}
+	if m.ds != nil {
+		part, closer, size, err := s.loadDeepSeek(ctx, m, from, to, providers)
+		if err != nil {
+			return nil, err
+		}
+		s.log.Info("loaded model layers", "model", model.String()[:12], "from", from, "to", to)
+		return &loaded{manifest: m, ds: part, dsClose: closer, bytes: size}, nil
 	}
 	size := LayerBytes(m.Config) * int64(to-from)
 	// The host copy is needed while loading, whatever holds it after.
 	if err := s.reserve(size); err != nil {
-		return nil, nil, nil, 0, err
+		return nil, err
 	}
 	var layers []*Layer
 	for i := from; i < to; i++ {
 		id, _ := blob.ParseID(m.Layers[i])
 		if err := s.blobs.Fetch(ctx, id, providers, size); err != nil {
 			s.unreserve(size)
-			return nil, nil, nil, 0, err
+			return nil, err
 		}
 		data, err := s.blobs.Store().ReadAll(id, LayerBytes(m.Config))
 		if err == nil {
@@ -400,12 +445,12 @@ func (s *Service) load(ctx context.Context, model blob.ID, from, to int, provide
 		}
 		if err != nil {
 			s.unreserve(size)
-			return nil, nil, nil, 0, err
+			return nil, err
 		}
 	}
 	s.unreserve(size) // accounted by the caller once loaded
 	s.log.Info("loaded model layers", "model", model.String()[:12], "from", from, "to", to)
-	return m, layers, NewRope(m.Config, m.Config.SeqLen), size, nil
+	return &loaded{manifest: m, layers: layers, rope: NewRope(m.Config, m.Config.SeqLen), bytes: size}, nil
 }
 
 // toDevice moves loaded layers to the GPU within its budget. It reports
@@ -450,11 +495,11 @@ func (s *Service) toDevice(c Config, layers []*Layer) (int64, bool) {
 
 // reserveCache accounts for a stage's caches: in GPU memory, with its
 // activations, when the shard's layers are there; else in RAM.
-func (s *Service) reserveCache(l *loaded, positions int) (func(), error) {
+func (s *Service) reserveCache(l *loaded, from, to, positions int) (func(), error) {
 	c := l.manifest.Config
 	layers := len(l.layers)
 	if !l.onDevice {
-		n := CacheBytes(c, layers, positions)
+		n := l.manifest.shape().cacheBytes(from, to, positions)
 		if err := s.reserve(n); err != nil {
 			return nil, err
 		}
@@ -497,7 +542,7 @@ func (s *Service) idlest(onDevice bool) (Shard, bool) {
 	var victim Shard
 	var oldest time.Time
 	for k, l := range s.shards {
-		if l.users == 0 && l.layers != nil && l.onDevice == onDevice && (oldest.IsZero() || l.lastUsed.Before(oldest)) {
+		if l.users == 0 && l.isLoaded() && l.onDevice == onDevice && (oldest.IsZero() || l.lastUsed.Before(oldest)) {
 			victim, oldest = k, l.lastUsed
 		}
 	}
@@ -514,6 +559,9 @@ func (s *Service) drop(k Shard) {
 		s.devUsed -= l.bytes
 	} else {
 		s.used -= l.bytes
+	}
+	if l.dsClose != nil {
+		l.dsClose()
 	}
 	delete(s.shards, k)
 }
@@ -624,19 +672,19 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		return
 	}
 	defer s.release(l)
-	cfg := l.manifest.Config
+	sh := l.manifest.shape()
 	positions := req.Ctx
-	if positions <= 0 || positions > cfg.SeqLen {
-		positions = cfg.SeqLen
+	if seq := l.manifest.seqLen(); positions <= 0 || positions > seq {
+		positions = seq
 	}
-	unreserve, err := s.reserveCache(l, positions)
+	unreserve, err := s.reserveCache(l, req.From, req.To, positions)
 	if err != nil {
 		writeStatus(st, err)
 		return
 	}
 	defer func() { unreserve(); s.notify() }()
-	stage := NewStage(cfg, l.layers, l.rope, positions)
-	defer stage.Close()
+	stage := l.open(positions)
+	defer stage.close()
 	if writeStatus(st, nil) != nil {
 		return
 	}
@@ -658,8 +706,8 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 			writeStatus(st, fmt.Errorf("positions %d..%d outside the context of %d", req.Pos, req.Pos+req.Tokens, positions))
 			return
 		}
-		acts, err := readFrame(st, 4*req.Tokens*cfg.Dim)
-		if err != nil || len(acts) != 4*req.Tokens*cfg.Dim {
+		in, err := readFrame(st, sh.payloadBytes(req.Tokens))
+		if err != nil {
 			st.Reset()
 			return
 		}
@@ -668,24 +716,24 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 			return
 		}
 		settle := func(int64) {}
-		gas := StageGas(cfg, req.To-req.From, req.Tokens)
+		gas := sh.gas(shard.From, shard.To, req.Tokens)
 		if s.cfg.Trust != nil {
 			if settle, err = s.cfg.Trust.Reserve(c.Subject, gas); err != nil {
 				writeStatus(st, err)
 				return
 			}
 		}
-		xs := decodeActs(acts)
-		if err = stage.ForwardMany(xs, req.Pos, req.Tokens); err != nil {
+		out, err := stage.forward(in, req.Pos, req.Tokens)
+		if err != nil {
 			settle(0)
 			writeStatus(st, err)
 			return
 		}
 		settle(gas)
 		if s.tamper != nil {
-			s.tamper(shard, xs)
+			s.tamper(shard, out)
 		}
-		if writeStatus(st, nil) != nil || writeFrame(st, encodeActs(xs)) != nil {
+		if writeStatus(st, nil) != nil || writeFrame(st, out) != nil {
 			return
 		}
 	}
