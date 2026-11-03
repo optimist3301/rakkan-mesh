@@ -166,18 +166,20 @@ func (r *Runner) Run(ctx context.Context, t Task) (*Result, error) {
 		ret, err = mod.ExportedFunction(entry).Call(ctx)
 	}
 	stop()
+	// From here on the task has run: failures carry the gas it burned, so
+	// that a task trapping on purpose after its work is billed for it.
 	if err != nil {
-		return nil, st.classify(ctx, err)
+		return nil, WithGasUsed(st.classify(ctx, err), st.gasUsed())
 	}
 	if ctx.Err() != nil {
 		// Finished while being interrupted; the balance is unreliable.
-		return nil, st.classify(ctx, nil)
+		return nil, WithGasUsed(st.classify(ctx, nil), st.gasUsed())
 	}
 	// Checks run only at function entry, loop headers and dynamic charges,
 	// so straight-line code may finish slightly in debt.
 	remaining := int64(st.gas.Get())
 	if remaining < 0 {
-		return nil, st.outOfGas()
+		return nil, WithGasUsed(st.outOfGas(), lim.MaxGas)
 	}
 	return &Result{
 		ExitCode:     api.DecodeU32(ret[0]),
@@ -229,6 +231,12 @@ func (s *execState) watch(ctx context.Context) (stop func()) {
 func (s *execState) trap(err error) {
 	s.fault = err
 	panic(err)
+}
+
+// gasUsed is the gas consumed so far, within the budget: a balance in debt
+// counts as the whole budget.
+func (s *execState) gasUsed() int64 {
+	return min(max(s.lim.MaxGas-int64(s.gas.Get()), 0), s.lim.MaxGas)
 }
 
 func (s *execState) outOfGas() error {

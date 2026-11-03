@@ -163,3 +163,42 @@ func TestCallerCancellation(t *testing.T) {
 		t.Fatalf("got %v, want context.Canceled", err)
 	}
 }
+
+func TestFailedTaskReportsGasUsed(t *testing.T) {
+	// A trap after work reports the gas burned, deterministically.
+	var first int64
+	for i := range 2 {
+		_, err := run(t, w.CountdownTrap(100_000), nil, testLimits())
+		gas, ok := GasUsed(err)
+		if !errors.Is(err, ErrTrap) || !ok || gas < 5*100_000 || gas > 5*100_000+10 {
+			t.Fatalf("got %v, gas %d (%v)", err, gas, ok)
+		}
+		if i == 0 {
+			first = gas
+		} else if gas != first {
+			t.Fatalf("gas %d, then %d", first, gas)
+		}
+	}
+	// Out of gas is the whole budget.
+	lim := testLimits()
+	lim.MaxGas = 1000
+	if _, err := run(t, w.Spin(), nil, lim); !errors.Is(err, ErrOutOfGas) {
+		t.Fatalf("got %v, want ErrOutOfGas", err)
+	} else if gas, ok := GasUsed(err); !ok || gas != lim.MaxGas {
+		t.Fatalf("out of gas reports %d (%v)", gas, ok)
+	}
+	// A timeout reports where the task stopped.
+	lim = testLimits()
+	lim.Timeout = 50 * time.Millisecond
+	if _, err := run(t, w.Spin(), nil, lim); !errors.Is(err, ErrTimeout) {
+		t.Fatalf("got %v, want ErrTimeout", err)
+	} else if gas, ok := GasUsed(err); !ok || gas <= 0 {
+		t.Fatalf("timeout reports %d (%v)", gas, ok)
+	}
+	// Failures before the task runs report none.
+	if _, err := run(t, []byte("junk"), nil, testLimits()); !errors.Is(err, ErrInvalidModule) {
+		t.Fatalf("got %v", err)
+	} else if _, ok := GasUsed(err); ok {
+		t.Fatal("invalid module reports gas")
+	}
+}

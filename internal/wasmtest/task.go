@@ -82,6 +82,18 @@ func Countdown(n int32) []byte {
 	)).Encode()
 }
 
+// CountdownTrap loops n times like Countdown, then traps: work that ends
+// in failure.
+func CountdownTrap(n int32) []byte {
+	return TaskModule(1, []byte{I32}, Cat(
+		I32Const(n), []byte{OpLocalSet, 0},
+		[]byte{OpLoop, BlockEmpty},
+		[]byte{OpLocalGet, 0}, I32Const(1), []byte{OpI32Sub, OpLocalTee, 0, OpBrIf, 0},
+		[]byte{OpEnd},
+		[]byte{OpUnreachable},
+	)).Encode()
+}
+
 // Match reads a little-endian u32 from its input and exits 0 if it equals
 // target, 1 otherwise.
 func Match(target int32) []byte {

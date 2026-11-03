@@ -390,22 +390,42 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		cancel()
 	}()
 	res, err := s.cfg.Pool.Run(ctx, c.Subject.String(), sandbox.Task{Module: module, Entry: h.Entry, Input: input, Blobs: sources, Limits: h.Limits})
+	gasUsed = billedGas(res, err, h.Limits)
 	if ctx.Err() != nil {
 		// Cancelled by the requester, or this node is shutting down: no
 		// verdict on the task. Resetting tells the requester to go elsewhere.
+		// The requester pays for the slot it held, unless the node is to
+		// blame; otherwise running a task and cancelling it just before it
+		// ends would be free.
+		if s.ctx.Err() != nil {
+			gasUsed = 0
+		} else {
+			gasUsed = h.Limits.MaxGas
+		}
 		st.Reset()
 		return
-	}
-	switch {
-	case err == nil:
-		gasUsed = res.GasUsed
-	case errors.Is(err, sandbox.ErrOutOfGas):
-		gasUsed = h.Limits.MaxGas
 	}
 	if err == nil && s.tamper != nil {
 		s.tamper(res)
 	}
 	writeResult(st, res, err, s.cfg.Blobs.Store())
+}
+
+// billedGas is what a task run for another peer costs it: the gas it used,
+// whether it succeeded or failed. A task that stopped at a limit, or whose
+// worker was killed, held the slot for its whole budget and pays all of
+// it; otherwise a task could work until just before a trap, a timeout or
+// an exhausted memory and pay nothing. Failures before the task ran, and
+// those of the executor itself (a worker crash), cost nothing.
+func billedGas(res *sandbox.Result, err error, lim sandbox.Limits) int64 {
+	switch {
+	case err == nil:
+		return res.GasUsed
+	case errors.Is(err, sandbox.ErrOutOfGas), errors.Is(err, sandbox.ErrTimeout), errors.Is(err, isolate.ErrWorkerOOM):
+		return lim.MaxGas
+	}
+	gas, _ := sandbox.GasUsed(err)
+	return gas
 }
 
 // openBlobs opens a task's attached blobs for reading on demand.

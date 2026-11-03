@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/optimist3301/rakkan-mesh/internal/isolate"
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
@@ -170,4 +171,64 @@ func ledger(n, g *testNode) int64 {
 		}
 	}
 	panic(fmt.Sprintf("%s not in the ledger", g.node.ID()))
+}
+
+func TestGuestPaysForTasksThatFail(t *testing.T) {
+	// A task that works and then traps costs its executor as much as one
+	// that succeeds; were failures free, a guest could compute without
+	// limit by trapping at the end of every task.
+	work := w.CountdownTrap(2_000_000)
+	r := sandbox.NewRunner(sandbox.DefaultLimits())
+	defer r.Close(t.Context())
+	_, err := r.Run(t.Context(), sandbox.Task{Module: work, Limits: limits()})
+	taskGas, ok := sandbox.GasUsed(err)
+	if !errors.Is(err, sandbox.ErrTrap) || !ok || taskGas < 10_000_000 {
+		t.Fatalf("probe: %v, gas %d (%v)", err, taskGas, ok)
+	}
+	lim := limits()
+	lim.MaxGas = taskGas + 1000
+
+	c := newOpenCluster(t)
+	// Credit for the gas of three such tasks, but the reservation of the
+	// third pushes past it.
+	member := c.addNode(nodeSpec{slots: 1, trust: &trust.Config{FreeCredit: 3 * taskGas, CreditPerTrust: 1}})
+	guest := c.addNode(nodeSpec{guest: true, trust: &trust.Config{}})
+	settle(t, guest, member)
+
+	ran := 0
+	for ; ran < 10; ran++ {
+		_, err = guest.svc.Run(t.Context(), Request{Module: work, Limits: lim})
+		if !errors.Is(err, sandbox.ErrTrap) {
+			break
+		}
+	}
+	if ran != 2 || !strings.Contains(fmt.Sprint(err), "credit") {
+		t.Fatalf("member ran %d failing tasks on credit for two, then: %v", ran, err)
+	}
+	if d := ledger(member, guest); d != 2*taskGas {
+		t.Fatalf("guest owes %d gas, want %d", d, 2*taskGas)
+	}
+}
+
+func TestBilledGas(t *testing.T) {
+	lim := limits()
+	for _, tc := range []struct {
+		name string
+		res  *sandbox.Result
+		err  error
+		want int64
+	}{
+		{"success", &sandbox.Result{GasUsed: 42}, nil, 42},
+		{"trap", nil, sandbox.WithGasUsed(fmt.Errorf("%w: x", sandbox.ErrTrap), 77), 77},
+		{"out of gas", nil, sandbox.ErrOutOfGas, lim.MaxGas},
+		{"timeout after running", nil, sandbox.WithGasUsed(sandbox.ErrTimeout, 5), lim.MaxGas},
+		{"timeout killed", nil, sandbox.ErrTimeout, lim.MaxGas},
+		{"worker oom", nil, isolate.ErrWorkerOOM, lim.MaxGas},
+		{"invalid module", nil, sandbox.ErrInvalidModule, 0},
+		{"worker crash", nil, isolate.ErrWorkerCrashed, 0},
+	} {
+		if got := billedGas(tc.res, tc.err, lim); got != tc.want {
+			t.Errorf("%s: billed %d, want %d", tc.name, got, tc.want)
+		}
+	}
 }

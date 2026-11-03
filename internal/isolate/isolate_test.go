@@ -218,6 +218,41 @@ func TestPoolRunsTask(t *testing.T) {
 	}
 }
 
+func TestPoolFailedTaskGasCrossesBoundary(t *testing.T) {
+	p := newPool(t, Config{Isolation: StrictIsolation()})
+	task := sandbox.Task{Module: w.CountdownTrap(100_000), Limits: testLimits()}
+	_, err := p.Run(t.Context(), "", task)
+	gas, ok := sandbox.GasUsed(err)
+	if !errors.Is(err, sandbox.ErrTrap) || !ok {
+		t.Fatalf("got %v, gas %d (%v)", err, gas, ok)
+	}
+	r := sandbox.NewRunner(sandbox.DefaultLimits())
+	defer r.Close(t.Context())
+	_, lerr := r.Run(t.Context(), task)
+	if local, _ := sandbox.GasUsed(lerr); local != gas {
+		t.Fatalf("gas %d in worker, %d in process", gas, local)
+	}
+	// Before running, there is no gas to report.
+	if _, err := p.Run(t.Context(), "", sandbox.Task{Module: []byte("junk"), Limits: testLimits()}); !errors.Is(err, sandbox.ErrInvalidModule) {
+		t.Fatalf("got %v", err)
+	} else if _, ok := sandbox.GasUsed(err); ok {
+		t.Fatal("invalid module reports gas")
+	}
+}
+
+func TestDecodeResponseRejectsGasOutsideBudget(t *testing.T) {
+	lim := testLimits()
+	resp := encodeResponse(nil, sandbox.WithGasUsed(sandbox.ErrTrap, lim.MaxGas+1))
+	if _, _, err := decodeResponse(resp[1:], lim); err == nil {
+		t.Fatal("accepted a failed task's gas over its budget")
+	}
+	resp = encodeResponse(nil, sandbox.WithGasUsed(sandbox.ErrTrap, 7))
+	_, taskErr, err := decodeResponse(resp[1:], lim)
+	if gas, ok := sandbox.GasUsed(taskErr); err != nil || !errors.Is(taskErr, sandbox.ErrTrap) || !ok || gas != 7 {
+		t.Fatalf("decoded %v, %v, gas %d (%v)", taskErr, err, gas, ok)
+	}
+}
+
 func TestPoolSandboxErrorsCrossBoundary(t *testing.T) {
 	p := newPool(t, Config{Isolation: StrictIsolation()})
 	lim := testLimits()
