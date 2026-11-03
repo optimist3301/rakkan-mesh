@@ -52,6 +52,9 @@ type shape interface {
 	layerBytes(i int) int64
 	diskBytes(i int) int64
 	readBytes(i int) int64
+	// hostBytes is what of layer i a GPU node may keep in RAM, run on its
+	// CPU (DeepSeek's routed experts); 0 if the layer runs whole.
+	hostBytes(i int) int64
 	// cacheBytes is the memory of a stage's caches for positions.
 	cacheBytes(from, to, positions int) int64
 	// gas prices a forward of tokens through layers [from, to).
@@ -72,11 +75,12 @@ func nodeFit(a advert, model string, sh shape, positions int) func(from, to int)
 		}
 	}
 	return func(from, to int) bool {
-		var weights, disk int64
+		var weights, disk, host int64
 		for i := from; i < to; i++ {
 			if !slices.ContainsFunc(loaded, func(s Shard) bool { return s.From <= i && i < s.To }) {
 				weights += sh.layerBytes(i)
 				disk += sh.diskBytes(i)
+				host += sh.hostBytes(i)
 			}
 		}
 		cache := sh.cacheBytes(from, to, positions)
@@ -86,7 +90,11 @@ func nodeFit(a advert, model string, sh shape, positions int) func(from, to int)
 		if a.FreeCache > 0 {
 			return weights <= a.FreeMem && cache <= a.FreeCache
 		}
-		return weights+cache <= a.FreeMem
+		if weights+cache <= a.FreeMem {
+			return true
+		}
+		// On a GPU node, the experts in RAM beside the rest on the GPU.
+		return a.Device != "" && host > 0 && weights-host+cache <= a.FreeMem && host <= a.FreeHost
 	}
 }
 

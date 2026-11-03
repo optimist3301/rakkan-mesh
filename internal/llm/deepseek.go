@@ -75,6 +75,7 @@ func (s llamaShape) numLayers() int       { return s.c.Layers }
 func (s llamaShape) layerBytes(int) int64 { return LayerBytes(s.c) }
 func (s llamaShape) diskBytes(int) int64  { return 0 }
 func (s llamaShape) readBytes(int) int64  { return LayerBytes(s.c) }
+func (s llamaShape) hostBytes(int) int64  { return 0 }
 func (s llamaShape) cacheBytes(from, to, positions int) int64 {
 	return CacheBytes(s.c, to-from, positions)
 }
@@ -87,6 +88,7 @@ func (s dsShape) numLayers() int         { return s.c.Layers }
 func (s dsShape) layerBytes(i int) int64 { return dsv41.LayerBytes(s.c, i) }
 func (s dsShape) diskBytes(i int) int64  { return dsv41.EngramTableBytes(s.c, i) }
 func (s dsShape) readBytes(i int) int64  { return dsv41.ActiveBytes(s.c, i) }
+func (s dsShape) hostBytes(i int) int64  { return dsv41.ExpertBytes(s.c, i) }
 func (s dsShape) cacheBytes(from, to, positions int) int64 {
 	return dsv41.CacheBytes(s.c, from, to, positions)
 }
@@ -386,41 +388,61 @@ func (d *deepseekStage) close() {
 }
 
 // deepseekToDevice moves a loaded DeepSeek shard's weights to the GPU
-// within its budget, letting the host copy go. It reports the device
-// memory taken; on failure the shard stays on the CPU.
-func (s *Service) deepseekToDevice(m *Manifest, part *dsv41.Model, from, to int) (*dsv41.GPUPart, int64, bool) {
+// within its budget, letting the host copy go: all of them if they fit,
+// else all but the routed experts, which stay in RAM and run on the CPU
+// (hostBytes). It reports the memory taken; on failure the shard stays on
+// the CPU.
+func (s *Service) deepseekToDevice(m *Manifest, part *dsv41.Model, from, to int) (gp *dsv41.GPUPart, devBytes, hostBytes int64, ok bool) {
 	d := s.cfg.Device
 	if d == nil {
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
-	// The estimate bounds what the upload takes; the actual size replaces it.
-	var need int64
+	// The estimates bound what the upload takes; the actual size replaces it.
+	var whole, experts int64
 	for i := from; i < to; i++ {
-		need += dsv41.LayerBytes(m.ds, i)
+		whole += dsv41.LayerBytes(m.ds, i)
+		experts += dsv41.ExpertBytes(m.ds, i)
 	}
-	s.mu.Lock()
-	if s.devUsed+need > s.cfg.DeviceBytes {
-		s.evictDevice(need)
+	fits := func(n int64) bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.devUsed+n > s.cfg.DeviceBytes {
+			s.evictDevice(n)
+		}
+		if s.devUsed+n > s.cfg.DeviceBytes {
+			return false
+		}
+		s.devUsed += n
+		return true
 	}
-	ok := s.devUsed+need <= s.cfg.DeviceBytes
-	if ok {
-		s.devUsed += need
+	need, o := whole, dsv41.GPUOptions{}
+	if !fits(need) {
+		need, o = whole-experts, dsv41.GPUOptions{HostExperts: true}
+		if !fits(need) {
+			s.log.Warn("GPU memory full; serving DeepSeek layers from the CPU")
+			return nil, 0, 0, false
+		}
+		if err := s.reserve(experts); err != nil {
+			s.unreserveDevice(need)
+			s.log.Warn("no RAM for the experts beside the GPU; serving DeepSeek layers from the CPU", "err", err)
+			return nil, 0, 0, false
+		}
+		hostBytes = experts
 	}
-	s.mu.Unlock()
-	if !ok {
-		s.log.Warn("GPU memory full; serving DeepSeek layers from the CPU")
-		return nil, 0, false
-	}
-	gp, err := part.ToGPU(d)
+	gp, err := part.ToGPU(d, o)
 	if err != nil {
 		s.unreserveDevice(need)
+		s.unreserve(hostBytes)
 		s.log.Warn("could not move DeepSeek layers to the GPU; serving them from the CPU", "err", err)
-		return nil, 0, false
+		return nil, 0, 0, false
 	}
-	size := gp.Bytes()
-	s.unreserveDevice(need - size)
-	part.DropHostWeights()
-	return gp, size, true
+	devBytes = gp.Bytes()
+	s.unreserveDevice(need - devBytes)
+	gp.DropHostWeights()
+	if o.HostExperts {
+		s.log.Info("DeepSeek layers on the GPU, their experts on the CPU", "from", from, "to", to)
+	}
+	return gp, devBytes, hostBytes, true
 }
 
 // deepseekCoord is a coordinator's part of a DeepSeek model.

@@ -270,10 +270,15 @@ func (s *State) moe(f *moe, x []float32) []float32 {
 }
 
 func (s *State) expert(e *expert, x []float32, weight float32, weighted bool, limit float32) []float32 {
+	return runExpert(e, x, weight, weighted, limit, &s.act)
+}
+
+// runExpert is an expert's SwiGLU on x, its output weighted if weighted.
+func runExpert(e *expert, x []float32, weight float32, weighted bool, limit float32, act *num.ActFP8) []float32 {
 	g := make([]float32, e.w1.rows)
 	u := make([]float32, e.w3.rows)
-	e.w1.apply(g, x, &s.act)
-	e.w3.apply(u, x, &s.act)
+	e.w1.apply(g, x, act)
+	e.w3.apply(u, x, act)
 	for i := range g {
 		gi, ui := g[i], u[i]
 		if limit > 0 {
@@ -287,7 +292,7 @@ func (s *State) expert(e *expert, x []float32, weight float32, weighted bool, li
 		g[i] = bf16(v)
 	}
 	out := make([]float32, e.w2.rows)
-	e.w2.apply(out, g, &s.act)
+	e.w2.apply(out, g, act)
 	return out
 }
 

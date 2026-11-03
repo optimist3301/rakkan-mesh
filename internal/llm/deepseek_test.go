@@ -306,3 +306,42 @@ func TestDeepSeekGPUGuestWitnessedByCPU(t *testing.T) {
 		t.Fatal("witnessed GPU stages earned the guest no trust")
 	}
 }
+
+// A GPU too small for the layers whole takes them without their experts,
+// which run on the node's CPU; the text is the same.
+func TestDeepSeekHostExperts(t *testing.T) {
+	dev := testDevice(t)
+	cfg, err := dsv41.LoadConfig(filepath.Join(dsFixture, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var whole, experts int64
+	for i := range cfg.Layers {
+		whole += dsv41.LayerBytes(cfg, i)
+		experts += dsv41.ExpertBytes(cfg, i)
+	}
+	// Room for every layer's dense part and a stage's arena, not for the
+	// layers whole.
+	devBytes := whole - experts/2
+	c := newCluster(t)
+	coord := c.add(false)
+	node := c.addOpts(nodeOpts{serve: true, dev: dev, devBytes: devBytes, mem: 1 << 30, speed: 50})
+	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 1)
+	want := localDeepSeek(t, tok, dsPrompt, 20)
+	got, stats := generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 20}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("tokens %v, one process %v", got, want)
+	}
+	t.Logf("stages %+v", stats.Stages)
+	node.llm.mu.Lock()
+	defer node.llm.mu.Unlock()
+	for _, l := range node.llm.shards {
+		if l.dsGPU == nil || !l.dsGPU.HostExperts() {
+			t.Fatalf("shard on the GPU %v, host experts %v", l.dsGPU != nil, l.dsGPU != nil && l.dsGPU.HostExperts())
+		}
+		if l.hostBytes == 0 {
+			t.Fatal("the experts' RAM is not accounted")
+		}
+	}
+}

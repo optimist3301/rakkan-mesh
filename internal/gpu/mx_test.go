@@ -323,3 +323,44 @@ func TestFP8SumExactThroughCancellation(t *testing.T) {
 		m.Free()
 	}
 }
+
+// Experts given in chunks are uploaded part by part, each part whole
+// experts, as from one slice.
+func TestFP4Chunks(t *testing.T) {
+	r := rand.New(rand.NewPCG(41, 42))
+	const rows, cols, per = 70000, 4096, 2000
+	w := make([]byte, rows*cols/2)
+	for i := range w {
+		w[i] = byte(r.IntN(256))
+	}
+	s := make([]byte, rows*cols/32)
+	randomScales(r, s, false)
+	var wc, sc [][]byte
+	for e := 0; e < rows; e += per {
+		wc = append(wc, w[e*cols/2:(e+per)*cols/2])
+		sc = append(sc, s[e*cols/32:(e+per)*cols/32])
+	}
+	x := mxInput(r, cols)
+	var a num.ActFP8
+	num.QuantizeActFP8(x, &a)
+	want := make([]float32, rows)
+	num.MatVecFP4(want, w, s, &a)
+	for _, d := range devices(t) {
+		m, err := d.Upload(rows, cols, Format{FP4Chunks: wc, E8M0Chunks: sc, AlignRows: per})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range m.parts {
+			if p.row0%per != 0 || p.rows%per != 0 {
+				t.Fatalf("part of rows %d..%d splits an expert", p.row0, p.row0+p.rows)
+			}
+		}
+		got := make([]float32, rows)
+		if err := m.MulVec(got, x); err != nil {
+			t.Fatal(err)
+		}
+		sameBits(t, d.Info().Name, got, want)
+		t.Logf("%s: %d parts", d.Info().Name, len(m.parts))
+		m.Free()
+	}
+}

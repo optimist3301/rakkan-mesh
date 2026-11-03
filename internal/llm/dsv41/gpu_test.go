@@ -58,8 +58,12 @@ func TestGPUStagesMatchCPU(t *testing.T) {
 	tokens := g.ints(t, "tokens")
 	prompt := promptLen
 	for _, d := range gpuDevices(t) {
-		for _, cuts := range [][]int{{0, 1, 2, 3, 4, 5, 6, 7, 8}, {0, 8}, {0, 3, 6, 8}} {
-			t.Run(fmt.Sprintf("%s/%v", d.Info().Name, cuts), func(t *testing.T) {
+		for _, run := range []struct {
+			cuts []int
+			host bool
+		}{{[]int{0, 1, 2, 3, 4, 5, 6, 7, 8}, false}, {[]int{0, 8}, false}, {[]int{0, 3, 6, 8}, false}, {[]int{0, 8}, true}, {[]int{0, 3, 6, 8}, true}} {
+			cuts := run.cuts
+			t.Run(fmt.Sprintf("%s/%v/host experts %v", d.Info().Name, cuts, run.host), func(t *testing.T) {
 				var cpu []*Stage
 				var gpus []*GPUStage
 				for i := range len(cuts) - 1 {
@@ -68,11 +72,18 @@ func TestGPUStagesMatchCPU(t *testing.T) {
 						t.Fatal(err)
 					}
 					cpu = append(cpu, part.NewStage())
-					gp, err := part.ToGPU(d)
+					// The GPU's own copy of the part, its host weights let go
+					// once uploaded (all but the experts kept on the host).
+					gpart, err := NewPart(cfg, layerTensors(tensors, cuts[i], cuts[i+1]), cuts[i], cuts[i+1], nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					gp, err := gpart.ToGPU(d, GPUOptions{HostExperts: run.host})
 					if err != nil {
 						t.Fatal(err)
 					}
 					t.Cleanup(gp.Free)
+					gp.DropHostWeights()
 					st, err := gp.NewStage(len(tokens))
 					if err != nil {
 						t.Fatal(err)
@@ -230,3 +241,52 @@ func TestGPUKernelsOnExtremes(t *testing.T) {
 }
 
 func isDenormal(f float32) bool { b := math.Float32bits(f); return b>>23&0xff == 0 && b&0x7fffff != 0 }
+
+// The GPU's selection is topK's, ties and signed zeros included, at sizes
+// where ranking every pair would not do.
+func TestGPUSelectMatchesTopK(t *testing.T) {
+	r := rand.New(rand.NewPCG(31, 32))
+	for _, d := range gpuDevices(t) {
+		for _, n := range []int{1, 7, 300, 5000, 70000} {
+			a, err := d.NewArena(3*n+16, 2*n+16)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := make([]float32, n)
+			for i := range v {
+				switch r.IntN(6) {
+				case 0:
+					v[i] = float32(math.Inf(-1))
+				case 1:
+					v[i] = float32(math.Copysign(0, -1))
+				case 2:
+					v[i] = 0
+				default:
+					v[i] = float32(r.IntN(50) - 25) // many ties
+				}
+			}
+			for _, k := range []int{0, 1, min(5, n), min(512, n), n} {
+				visible := n / 2
+				b := a.Begin()
+				b.Write(0, v)
+				b.SelectSorted(n, k, 0, n, 2*n, visible)
+				got := make([]float32, k)
+				b.Read(n, got)
+				if err := b.Submit(); err != nil {
+					t.Fatal(err)
+				}
+				want := topK(v, k)
+				slices.Sort(want)
+				for i, x := range want {
+					if x >= visible {
+						want[i] = -1
+					}
+					if g := int(int32(math.Float32bits(got[i]))); g != want[i] {
+						t.Fatalf("%s n=%d k=%d: entry %d: GPU %d, CPU %d", d.Info().Name, n, k, i, g, want[i])
+					}
+				}
+			}
+			a.Free()
+		}
+	}
+}

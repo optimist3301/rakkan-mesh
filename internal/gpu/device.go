@@ -571,6 +571,10 @@ type Format struct {
 	// scales' bytes in E8M0. The products are rounded to bfloat16.
 	FP8, FP4 []byte
 	E8M0     []byte
+	// FP4Chunks and E8M0Chunks are FP4 and E8M0 given in pieces, read as
+	// one: stacked experts, which are uploaded part by part and so never
+	// gathered on the host whole.
+	FP4Chunks, E8M0Chunks [][]byte
 	// AlignRows, if set, keeps runs of that many rows (an expert's) in one
 	// part when the matrix is split.
 	AlignRows int
@@ -603,12 +607,15 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	case f.FP4 != nil:
 		m.kind, rowBytes = kindFP4, cols/2
 		data = f.FP4
+	case f.FP4Chunks != nil:
+		m.kind, rowBytes = kindFP4, cols/2
 	default:
 		return nil, errors.New("gpu: empty matrix")
 	}
 	// Rows beyond maxRows are for products into an arena (stacked experts);
 	// MulVecs, through the host's arena, checks its own outputs.
-	if cols > maxCols || rows > 1<<24 || len(data) != rows*rowBytes {
+	read, dataLen := gatherer(data, f.FP4Chunks)
+	if cols > maxCols || rows > 1<<24 || dataLen != rows*rowBytes {
 		return nil, fmt.Errorf("gpu: matrix %d×%d out of range", rows, cols)
 	}
 	if (m.kind == kindQ8 || m.kind == kindQ4) && (cols%num.QBlock != 0 || len(f.Scales) != rows*cols/num.QBlock) {
@@ -621,7 +628,7 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		if m.kind == kindFP8 {
 			blocks = (rows + 31) / 32 * (cols / num.QBlock)
 		}
-		if cols%num.QBlock != 0 || len(f.E8M0) != blocks {
+		if _, n := gatherer(f.E8M0, f.E8M0Chunks); cols%num.QBlock != 0 || n != blocks {
 			return nil, errors.New("gpu: block-scaled matrix of the wrong shape")
 		}
 		if m.kind == kindFP8 && !num.ValidE4M3(f.FP8) {
@@ -629,6 +636,7 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		}
 		scales = f.E8M0
 	}
+	readScales, _ := gatherer(scales, f.E8M0Chunks)
 
 	// Split rows so each part fits a binding, and a gigabyte at most: for
 	// E4M3 weights, whole blocks of 32 rows sharing scales.
@@ -654,14 +662,14 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		n := min(per, rows-r)
 		p := part{row0: r, rows: n}
 		var err error
-		if p.w, err = d.upload(data[r*rowBytes : (r+n)*rowBytes]); err == nil {
+		if p.w, err = d.upload(read(r*rowBytes, (r+n)*rowBytes)); err == nil {
 			// Byte scales are padded to whole words, which kernels read.
 			nb := cols / num.QBlock
 			switch {
 			case m.kind == kindFP8:
-				p.s, err = d.upload(padWords(scales[r/32*nb : (r+n+31)/32*nb]))
+				p.s, err = d.upload(padWords(readScales(r/32*nb, (r+n+31)/32*nb)))
 			case m.kind == kindFP4:
-				p.s, err = d.upload(padWords(scales[r*nb : (r+n)*nb]))
+				p.s, err = d.upload(padWords(readScales(r*nb, (r+n)*nb)))
 			case scaleBytes > 0:
 				p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
 			}
@@ -688,6 +696,29 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	d.used += m.bytes
 	runtime.KeepAlive(f)
 	return m, nil
+}
+
+// gatherer reads bytes [lo, hi) of data, or of chunks read as one (only
+// that range is gathered), and reports their whole length.
+func gatherer(data []byte, chunks [][]byte) (func(lo, hi int) []byte, int) {
+	if chunks == nil {
+		return func(lo, hi int) []byte { return data[lo:hi] }, len(data)
+	}
+	n := 0
+	for _, c := range chunks {
+		n += len(c)
+	}
+	return func(lo, hi int) []byte {
+		out := make([]byte, 0, hi-lo)
+		at := 0
+		for _, c := range chunks {
+			if end := at + len(c); end > lo && at < hi {
+				out = append(out, c[max(lo-at, 0):min(hi-at, len(c))]...)
+			}
+			at += len(c)
+		}
+		return out
+	}, n
 }
 
 // padWords pads bytes to whole words.

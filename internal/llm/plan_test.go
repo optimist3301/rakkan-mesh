@@ -145,6 +145,36 @@ func (s testShape) numLayers() int                   { return len(s.bytes) }
 func (s testShape) layerBytes(i int) int64           { return s.bytes[i] }
 func (s testShape) diskBytes(i int) int64            { return s.disk[i] }
 func (s testShape) readBytes(i int) int64            { return s.bytes[i] }
+func (s testShape) hostBytes(int) int64              { return 0 }
 func (s testShape) cacheBytes(from, to, _ int) int64 { return int64(to - from) }
 func (s testShape) gas(from, to, tokens int) int64   { return 0 }
 func (s testShape) payloadBytes(tokens int) int      { return tokens }
+
+// hybridShape's layers keep part of themselves in RAM on a GPU node.
+type hybridShape struct {
+	testShape
+	host []int64
+}
+
+func (s hybridShape) hostBytes(i int) int64 { return s.host[i] }
+
+// A GPU node too small for whole layers takes them with their experts in
+// its RAM, when that holds them.
+func TestPlanHostExperts(t *testing.T) {
+	sh := hybridShape{testShape{bytes: []int64{100, 100, 100, 100}, disk: make([]int64, 4)}, []int64{90, 90, 90, 90}}
+	gpuNode := stageNode{id: "gpu", speed: 50, fit: nodeFit(advert{Device: "gpu", FreeMem: 40, FreeHost: 300}, "m", sh, 1)}
+	cpu := stageNode{id: "cpu", speed: 5, fit: nodeFit(advert{FreeMem: 1000}, "m", sh, 1)}
+	got, err := planStages(sh.bytes, []stageNode{gpuNode, cpu}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Three layers: 3·10 + caches on the GPU, 3·90 in RAM.
+	if !equalSpans(got, []span{{0, 3, "gpu"}, {3, 4, "cpu"}}) {
+		t.Fatalf("plan %v", got)
+	}
+	// Without RAM to spare the GPU node holds none.
+	small := stageNode{id: "gpu", speed: 50, fit: nodeFit(advert{Device: "gpu", FreeMem: 40, FreeHost: 50}, "m", sh, 1)}
+	if got, _ := planStages(sh.bytes, []stageNode{small, cpu}, 0); !equalSpans(got, []span{{0, 4, "cpu"}}) {
+		t.Fatalf("plan without RAM: %v", got)
+	}
+}

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"testing"
@@ -38,6 +40,7 @@ func TestRealLayers(t *testing.T) {
 	if dir == "" {
 		t.Skip("RAKKAN_DSV41_REAL not set")
 	}
+	needMemory(t, 12)
 	cfg, err := LoadConfig("../../../tools/llmref/dsv41/upstream/config.json")
 	if err != nil {
 		t.Fatal(err)
@@ -219,6 +222,26 @@ func checkRealLayer(t *testing.T, cfg *Config, dir string, layer int) {
 	}
 }
 
+// needMemory skips a test the machine has not the memory for: running
+// out takes more down than the test (the OOM killer also takes the
+// desktop session).
+func needMemory(t *testing.T, gib int) {
+	t.Helper()
+	b, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		return
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		var kb int64
+		if _, err := fmt.Sscanf(line, "MemAvailable: %d kB", &kb); err == nil {
+			if kb>>20 < int64(gib) {
+				t.Skipf("%d GiB of memory available, the test needs %d", kb>>20, gib)
+			}
+			return
+		}
+	}
+}
+
 // common counts the entries two selections share.
 func common(a, b []int) int {
 	n := 0
@@ -233,7 +256,8 @@ func common(a, b []int) int {
 // TestRealLayersGPU runs the real layers on a GPU (not a software one) and
 // on the CPU, position by position on the reference's input, and wants
 // the same bits: the stream, the mix, the selections and the cache
-// entries.
+// entries. The GPU runs the layer whole, then with its experts on the CPU,
+// one after the other, so that each has the device to itself.
 func TestRealLayersGPU(t *testing.T) {
 	dir := os.Getenv("RAKKAN_DSV41_REAL")
 	if dir == "" {
@@ -249,6 +273,12 @@ func TestRealLayersGPU(t *testing.T) {
 	if dev == nil {
 		t.Skip("no hardware GPU")
 	}
+	// The layer on the host, its copy on the GPU (in RAM too for an
+	// integrated one) and a part being uploaded.
+	needMemory(t, 18)
+	// Go would let the heap grow to twice the live layer before collecting;
+	// layers come one after the other here.
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(12 << 30))
 	cfg, err := LoadConfig("../../../tools/llmref/dsv41/upstream/config.json")
 	if err != nil {
 		t.Fatal(err)
@@ -267,11 +297,6 @@ func TestRealLayersGPU(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			gp, err := part.ToGPU(dev)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer gp.Free()
 			input := golden(g).f32(t, "input")
 			decode := 0
 			for k := range g {
@@ -281,48 +306,66 @@ func TestRealLayersGPU(t *testing.T) {
 			}
 			T := len(golden(g).ints(t, "tokens"))
 			P := T - decode
-			gs, err := gp.NewStage(T)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer gs.Close()
-			cs := part.NewStage()
 			width := cfg.HCMult * cfg.Dim
 			hashes := make([][]int64, len(cfg.EngramLayers))
 			for i := range hashes {
 				hashes[i] = make([]int64, (cfg.EngramMaxNgram-1)*cfg.EngramHeads)
 			}
-			var cpuTime, gpuTime time.Duration
-			for pos := range T {
+			mk := func(pos int) *Payload {
 				prefill := 0
 				if pos < P {
 					prefill = P
 				}
-				mk := func() *Payload {
-					p := &Payload{Prefill: prefill, H: slices.Clone(input[pos*width : (pos+1)*width]), PreMix: make([]float32, cfg.HCMult),
-						Hashes: hashes, Source: sourceBefore(cfg, layer)}
-					p.PreMix[0] = 1
-					return p
-				}
-				pc, pg := mk(), mk()
-				start := time.Now()
-				if err := cs.Forward(pc, pos); err != nil {
-					t.Fatal(err)
-				}
-				cpuTime += time.Since(start)
-				start = time.Now()
-				if err := gs.Forward(pg, pos); err != nil {
-					t.Fatal(err)
-				}
-				gpuTime += time.Since(start)
-				want, _ := AppendPayload(nil, cfg, pc)
-				got, _ := AppendPayload(nil, cfg, pg)
-				if !bytes.Equal(got, want) {
-					t.Fatalf("position %d: %s", pos, payloadDiff(cfg, pg, pc))
-				}
+				p := &Payload{Prefill: prefill, H: slices.Clone(input[pos*width : (pos+1)*width]), PreMix: make([]float32, cfg.HCMult),
+					Hashes: hashes, Source: sourceBefore(cfg, layer)}
+				p.PreMix[0] = 1
+				return p
 			}
-			t.Logf("%d positions bit for bit; CPU %s, GPU (%s) %s per position", T, (cpuTime / time.Duration(T)).Round(time.Millisecond),
-				dev.Info().Name, (gpuTime / time.Duration(T)).Round(time.Millisecond))
+			per := func(d time.Duration) time.Duration { return (d / time.Duration(T)).Round(time.Millisecond) }
+
+			cs := part.NewStage()
+			want := make([][]byte, T)
+			var elapsed time.Duration
+			for pos := range T {
+				p := mk(pos)
+				start := time.Now()
+				if err := cs.Forward(p, pos); err != nil {
+					t.Fatal(err)
+				}
+				elapsed += time.Since(start)
+				want[pos], _ = AppendPayload(nil, cfg, p)
+			}
+			t.Logf("CPU: %s per position", per(elapsed))
+			for _, o := range []GPUOptions{{}, {HostExperts: true}} {
+				gp, err := part.ToGPU(dev, o)
+				if err != nil {
+					t.Fatal(err)
+				}
+				gs, err := gp.NewStage(T)
+				if err != nil {
+					t.Fatal(err)
+				}
+				elapsed = 0
+				for pos := range T {
+					p := mk(pos)
+					start := time.Now()
+					if err := gs.Forward(p, pos); err != nil {
+						t.Fatal(err)
+					}
+					elapsed += time.Since(start)
+					if got, _ := AppendPayload(nil, cfg, p); !bytes.Equal(got, want[pos]) {
+						ref, _, _ := DecodePayload(want[pos], cfg, T)
+						t.Fatalf("host experts %v, position %d: %s", o.HostExperts, pos, payloadDiff(cfg, p, ref))
+					}
+				}
+				t.Logf("GPU (%s), host experts %v: %d positions bit for bit, %s per position, %d MiB on the GPU",
+					dev.Info().Name, o.HostExperts, T, per(elapsed), gp.Bytes()>>20)
+				gs.Close()
+				gp.Free()
+			}
+			part, tensors, cs = nil, nil, nil
+			runtime.GC()
+			debug.FreeOSMemory()
 		})
 	}
 }

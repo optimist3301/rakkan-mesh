@@ -110,6 +110,12 @@ func layerSizes(c *Config, i int) (held, active, params int64) {
 // aside, and so the size of its blob.
 func LayerBytes(c *Config, i int) int64 { h, _, _ := layerSizes(c, i); return h }
 
+// ExpertBytes is what block i's routed experts take loaded: what stays
+// in RAM when the rest of the block is on a GPU (GPUOptions.HostExperts).
+func ExpertBytes(c *Config, i int) int64 {
+	return int64(c.RoutedExperts) * (2*fp4Bytes(c.MoEInter, c.Dim) + fp4Bytes(c.Dim, c.MoEInter))
+}
+
 // ActiveBytes is what block i reads of its weights per token: what a
 // node's speed (bytes per second through products) is measured against.
 func ActiveBytes(c *Config, i int) int64 { _, a, _ := layerSizes(c, i); return a }

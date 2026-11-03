@@ -30,6 +30,8 @@ const (
 	kindSiluMulDS
 	kindMoESum
 	kindEngramGate
+	kindSelect
+	kindCompact
 	kindAllCount
 )
 
@@ -73,6 +75,10 @@ func dsKernel(k kernelKind, modes floatModes) []uint32 {
 		return moeSumKernel(modes)
 	case kindEngramGate:
 		return engramGateKernel(modes)
+	case kindSelect:
+		return selectKernel(modes)
+	case kindCompact:
+		return compactKernel(modes)
 	}
 	panic("gpu: unknown kernel")
 }
@@ -485,47 +491,31 @@ func (k *kbuilder) rank(vals, n, v, i id) id {
 	return k.load(k.tU32, r)
 }
 
-// topKKernel selects the k largest of n values (dsv41.topK). Mode 0
-// writes the indices by rank at out. Mode 1 flags the selected ones at
-// flags; mode 2 writes the flagged ones in ascending order at out, -1 for
-// those from visible on (the indexer's selection). Push n, k, vals, out,
-// mode, flags, visible.
+// topKKernel writes the indices of the k largest of n values at out, by
+// rank (dsv41.topK, its order too): each value's rank is the count of
+// those before it. O(n²): for the router's few hundred experts; Select
+// takes the indexer's. Push n, k, vals, out.
 func topKKernel(modes floatModes) []uint32 {
 	k := newKernel(modes, flatGroup, 1)
 	i := k.flat()
-	n, kk, vals, out, mode, flags, visible := k.p(0), k.p(1), k.p(2), k.p(3), k.p(4), k.p(5), k.p(6)
+	n, kk, vals, out := k.p(0), k.p(1), k.p(2), k.p(3)
 	k.ifThen(k.ult(i, n), func() {
-		k.ifThen(k.ult(mode, k.u32(2)), func() {
-			r := k.rank(vals, n, k.get(k.at(vals, i)), i)
-			sel := k.ult(r, kk)
-			k.ifThen(k.ieq(mode, k.u32(0)), func() {
-				k.ifThen(sel, func() { k.iput(k.at(out, r), i) })
-			})
-			k.ifThen(k.ieq(mode, k.u32(1)), func() { k.iput(k.at(flags, i), k.cnt(sel)) })
-		})
-		k.ifThen(k.ieq(mode, k.u32(2)), func() {
-			k.ifThen(k.ine(k.iget(k.at(flags, i)), k.u32(0)), func() {
-				pos := k.local(k.tU32)
-				k.store(pos, k.u32(0))
-				k.forRange(k.u32(0), i, k.u32(1), func(j id) {
-					k.store(pos, k.iadd(k.load(k.tU32, pos), k.iget(k.at(flags, j))))
-				})
-				k.iput(k.at(out, k.load(k.tU32, pos)), k.sel(k.uge(i, visible), k.u32(0xffffffff), i))
-			})
-		})
+		r := k.rank(vals, n, k.get(k.at(vals, i)), i)
+		k.ifThen(k.ult(r, kk), func() { k.iput(k.at(out, r), i) })
 	})
 	return k.finish()
 }
 
-// candPoolKernel is dsv41.candidatePool in three phases over the scores
-// of width positions: 0, the best score of each block of size (n of them)
-// at bs, +inf for the newest visible position's; 1, flags at sel for the
-// best k blocks that have a score; 2, a flag per position at keep. Push
+// candPoolKernel is dsv41.candidatePool in phases over the scores of
+// width positions: 0, the best score of each block of size (n of them) at
+// bs, +inf for the newest visible position's; then the selection kernel
+// flags the best k blocks at sel; 2, a flag per position at keep, for
+// selected blocks that have a score. Push
 // width, visible, k, size, scores, bs, sel, keep, phase.
 func candPoolKernel(modes floatModes) []uint32 {
 	k := newKernel(modes, flatGroup, 1)
 	i := k.flat()
-	width, visible, kk, size, scores, bs, sel, keep, phase := k.p(0), k.p(1), k.p(2), k.p(3), k.p(4), k.p(5), k.p(6), k.p(7), k.p(8)
+	width, visible, size, scores, bs, sel, keep, phase := k.p(0), k.p(1), k.p(3), k.p(4), k.p(5), k.p(6), k.p(7), k.p(8)
 	n := k.floorDiv(k.iadd(width, k.op(opISub, k.tU32, size, k.u32(1))), size)
 	k.ifThen(k.ieq(phase, k.u32(0)), func() {
 		k.ifThen(k.ult(i, n), func() {
@@ -540,17 +530,13 @@ func candPoolKernel(modes floatModes) []uint32 {
 			k.put(k.at(bs, i), k.selF(newest, k.toF(k.u32(0x7f800000)), k.load(k.tF32, m)))
 		})
 	})
-	k.ifThen(k.ieq(phase, k.u32(1)), func() {
-		k.ifThen(k.ult(i, n), func() {
-			v := k.get(k.at(bs, i))
-			kn := k.sel(k.ult(kk, n), kk, n)
-			chosen := k.land(k.ult(k.rank(bs, n, v, i), kn), k.op(opLogicalNot, k.tBool, k.feq(v, k.toF(k.u32(negInfBits)))))
-			k.iput(k.at(sel, i), k.cnt(chosen))
-		})
-	})
+	// Phase 1 is the selection kernel's, on bs; blocks without a score
+	// are not kept.
 	k.ifThen(k.ieq(phase, k.u32(2)), func() {
 		k.ifThen(k.ult(i, width), func() {
-			k.iput(k.at(keep, i), k.iget(k.at(sel, k.floorDiv(i, size))))
+			blk := k.floorDiv(i, size)
+			scored := k.op(opLogicalNot, k.tBool, k.feq(k.get(k.at(bs, blk)), k.toF(k.u32(negInfBits))))
+			k.iput(k.at(keep, i), k.cnt(k.land(k.ine(k.iget(k.at(sel, blk)), k.u32(0)), scored)))
 		})
 	})
 	return k.finish()
@@ -794,6 +780,130 @@ func engramGateKernel(modes floatModes) []uint32 {
 	g := k.load(k.tF32, k.shared(shared, k.u32(2)))
 	k.forRange(lane, dim, k.u32(32), func(i id) {
 		k.put(k.at(x, i), k.roundBF16(k.fadd(xv(i), k.fmul(g, k.get(k.at(value, i))))))
+	})
+	return k.finish()
+}
+
+// selectGroup is the threads of the selection kernels' one workgroup.
+const selectGroup = 256
+
+// orderKey maps a float to a word ordered as the floats are, -0 as +0:
+// larger floats, larger keys.
+func (b *builder) orderKey(f id) id {
+	bits := b.sel(b.feq(f, b.f32(0)), b.u32(0), b.toU(f))
+	neg := b.ine(b.and(bits, b.u32(0x80000000)), b.u32(0))
+	return b.op(opBitwiseXor, b.tU32, bits, b.sel(neg, b.u32(0xffffffff), b.u32(0x80000000)))
+}
+
+// groupSum adds every thread's v (a count below 2^24, as a float) across
+// the workgroup, in shared, and returns the total to all.
+func (k *kbuilder) groupSum(shared, tid, v id) id {
+	k.barrier()
+	k.store(k.shared(shared, tid), k.op(opConvertUToF, k.tF32, v))
+	k.barrier()
+	for s := uint32(selectGroup / 2); s >= 1; s /= 2 {
+		k.ifThen(k.ult(tid, k.u32(s)), func() {
+			k.store(k.shared(shared, tid), k.fadd(k.load(k.tF32, k.shared(shared, tid)), k.load(k.tF32, k.shared(shared, k.iadd(tid, k.u32(s))))))
+		})
+		k.barrier()
+	}
+	return k.op(opConvertFToU, k.tU32, k.load(k.tF32, k.shared(shared, k.u32(0))))
+}
+
+const opConvertFToU = 109
+
+// groupScan returns the count of set flags among the threads before this
+// one (an exclusive prefix sum over the workgroup) and the total.
+func (k *kbuilder) groupScan(shared, tid, flag id) (before, total id) {
+	k.barrier()
+	k.store(k.shared(shared, tid), k.op(opConvertUToF, k.tF32, flag))
+	k.barrier()
+	for s := uint32(1); s < selectGroup; s *= 2 {
+		v := k.local(k.tF32)
+		k.store(v, k.load(k.tF32, k.shared(shared, tid)))
+		k.ifThen(k.uge(tid, k.u32(s)), func() {
+			k.store(v, k.fadd(k.load(k.tF32, v), k.load(k.tF32, k.shared(shared, k.op(opISub, k.tU32, tid, k.u32(s))))))
+		})
+		k.barrier()
+		k.store(k.shared(shared, tid), k.load(k.tF32, v))
+		k.barrier()
+	}
+	inclusive := k.op(opConvertFToU, k.tU32, k.load(k.tF32, k.shared(shared, tid)))
+	total = k.op(opConvertFToU, k.tU32, k.load(k.tF32, k.shared(shared, k.u32(selectGroup-1))))
+	return k.op(opISub, k.tU32, inclusive, flag), total
+}
+
+// selectKernel flags at flags the k largest of n values at vals, as
+// dsv41.topK chooses them (equal values: the lower index first), in one
+// workgroup: the k-th largest key is found bit by bit, counting the keys
+// at least each candidate (32 passes over the values), then the values
+// above it are taken, and of those equal to it the first by index.
+// Push n, k, vals, flags.
+func selectKernel(modes floatModes) []uint32 {
+	k := newKernel(modes, selectGroup, 1)
+	shared := k.workgroupFloats(selectGroup)
+	lid, _ := k.ids()
+	tid := k.component(lid, 0)
+	n, kk, vals, flags := k.p(0), k.p(1), k.p(2), k.p(3)
+	key := func(i id) id { return k.orderKey(k.get(k.at(vals, i))) }
+	count := func(pred func(key id) id) id {
+		c := k.local(k.tU32)
+		k.store(c, k.u32(0))
+		k.forRange(tid, n, k.u32(selectGroup), func(i id) {
+			k.store(c, k.iadd(k.load(k.tU32, c), k.cnt(pred(key(i)))))
+		})
+		return k.groupSum(shared, tid, k.load(k.tU32, c))
+	}
+	t := k.local(k.tU32)
+	k.store(t, k.u32(0))
+	for bit := 31; bit >= 0; bit-- {
+		cand := k.or(k.load(k.tU32, t), k.u32(1<<uint(bit)))
+		c := count(func(x id) id { return k.uge(x, cand) })
+		k.store(t, k.sel(k.uge(c, kk), cand, k.load(k.tU32, t)))
+	}
+	thr := k.load(k.tU32, t)
+	above := count(func(x id) id { return k.ugt(x, thr) })
+	need := k.op(opISub, k.tU32, kk, k.sel(k.ugt(above, kk), kk, above))
+	running := k.local(k.tU32)
+	k.store(running, k.u32(0))
+	k.forRange(k.u32(0), n, k.u32(selectGroup), func(base id) {
+		i := k.iadd(base, tid)
+		in := k.ult(i, n)
+		x := k.local(k.tU32)
+		k.store(x, k.u32(0))
+		k.ifThen(in, func() { k.store(x, key(i)) })
+		eq := k.land(in, k.ieq(k.load(k.tU32, x), thr))
+		before, total := k.groupScan(shared, tid, k.cnt(eq))
+		pick := k.lor(k.land(in, k.ugt(k.load(k.tU32, x), thr)), k.land(eq, k.ult(k.iadd(k.load(k.tU32, running), before), need)))
+		k.ifThen(in, func() { k.iput(k.at(flags, i), k.cnt(k.land(pick, k.ugt(kk, k.u32(0))))) })
+		k.store(running, k.iadd(k.load(k.tU32, running), total))
+	})
+	return k.finish()
+}
+
+// compactKernel writes the indices of the n flags set, ascending, at out,
+// -1 for those from visible on: the indexer's selection. One workgroup.
+// Push n, flags, out, visible.
+func compactKernel(modes floatModes) []uint32 {
+	k := newKernel(modes, selectGroup, 1)
+	shared := k.workgroupFloats(selectGroup)
+	lid, _ := k.ids()
+	tid := k.component(lid, 0)
+	n, flags, out, visible := k.p(0), k.p(1), k.p(2), k.p(3)
+	running := k.local(k.tU32)
+	k.store(running, k.u32(0))
+	k.forRange(k.u32(0), n, k.u32(selectGroup), func(base id) {
+		i := k.iadd(base, tid)
+		in := k.ult(i, n)
+		f := k.local(k.tU32)
+		k.store(f, k.u32(0))
+		k.ifThen(in, func() { k.store(f, k.iget(k.at(flags, i))) })
+		set := k.land(in, k.ine(k.load(k.tU32, f), k.u32(0)))
+		before, total := k.groupScan(shared, tid, k.cnt(set))
+		k.ifThen(set, func() {
+			k.iput(k.at(out, k.iadd(k.load(k.tU32, running), before)), k.sel(k.uge(i, visible), k.u32(0xffffffff), i))
+		})
+		k.store(running, k.iadd(k.load(k.tU32, running), total))
 	})
 	return k.finish()
 }

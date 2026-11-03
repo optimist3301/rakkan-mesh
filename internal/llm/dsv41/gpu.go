@@ -6,6 +6,7 @@ import (
 	"math"
 
 	"github.com/optimist3301/rakkan-mesh/internal/gpu"
+	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
 
 // A part's blocks on a GPU (package gpu, any Vulkan device): GPUPart holds
@@ -24,7 +25,12 @@ type GPUPart struct {
 	blocks []*gpuBlock // by layer; nil outside the part
 	vecs   []float32   // the blocks' vectors, copied into each stage's arena
 	mats   []*gpu.Matrix
+	// hostExperts: the routed experts stay on the host (GPUOptions).
+	hostExperts bool
 }
+
+// HostExperts reports whether the part's routed experts run on the host.
+func (p *GPUPart) HostExperts() bool { return p.hostExperts }
 
 type gpuBlock struct {
 	b                          *block
@@ -43,13 +49,21 @@ type gpuBlock struct {
 	gateBias, qk               int
 }
 
+// GPUOptions chooses what of a part goes to the GPU.
+type GPUOptions struct {
+	// HostExperts keeps the routed experts in RAM, computed on the CPU:
+	// the GPU holds the rest of each block (about 2.5% of its weights for
+	// DeepSeek-V4.1-Flash), selects the experts and receives their outputs.
+	HostExperts bool
+}
+
 // ToGPU uploads the part's blocks to a device.
-func (m *Model) ToGPU(d *gpu.Device) (*GPUPart, error) {
+func (m *Model) ToGPU(d *gpu.Device, o GPUOptions) (*GPUPart, error) {
 	c := m.Cfg
 	if c.HCMult != 4 {
 		return nil, errors.New("dsv41: the GPU kernels take 4 stream copies")
 	}
-	p := &GPUPart{m: m, d: d, blocks: make([]*gpuBlock, c.Layers)}
+	p := &GPUPart{m: m, d: d, blocks: make([]*gpuBlock, c.Layers), hostExperts: o.HostExperts}
 	fail := func(err error) (*GPUPart, error) {
 		p.Free()
 		return nil, err
@@ -156,12 +170,15 @@ func (p *GPUPart) upload(b *block) (*gpuBlock, error) {
 	// The routed experts, stacked: an expert's rows in one part.
 	stack := func(get func(e *expert) *linear) (*gpu.Matrix, error) {
 		first := get(&b.ffn.experts[0])
-		var q, s []byte
+		var q, s [][]byte
 		for i := range b.ffn.experts {
 			l := get(&b.ffn.experts[i])
-			q, s = append(q, l.q...), append(s, l.scales...)
+			q, s = append(q, l.q), append(s, l.scales)
 		}
-		return p.mat(first.rows*len(b.ffn.experts), first.cols, gpu.Format{FP4: q, E8M0: s, AlignRows: first.rows})
+		return p.mat(first.rows*len(b.ffn.experts), first.cols, gpu.Format{FP4Chunks: q, E8M0Chunks: s, AlignRows: first.rows})
+	}
+	if p.hostExperts {
+		goto engram
 	}
 	if g.w1, err = stack(func(e *expert) *linear { return e.w1 }); err != nil {
 		return nil, err
@@ -172,6 +189,7 @@ func (p *GPUPart) upload(b *block) (*gpuBlock, error) {
 	if g.w3, err = stack(func(e *expert) *linear { return e.w3 }); err != nil {
 		return nil, err
 	}
+engram:
 	if e := b.engram; e != nil {
 		g.qk = p.vec(e.qk)
 		if g.ewkv, err = p.lin(e.wkv); err != nil {
@@ -196,6 +214,7 @@ type GPUStage struct {
 	source              int
 	newKV, newIdx       bool
 	maxEntries, maxRows int
+	act                 num.ActFP8 // host experts' scratch
 }
 
 // gpuLayout is where things are in a stage's arena, in words.
@@ -236,9 +255,11 @@ func (p *GPUPart) StageBytes(positions int) int64 {
 	return 4 * int64(l.words)
 }
 
-// DropHostWeights lets the host copy of the part's weight matrices go,
-// once on the GPU: the CPU can no longer run the part.
-func (m *Model) DropHostWeights() {
+// DropHostWeights lets the host copy of the weights on the GPU go: the
+// CPU can no longer run the part. Routed experts kept on the host stay.
+func (p *GPUPart) DropHostWeights() { p.m.dropHostWeights(p.hostExperts) }
+
+func (m *Model) dropHostWeights(keepExperts bool) {
 	drop := func(l *linear) {
 		if l != nil {
 			l.q, l.scales, l.bf, l.f = nil, nil, nil, nil
@@ -254,6 +275,9 @@ func (m *Model) DropHostWeights() {
 			drop(l)
 		}
 		for i := range b.ffn.experts {
+			if keepExperts {
+				break
+			}
 			e := &b.ffn.experts[i]
 			drop(e.w1)
 			drop(e.w2)
@@ -445,8 +469,11 @@ func (s *GPUStage) Forward(p *Payload, pos int) error {
 		b.Write(l.cs+2*rd, m.ropes[1].at(pos-1))
 	}
 	for i := m.from; i < m.to; i++ {
-		if err := s.block(b, s.p.blocks[i], p, pos); err != nil {
-			b.Submit()
+		var err error
+		if b, err = s.block(b, s.p.blocks[i], p, pos); err != nil {
+			if b != nil {
+				b.Submit()
+			}
 			return err
 		}
 	}
@@ -498,8 +525,9 @@ func (s *GPUStage) Forward(p *Payload, pos int) error {
 	return nil
 }
 
-// block records one block, as State.block.
-func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, p *Payload, pos int) error {
+// block records one block, as State.block, and returns the batch to go on
+// with: a new one if host experts had the batch submitted.
+func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, p *Payload, pos int) (*gpu.Batch, error) {
 	c := s.p.m.Cfg
 	l := &s.l
 	dim, hc := c.Dim, c.HCMult
@@ -507,7 +535,7 @@ func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, p *Payload, pos int) error {
 	if e := g.b.engram; e != nil {
 		emb, err := e.embeddings(p.Hashes[e.index], c)
 		if err != nil {
-			return err
+			return b, err
 		}
 		b.Write(l.emb, emb)
 		b.MatVecs([]*gpu.Matrix{g.ewkv}, []int{l.ekv}, l.emb)
@@ -526,10 +554,13 @@ func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, p *Payload, pos int) error {
 	b.HCSplit(l.mix, l.h, hc*dim, v+g.fBase, v+g.fScl, c.HCSinkhornIters, c.HCEps, c.NormEps, l.fPre, l.fPost, l.fComb)
 	b.HCPre(dim, l.h, l.aPre, l.x)
 	b.DSNorm(l.x, l.x, v+g.ffnNorm, dim, 1, 0, c.NormEps)
-	s.moe(b, g)
+	b, err := s.moe(b, g)
+	if err != nil {
+		return nil, err
+	}
 	b.HCPost(dim, l.h, l.y, l.res, l.fPost, l.fComb)
 	b.Copy(l.fPre, l.preMix, hc)
-	return nil
+	return b, nil
 }
 
 // bf16Lin records a bfloat16 product: rounded to bfloat16 for kindBF16.
@@ -693,13 +724,15 @@ func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, pos, prefillN int, latent 
 	}
 	k := min(c.IndexTopK, width)
 	if k > 0 {
-		b.TopKSorted(width, k, l.scores, l.topk, l.flags, visible)
+		b.SelectSorted(width, k, l.scores, l.topk, l.flags, visible)
 	}
 	s.topkSet, s.topkN = true, k
 }
 
-// moe records State.moe for the input at x into y.
-func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock) {
+// moe records State.moe for the input at x into y. With host experts the
+// batch is submitted once the experts are chosen: the CPU computes them
+// as State.expert does, and a new batch takes their outputs.
+func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock) (*gpu.Batch, error) {
 	c := s.p.m.Cfg
 	l := &s.l
 	f := g.b.ffn
@@ -708,6 +741,31 @@ func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock) {
 	b.MoEScores(E, l.z, l.vecs+g.gateBias, f.scoreFn == "sigmoid", l.score, l.biased)
 	b.TopK(E, k, l.biased, l.esel)
 	b.MoEWeights(k, l.score, l.esel, f.normTopK, f.scale, l.order, l.ew)
+	if s.p.hostExperts {
+		// The shared expert first, recorded before the batch goes.
+		b.MatVecs([]*gpu.Matrix{g.s1, g.s3}, []int{l.sg, l.su}, l.x)
+		b.SiluMulDS(inter, l.sg, l.su, f.limit, false, 0, 1, 0)
+		b.MatVecs([]*gpu.Matrix{g.s2}, []int{l.sout}, l.sg)
+		x, order, w := make([]float32, dim), make([]float32, k), make([]float32, k)
+		b.Read(l.x, x)
+		b.Read(l.order, order)
+		b.Read(l.ew, w)
+		if err := b.Submit(); err != nil {
+			return nil, err
+		}
+		outs := make([]float32, 0, k*dim)
+		for i := range k {
+			e := int(math.Float32bits(order[i]))
+			if e >= E {
+				return nil, fmt.Errorf("dsv41: expert %d of %d", e, E)
+			}
+			outs = append(outs, runExpert(&f.experts[e], x, w[i], true, f.limit, &s.act)...)
+		}
+		b = s.a.Begin()
+		b.Write(l.eouts, outs)
+		b.MoESum(dim, l.eouts, k, dim, l.sout, l.y)
+		return b, nil
+	}
 	b.ExpertMatVecs(g.w1, inter, l.order, k, l.x, 0, l.eg, inter, l.eqx, l.exs)
 	b.ExpertMatVecs(g.w3, inter, l.order, k, l.x, 0, l.eu, inter, l.eqx, l.exs)
 	b.SiluMulDS(inter, l.eg, l.eu, f.limit, true, l.ew, k, inter)
@@ -716,4 +774,5 @@ func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock) {
 	b.SiluMulDS(inter, l.sg, l.su, f.limit, false, 0, 1, 0)
 	b.MatVecs([]*gpu.Matrix{g.s2}, []int{l.sout}, l.sg)
 	b.MoESum(dim, l.eouts, k, dim, l.sout, l.y)
+	return b, nil
 }

@@ -74,6 +74,9 @@ type advert struct {
 	// Device is set. FreeCache, if set, is memory for caches apart.
 	FreeMem   int64 `json:"free_mem"`
 	FreeCache int64 `json:"free_cache,omitempty"`
+	// FreeHost, on a GPU node, is its RAM for what of a layer may run on
+	// the CPU beside the GPU (DeepSeek's routed experts).
+	FreeHost int64 `json:"free_host,omitempty"`
 	// FreeDisk is the blob store's room, for parts read from disk as
 	// they are used (DeepSeek-V4.1's Engram tables).
 	FreeDisk int64 `json:"free_disk,omitempty"`
@@ -140,10 +143,13 @@ type loaded struct {
 	dsClose  func()         // releases their Engram tables
 	bytes    int64
 	onDevice bool // bytes are device memory
-	users    int
-	lastUsed time.Time
-	ready    chan struct{} // closed once loaded
-	err      error
+	// hostBytes is RAM a shard on the device holds too (its experts),
+	// accounted as soon as it is placed.
+	hostBytes int64
+	users     int
+	lastUsed  time.Time
+	ready     chan struct{} // closed once loaded
+	err       error
 }
 
 func (l *loaded) isLoaded() bool { return l.layers != nil || l.ds != nil }
@@ -282,8 +288,9 @@ func (s *Service) advert() advert {
 	defer s.mu.Unlock()
 	a := advert{Serves: s.cfg.Serve, FreeMem: s.cfg.MemoryBytes - s.used, Speed: s.speed, FreeDisk: s.blobs.Store().Room()}
 	if s.cfg.Device != nil {
-		// Weights and caches share the GPU's memory.
+		// Weights and caches share the GPU's memory; RAM can hold experts.
 		a.Device = s.deviceName()
+		a.FreeHost = a.FreeMem
 		a.FreeMem = s.cfg.DeviceBytes - s.devUsed
 	}
 	for sh, l := range s.shards {
@@ -380,13 +387,13 @@ func (s *Service) acquire(ctx context.Context, model blob.ID, from, to int, prov
 			}
 		}
 		if err == nil && got.ds != nil {
-			if part, devBytes, ok := s.deepseekToDevice(got.manifest, got.ds, from, to); ok {
-				got.dsGPU, got.bytes, got.onDevice = part, devBytes, true
+			if part, devBytes, hostBytes, ok := s.deepseekToDevice(got.manifest, got.ds, from, to); ok {
+				got.dsGPU, got.bytes, got.hostBytes, got.onDevice = part, devBytes, hostBytes, true
 			}
 		}
 		s.mu.Lock()
 		if err == nil {
-			l.manifest, l.layers, l.rope, l.ds, l.dsGPU, l.dsClose, l.bytes, l.onDevice = got.manifest, got.layers, got.rope, got.ds, got.dsGPU, got.dsClose, got.bytes, got.onDevice
+			l.manifest, l.layers, l.rope, l.ds, l.dsGPU, l.dsClose, l.bytes, l.hostBytes, l.onDevice = got.manifest, got.layers, got.rope, got.ds, got.dsGPU, got.dsClose, got.bytes, got.hostBytes, got.onDevice
 		}
 		l.err = err
 		if l.err != nil {
@@ -579,6 +586,7 @@ func (s *Service) drop(k Shard) {
 			l.dsGPU.Free()
 		}
 		s.devUsed -= l.bytes
+		s.used -= l.hostBytes
 	} else {
 		s.used -= l.bytes
 	}

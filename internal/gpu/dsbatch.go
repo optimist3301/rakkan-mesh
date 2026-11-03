@@ -95,24 +95,31 @@ func (b *Batch) IndexScores(width, visible, q, keys, w, heads, dim, out, cand, c
 // block.
 func (b *Batch) CandidatePool(width, visible, k, size, scores, bs, sel, keep int) {
 	n := (width + size - 1) / size
-	for phase, count := range []int{n, n, width} {
+	phase := func(p uint32, count int) {
 		b.dispatch(kindCandPool, 0, groups(count, flatGroup), 1, uint32(width), uint32(visible), uint32(k), uint32(size),
-			uint32(scores), uint32(bs), uint32(sel), uint32(keep), uint32(phase))
+			uint32(scores), uint32(bs), uint32(sel), uint32(keep), p)
 	}
+	phase(0, n)
+	b.Select(n, min(k, n), bs, sel)
+	phase(2, width)
 }
 
 // TopK writes the indices of the k largest of n values at vals, by rank,
 // at out.
 func (b *Batch) TopK(n, k, vals, out int) {
-	b.dispatch(kindTopK, 0, groups(n, flatGroup), 1, uint32(n), uint32(k), uint32(vals), uint32(out), 0, 0, 0)
+	b.dispatch(kindTopK, 0, groups(n, flatGroup), 1, uint32(n), uint32(k), uint32(vals), uint32(out))
 }
 
-// TopKSorted writes the indices of the k largest of n values in ascending
-// order at out, -1 for those from visible on; flags is scratch for n.
-func (b *Batch) TopKSorted(n, k, vals, out, flags, visible int) {
-	for mode := uint32(1); mode <= 2; mode++ {
-		b.dispatch(kindTopK, 0, groups(n, flatGroup), 1, uint32(n), uint32(k), uint32(vals), uint32(out), mode, uint32(flags), uint32(visible))
-	}
+// Select flags at flags the k largest of n values at vals (dsv41.topK's
+// choice) in 32·n steps; SelectSorted also writes their indices ascending
+// at out, -1 for those from visible on.
+func (b *Batch) Select(n, k, vals, flags int) {
+	b.dispatch(kindSelect, 0, 1, 1, uint32(n), uint32(k), uint32(vals), uint32(flags))
+}
+
+func (b *Batch) SelectSorted(n, k, vals, out, flags, visible int) {
+	b.Select(n, k, vals, flags)
+	b.dispatch(kindCompact, 0, 1, 1, uint32(n), uint32(flags), uint32(out), uint32(visible))
 }
 
 // SparseAttention attends the heads' queries at q to nWin rows listed at
