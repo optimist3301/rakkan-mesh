@@ -32,6 +32,7 @@ const (
 	kindEngramGate
 	kindSelect
 	kindCompact
+	kindFP8Batch
 	kindAllCount
 )
 
@@ -79,6 +80,8 @@ func dsKernel(k kernelKind, modes floatModes) []uint32 {
 		return selectKernel(modes)
 	case kindCompact:
 		return compactKernel(modes)
+	case kindFP8Batch:
+		return mxBatchKernel(kindFP8, modes)
 	}
 	panic("gpu: unknown kernel")
 }

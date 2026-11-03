@@ -345,21 +345,37 @@ func TestRealLayersGPU(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				elapsed = 0
-				for pos := range T {
-					p := mk(pos)
+				// The prompt in batches, the generation position by position.
+				var prefill, decoding time.Duration
+				for pos := 0; pos < T; {
+					n := 1
+					if pos < P {
+						n = min(GPUBatch, P-pos)
+					}
+					ps := make([]*Payload, n)
+					for j := range ps {
+						ps[j] = mk(pos + j)
+					}
 					start := time.Now()
-					if err := gs.Forward(p, pos); err != nil {
+					if err := gs.ForwardBatch(ps, pos); err != nil {
 						t.Fatal(err)
 					}
-					elapsed += time.Since(start)
-					if got, _ := AppendPayload(nil, cfg, p); !bytes.Equal(got, want[pos]) {
-						ref, _, _ := DecodePayload(want[pos], cfg, T)
-						t.Fatalf("host experts %v, position %d: %s", o.HostExperts, pos, payloadDiff(cfg, p, ref))
+					if pos < P {
+						prefill += time.Since(start)
+					} else {
+						decoding += time.Since(start)
 					}
+					for j, p := range ps {
+						if got, _ := AppendPayload(nil, cfg, p); !bytes.Equal(got, want[pos+j]) {
+							ref, _, _ := DecodePayload(want[pos+j], cfg, T)
+							t.Fatalf("host experts %v, position %d: %s", o.HostExperts, pos+j, payloadDiff(cfg, p, ref))
+						}
+					}
+					pos += n
 				}
-				t.Logf("GPU (%s), host experts %v: %d positions bit for bit, %s per position, %d MiB on the GPU",
-					dev.Info().Name, o.HostExperts, T, per(elapsed), gp.Bytes()>>20)
+				t.Logf("GPU (%s), host experts %v: %d positions bit for bit; prompt in batches of %d %s, generation %s per position; %d MiB on the GPU",
+					dev.Info().Name, o.HostExperts, T, GPUBatch, (prefill / time.Duration(P)).Round(time.Millisecond),
+					(decoding / time.Duration(T-P)).Round(time.Millisecond), gp.Bytes()>>20)
 				gs.Close()
 				gp.Free()
 			}

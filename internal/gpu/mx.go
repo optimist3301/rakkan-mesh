@@ -188,8 +188,9 @@ func mxKernel(kind kernelKind, modes floatModes) []uint32 { return mxKernelGen(k
 // rows apart, for slots selected experts: workgroup row y is a slot, whose
 // expert is at word ids+y; experts outside the part's [e0, e1) are left to
 // another part's dispatch. Each slot has its own input (qx, xs strides)
-// and output (out stride). Push rows (per expert), cols, gridX, out, qx,
-// xs, raw, ids, e0, e1, qxStride, xsStride, outStride.
+// and output (out stride); slot s takes input s / div. Push rows (per
+// expert), cols, gridX, out, qx, xs, raw, ids, e0, e1, qxStride, xsStride,
+// outStride, div.
 func mxKernelIndexed(modes floatModes) []uint32 { return mxKernelGen(kindFP4, modes, true) }
 
 func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
@@ -213,8 +214,9 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 		e := k.iget(k.at(k.p(7), slot))
 		inPart = k.land(k.uge(e, k.p(8)), k.ult(e, k.p(9)))
 		rowOff = k.imul(k.op(opISub, k.tU32, e, k.p(8)), rows)
-		qxOff = k.iadd(qxOff, k.imul(slot, k.p(10)))
-		xsOff = k.iadd(xsOff, k.imul(slot, k.p(11)))
+		in := k.floorDiv(slot, k.p(13)) // slots sharing an input
+		qxOff = k.iadd(qxOff, k.imul(in, k.p(10)))
+		xsOff = k.iadd(xsOff, k.imul(in, k.p(11)))
 		outOff = k.iadd(outOff, k.imul(slot, k.p(12)))
 	}
 	base := k.iadd(k.imul(group, k.u32(2*mxRows)), k.imul(ly, k.u32(mxRows)))
@@ -328,4 +330,81 @@ func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []i
 	}
 	sbyte := k.and(k.shr(k.word(ws, k.shr(sidx, k.u32(2))), k.imul(k.and(sidx, k.u32(3)), k.u32(8))), k.u32(0xff))
 	return k.fmul(k.fmul(sum, xsc), k.e8m0(sbyte))
+}
+
+// mxBatchMax is how many inputs mxBatchKernel multiplies at once: its
+// lanes add one row and input each.
+const mxBatchMax = laneCount / mxRows
+
+// mxBatchKernel is mxKernel for up to mxBatchMax inputs at once, each
+// quantized at qx + j·qxStride (scales xs + j·xsStride), into out +
+// j·outStride: the weights are read once for all, and each row and input
+// gets mxKernel's terms added in its order. Lane L adds row L mod mxRows
+// for input L / mxRows. Push rows, cols, gridX, out, qx, xs, raw, n,
+// qxStride, xsStride, outStride.
+func mxBatchKernel(kind kernelKind, modes floatModes) []uint32 {
+	k := newKernel(modes, laneCount, 2)
+	w, ws := k.storageBuffer(0, true), k.storageBuffer(1, true)
+	terms := k.workgroupFloats(laneCount * 2 * mxRows * mxBatchMax)
+	acc, chunk := k.local(k.tF32), k.local(k.tU32)
+	lid, wid := k.ids()
+	lane, ly := k.component(lid, 0), k.component(lid, 1)
+	rows, cols, outOff, qxOff, xsOff, raw := k.p(0), k.p(1), k.p(3), k.p(4), k.p(5), k.p(6)
+	nIn, qxStride, xsStride, outStride := k.p(7), k.p(8), k.p(9), k.p(10)
+	group := k.iadd(k.imul(k.component(wid, 1), k.p(2)), k.component(wid, 0))
+	base := k.iadd(k.imul(group, k.u32(2*mxRows)), k.imul(ly, k.u32(mxRows)))
+	nb := k.shr(cols, k.u32(5))
+	chunks := k.shr(k.iadd(nb, k.u32(laneCount-1)), k.u32(5))
+	myQ, myIn := k.umod(lane, k.u32(mxRows)), k.floorDiv(lane, k.u32(mxRows))
+	myRow := k.iadd(base, myQ)
+	// terms[ly][input][q][lane]
+	slot := func(j, q, l id) id {
+		return k.iadd(k.imul(k.iadd(k.imul(k.iadd(k.imul(ly, k.u32(mxBatchMax)), j), k.u32(mxRows)), q), k.u32(laneCount)), l)
+	}
+	k.store(acc, k.f32(0))
+	k.store(chunk, k.u32(0))
+	k.loop(func() id { return k.ult(k.load(k.tU32, chunk), chunks) }, func() {
+		c := k.load(k.tU32, chunk)
+		blk := k.iadd(k.imul(c, k.u32(laneCount)), lane)
+		k.forRange(k.u32(0), nIn, k.u32(1), func(j id) {
+			term := make([]id, mxRows)
+			for q := range term {
+				term[q] = k.local(k.tF32)
+				k.store(term[q], k.f32(0))
+			}
+			k.ifThen(k.land(k.ult(base, rows), k.ult(blk, nb)), func() {
+				xbase := k.iadd(k.iadd(qxOff, k.imul(j, qxStride)), k.imul(blk, k.u32(32)))
+				xs := make([]id, 32)
+				for e := range xs {
+					xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
+				}
+				xsc := k.get(k.at(k.iadd(xsOff, k.imul(j, xsStride)), blk))
+				for q := range uint32(mxRows) {
+					row := k.iadd(base, k.u32(q))
+					k.ifThen(k.ult(row, rows), func() {
+						k.store(term[q], k.mxBlock(kind, w, ws, row, cols, nb, blk, xs, xsc))
+					})
+				}
+			})
+			for q := range uint32(mxRows) {
+				k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.load(k.tF32, term[q]))
+			}
+		})
+		k.barrier()
+		k.ifThen(k.ult(myIn, nIn), func() {
+			first := k.imul(c, k.u32(laneCount))
+			for j := range uint32(laneCount) {
+				k.ifThen(k.ult(k.iadd(first, k.u32(j)), nb), func() {
+					t := k.load(k.tF32, k.shared(terms, slot(myIn, myQ, k.u32(j))))
+					k.store(acc, k.fadd(k.load(k.tF32, acc), t))
+				})
+			}
+		})
+		k.barrier()
+	}, func() { k.store(chunk, k.iadd(k.load(k.tU32, chunk), k.u32(1))) })
+	k.ifThen(k.land(k.ult(myIn, nIn), k.ult(myRow, rows)), func() {
+		v := k.load(k.tF32, acc)
+		k.put(k.at(k.iadd(outOff, k.imul(myIn, outStride)), myRow), k.selF(k.ieq(raw, k.u32(0)), k.roundBF16(v), v))
+	})
+	return k.finish()
 }

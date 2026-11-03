@@ -199,7 +199,10 @@ engram:
 	return g, nil
 }
 
-// GPUStage is one generation on a GPUPart: Stage on the GPU.
+// GPUStage is one generation on a GPUPart: Stage on the GPU. It takes
+// positions in batches of up to GPUBatch (ForwardBatch): each block runs
+// for all of them before the next, its E4M3 products reading the weights
+// once for the batch, and its attention position by position, in order.
 type GPUStage struct {
 	p         *GPUPart
 	a         *gpu.Arena
@@ -207,37 +210,48 @@ type GPUStage struct {
 	pos       int
 	l         gpuLayout
 	compN     []int // entries in each source's caches
-	// The state of the current step's shared attention, as State's.
-	topkN               int
-	topkSet, candSet    bool
-	candLen             int
-	source              int
-	newKV, newIdx       bool
-	maxEntries, maxRows int
-	act                 num.ActFP8 // host experts' scratch
+	source    int   // the latest KV source run, as State's shared.source
+	// The batch's positions' shared attention state, as State's.
+	pp         []gpuPos
+	maxEntries int
+	act        num.ActFP8 // host experts' scratch
 }
 
-// gpuLayout is where things are in a stage's arena, in words.
+// gpuPos is a batch position's shared attention state.
+type gpuPos struct {
+	topkN, candLen   int
+	topkSet, candSet bool
+	newKV, newIdx    bool
+	entry            int // the index of the entry it cached, if new
+}
+
+// GPUBatch is how many positions ForwardBatch takes at once.
+const GPUBatch = gpu.MatBatchMax
+
+// gpuLayout is where things are in a stage's arena, in words. Arrays of
+// the batch's positions are stride apart: the field's size.
 type gpuLayout struct {
-	vecs                              int
-	h, res, preMix, mix               int
-	aPre, aPost, aComb, fPre, fPost   int
-	fComb, x, y                       int
-	qr, q, o, low, acc, rows, cs      int
-	latent, iq, iw, scores, bs, sel   int
-	cand, topk, flags                 int
-	z, score, biased, esel, order, ew int
-	eg, eu, eouts, sg, su, sout       int
-	eqx, exs                          int
-	emb, ekv                          int
-	qx, xs                            int
-	window, comp, idx                 []int // by layer
-	kvSlots, scSlots                  []int // the compressors' open groups
-	words                             int
+	vecs                            int
+	h, res, preMix, mix             int
+	aPre, aPost, aComb, fPre, fPost int
+	fComb, x, y                     int
+	qr, q, o, low, acc, rows, cs    int
+	kvb, kvExt, scExt               int // the batch's window rows, a compressor's open groups
+	latent, iq, iw, scores, bs, sel int
+	cand, topk, flags               int
+	z, score, biased, esel          int
+	order, ew                       int
+	eg, eu, eouts, sg, su, sout     int
+	eqx, exs                        int
+	emb, ekv, embLen                int
+	qx, xs, maxCols                 int
+	window, comp, idx               []int // by layer
+	kvSlots, scSlots                []int // the compressors' open groups between batches
+	words                           int
 }
 
-// csSlots are the rotary tables a step uses: plain and compressed at the
-// position, compressed at the one before (a group's first, for ratio 2).
+// csSlots are the rotary tables a position uses: plain and compressed at
+// the position, compressed at the one before (a group's first, ratio 2).
 const csSlots = 3
 
 // Bytes is the device memory the part's weights take.
@@ -293,11 +307,9 @@ func (m *Model) dropHostWeights(keepExperts bool) {
 // NewStage starts a generation of up to positions on the part.
 func (p *GPUPart) NewStage(positions int) (*GPUStage, error) {
 	c := p.m.Cfg
-	s := &GPUStage{p: p, positions: positions, compN: make([]int, c.Layers), source: -1}
+	s := &GPUStage{p: p, positions: positions, compN: make([]int, c.Layers), source: -1, maxEntries: positions + 1}
 	l, staging := p.layout(positions)
 	s.l = l
-	s.maxEntries = positions + 1
-	s.maxRows = c.Window
 	a, err := p.d.NewArena(l.words, staging)
 	if err != nil {
 		return nil, err
@@ -324,35 +336,38 @@ func (p *GPUPart) layout(positions int) (gpuLayout, int) {
 		at += (n + 3) &^ 3
 		return off
 	}
+	B := GPUBatch
+	batch := func(n int) int { return alloc(B * n) }
 	dim, hc, hd := c.Dim, c.HCMult, c.HeadDim
-	inter := c.MoEInter
-	k := c.ActiveExperts
-	maxCols := max(dim, hd*c.Heads/c.OGroups, c.OGroups*c.OLoRA, c.QLoRA, inter, hc*dim)
+	inter, k := c.MoEInter, c.ActiveExperts
+	l.maxCols = max(dim, hd*c.Heads/c.OGroups, c.OGroups*c.OLoRA, c.QLoRA, inter, hc*dim)
 	if c.EngramDim > 0 {
-		maxCols = max(maxCols, (c.EngramMaxNgram-1)*c.EngramHeads*c.EngramDim)
+		l.embLen = (c.EngramMaxNgram - 1) * c.EngramHeads * c.EngramDim
+		l.maxCols = max(l.maxCols, l.embLen)
 	}
 	l.vecs = alloc(len(p.vecs))
-	l.h, l.res, l.preMix, l.mix = alloc(hc*dim), alloc(hc*dim), alloc(hc), alloc((2+hc)*hc)
-	l.aPre, l.aPost, l.aComb = alloc(hc), alloc(hc), alloc(hc*hc)
-	l.fPre, l.fPost, l.fComb = alloc(hc), alloc(hc), alloc(hc*hc)
-	l.x, l.y = alloc(dim), alloc(dim)
-	l.qr, l.q, l.o = alloc(c.QLoRA), alloc(c.Heads*hd), alloc(c.Heads*hd)
-	l.low, l.acc = alloc(c.OGroups*c.OLoRA), alloc(c.Heads*hd)
-	l.rows, l.cs = alloc(c.Window), alloc(csSlots*c.RopeDim)
+	l.h, l.res, l.preMix, l.mix = batch(hc*dim), batch(hc*dim), batch(hc), alloc((2+hc)*hc)
+	l.aPre, l.aPost, l.aComb = batch(hc), batch(hc), batch(hc*hc)
+	l.fPre, l.fPost, l.fComb = batch(hc), batch(hc), batch(hc*hc)
+	l.x, l.y = batch(dim), batch(dim)
+	l.qr, l.q, l.o = batch(c.QLoRA), batch(c.Heads*hd), batch(c.Heads*hd)
+	l.low, l.acc = batch(c.OGroups*c.OLoRA), alloc(c.Heads*hd)
+	l.rows, l.cs = alloc(c.Window), batch(csSlots*c.RopeDim)
+	l.kvb, l.kvExt, l.scExt = batch(hd), alloc((B+2)*hd), alloc((B+2)*hd)
 	l.latent = alloc(hd)
-	l.iq, l.iw = alloc(c.IndexHeads*c.IndexDim), alloc(c.IndexHeads)
+	l.iq, l.iw = batch(c.IndexHeads*c.IndexDim), alloc(c.IndexHeads)
 	l.scores, l.bs, l.sel = alloc(positions), alloc(positions), alloc(positions)
-	l.cand, l.topk, l.flags = alloc(positions), alloc(max(c.IndexTopK, 1)), alloc(positions)
+	l.cand, l.topk, l.flags = batch(positions), batch(max(c.IndexTopK, 1)), alloc(positions)
 	E := c.RoutedExperts
-	l.z, l.score, l.biased = alloc(E), alloc(E), alloc(E)
-	l.esel, l.order, l.ew = alloc(k), alloc(k), alloc(k)
-	l.eg, l.eu, l.eouts = alloc(k*inter), alloc(k*inter), alloc(k*dim)
-	l.sg, l.su, l.sout = alloc(inter), alloc(inter), alloc(dim)
-	l.eqx, l.exs = alloc(k*max(dim, inter)), alloc(k*max(dim, inter)/32)
+	l.z, l.score, l.biased, l.esel = alloc(E), alloc(E), alloc(E), alloc(k)
+	l.order, l.ew = batch(k), batch(k)
+	l.eg, l.eu, l.eouts = batch(k*inter), batch(k*inter), batch(k*dim)
+	l.sg, l.su, l.sout = batch(inter), batch(inter), batch(dim)
+	l.eqx, l.exs = batch(k*max(dim, inter)), batch(k*max(dim, inter)/32)
 	if c.EngramDim > 0 {
-		l.emb, l.ekv = alloc((c.EngramMaxNgram-1)*c.EngramHeads*c.EngramDim), alloc(dim*(hc+1))
+		l.emb, l.ekv = batch(l.embLen), batch(dim*(hc+1))
 	}
-	l.qx, l.xs = alloc(maxCols), alloc(maxCols/32)
+	l.qx, l.xs = batch(l.maxCols), batch(l.maxCols/32)
 	l.window = make([]int, c.Layers)
 	l.comp, l.idx = make([]int, c.Layers), make([]int, c.Layers)
 	l.kvSlots, l.scSlots = make([]int, c.Layers), make([]int, c.Layers)
@@ -372,9 +387,9 @@ func (p *GPUPart) layout(positions int) (gpuLayout, int) {
 		}
 	}
 	l.words = at
-	staging := 2*hc*dim + 2*(hd+c.IndexDim) + 2*positions + c.Layers*(c.Window+4) + csSlots*c.RopeDim + 2*max(c.IndexTopK, 1) + 4096
+	staging := B*(2*hc*dim+2*(hd+c.IndexDim)+2*positions+2*max(c.IndexTopK, 1)+csSlots*c.RopeDim+c.Layers*(c.Window+4)+2*k*dim) + 4096
 	if c.EngramDim > 0 {
-		staging += (c.EngramMaxNgram - 1) * c.EngramHeads * c.EngramDim * len(c.EngramLayers)
+		staging += B * l.embLen * len(c.EngramLayers)
 	}
 	return lay, max(staging, len(p.vecs))
 }
@@ -400,77 +415,94 @@ func words(v []int) []uint32 {
 
 // Forward runs the part's blocks on the Payload of position pos, as
 // Stage.Forward does.
-func (s *GPUStage) Forward(p *Payload, pos int) error {
+func (s *GPUStage) Forward(p *Payload, pos int) error { return s.ForwardBatch([]*Payload{p}, pos) }
+
+// ForwardBatch runs the part's blocks on the Payloads of positions pos,
+// pos+1, ... (GPUBatch at most), as Stage.Forward on each in turn does.
+func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 	m, c := s.p.m, s.p.m.Cfg
 	l := &s.l
-	if pos != s.pos {
+	B := len(ps)
+	switch {
+	case B == 0:
+		return nil
+	case B > GPUBatch:
+		return fmt.Errorf("dsv41: %d positions in a batch, at most %d", B, GPUBatch)
+	case pos != s.pos:
 		return fmt.Errorf("dsv41: position %d, the stage expects %d", pos, s.pos)
+	case pos+B > s.positions:
+		return fmt.Errorf("dsv41: positions to %d beyond the stage's %d", pos+B, s.positions)
 	}
-	if pos >= s.positions {
-		return fmt.Errorf("dsv41: position %d beyond the stage's %d", pos, s.positions)
-	}
-	if want := sourceBefore(c, m.from); p.Source != want {
-		return fmt.Errorf("dsv41: payload from the KV source %d, layer %d follows %d", p.Source, m.from, want)
-	}
-	if p.Prefill > s.positions || len(p.Candidates) > s.positions {
-		return errors.New("dsv41: payload beyond the stage's positions")
-	}
+	hc, dim, rd := c.HCMult, c.Dim, c.RopeDim
+	s.pp = make([]gpuPos, B)
 	b := s.a.Begin()
-	b.Write(l.h, p.H)
-	b.Write(l.preMix, p.PreMix)
-	s.source, s.newKV, s.newIdx = p.Source, false, false
-	if src := p.Source; src >= 0 {
-		n := s.compN[src]
+	fail := func(err error) error {
+		b.Submit()
+		return err
+	}
+	src := sourceBefore(c, m.from)
+	n := 0
+	if src >= 0 {
+		n = s.compN[src]
+	}
+	for i, p := range ps {
+		q := pos + i
+		switch {
+		case p.Source != src:
+			return fail(fmt.Errorf("dsv41: payload from the KV source %d, layer %d follows %d", p.Source, m.from, src))
+		case p.Prefill > s.positions || len(p.Candidates) > s.positions:
+			return fail(errors.New("dsv41: payload beyond the stage's positions"))
+		case (p.CompKV == nil) != (p.IndexK == nil):
+			// Every KV source is an index source: both come, or neither.
+			return fail(errors.New("dsv41: a compressed entry without its indexer key"))
+		case src < 0 && (len(p.TopK) > 0 || p.CompKV != nil):
+			return fail(errors.New("dsv41: compressed entries before any KV source"))
+		}
+		b.Write(l.h+i*hc*dim, p.H)
+		b.Write(l.preMix+i*hc, p.PreMix)
 		if p.CompKV != nil {
 			if n >= s.maxEntries {
-				return errors.New("dsv41: more compressed entries than positions")
+				return fail(errors.New("dsv41: more compressed entries than positions"))
 			}
 			b.Write(l.comp[src]+n*c.HeadDim, p.CompKV)
-			s.newKV = true
-		}
-		if p.IndexK != nil {
 			b.Write(l.idx[src]+n*c.IndexDim, p.IndexK)
-			s.newIdx = true
-		}
-		if p.CompKV != nil {
-			s.compN[src]++
-		}
-		if (p.CompKV == nil) != (p.IndexK == nil) {
-			// Every KV source is an index source: both come, or neither.
-			return errors.New("dsv41: a compressed entry without its indexer key")
+			s.pp[i].newKV, s.pp[i].newIdx, s.pp[i].entry = true, true, n
+			n++
 		}
 		for _, g := range p.TopK {
-			if g >= s.compN[src] {
-				return fmt.Errorf("dsv41: selected entry %d of %d", g, s.compN[src])
+			if g >= n {
+				return fail(fmt.Errorf("dsv41: selected entry %d of %d", g, n))
 			}
 		}
-	} else if len(p.TopK) > 0 || p.CompKV != nil || p.IndexK != nil {
-		return errors.New("dsv41: compressed entries before any KV source")
-	}
-	s.topkN, s.topkSet = len(p.TopK), p.TopK != nil
-	if s.topkSet {
-		b.WriteWords(l.topk, words(p.TopK))
-	}
-	s.candSet, s.candLen = p.Candidates != nil, len(p.Candidates)
-	if s.candSet {
-		flags := make([]uint32, len(p.Candidates))
-		for i, v := range p.Candidates {
-			if v {
-				flags[i] = 1
-			}
+		pp := &s.pp[i]
+		pp.topkN, pp.topkSet = len(p.TopK), p.TopK != nil
+		if pp.topkSet {
+			b.WriteWords(l.topk+i*max(c.IndexTopK, 1), words(p.TopK))
 		}
-		b.WriteWords(l.cand, flags)
+		pp.candSet, pp.candLen = p.Candidates != nil, len(p.Candidates)
+		if pp.candSet {
+			flags := make([]uint32, len(p.Candidates))
+			for j, v := range p.Candidates {
+				if v {
+					flags[j] = 1
+				}
+			}
+			b.WriteWords(l.cand+i*s.positions, flags)
+		}
+		cs := l.cs + i*csSlots*rd
+		b.Write(cs, m.ropes[0].at(q))
+		b.Write(cs+rd, m.ropes[1].at(q))
+		if q > 0 {
+			b.Write(cs+2*rd, m.ropes[1].at(q-1))
+		}
 	}
-	// The rotary tables of the step.
-	rd := c.RopeDim
-	b.Write(l.cs, m.ropes[0].at(pos))
-	b.Write(l.cs+rd, m.ropes[1].at(pos))
-	if pos > 0 {
-		b.Write(l.cs+2*rd, m.ropes[1].at(pos-1))
+	if src >= 0 {
+		s.compN[src] = n
 	}
+	s.source = src
 	for i := m.from; i < m.to; i++ {
 		var err error
-		if b, err = s.block(b, s.p.blocks[i], p, pos); err != nil {
+		if b, err = s.block(b, s.p.blocks[i], ps, pos); err != nil {
 			if b != nil {
 				b.Submit()
 			}
@@ -478,88 +510,101 @@ func (s *GPUStage) Forward(p *Payload, pos int) error {
 		}
 	}
 	// What leaves: the stream, the mix, the shared state.
-	out := make([]float32, c.HCMult*c.Dim)
-	mix := make([]float32, c.HCMult)
-	b.Read(l.h, out)
-	b.Read(l.preMix, mix)
-	var kv, ik, topk, cand []float32
-	if s.source >= 0 && s.source >= m.from {
-		n := s.compN[s.source] - 1
-		if s.newKV {
-			kv = make([]float32, c.HeadDim)
-			b.Read(l.comp[s.source]+n*c.HeadDim, kv)
+	type outs struct{ h, mix, kv, ik, topk, cand []float32 }
+	res := make([]outs, B)
+	for i := range B {
+		o, pp := &res[i], &s.pp[i]
+		o.h, o.mix = make([]float32, hc*dim), make([]float32, hc)
+		b.Read(l.h+i*hc*dim, o.h)
+		b.Read(l.preMix+i*hc, o.mix)
+		if s.source >= m.from && pp.newKV {
+			o.kv, o.ik = make([]float32, c.HeadDim), make([]float32, c.IndexDim)
+			b.Read(l.comp[s.source]+pp.entry*c.HeadDim, o.kv)
+			b.Read(l.idx[s.source]+pp.entry*c.IndexDim, o.ik)
 		}
-		if s.newIdx {
-			ik = make([]float32, c.IndexDim)
-			b.Read(l.idx[s.source]+n*c.IndexDim, ik)
+		if pp.topkSet && pp.topkN > 0 {
+			o.topk = make([]float32, pp.topkN)
+			b.Read(l.topk+i*max(c.IndexTopK, 1), o.topk)
 		}
-	}
-	if s.topkSet && s.topkN > 0 {
-		topk = make([]float32, s.topkN)
-		b.Read(l.topk, topk)
-	}
-	if s.candSet && s.candLen > 0 {
-		cand = make([]float32, s.candLen)
-		b.Read(l.cand, cand)
+		if pp.candSet && pp.candLen > 0 {
+			o.cand = make([]float32, pp.candLen)
+			b.Read(l.cand+i*s.positions, o.cand)
+		}
 	}
 	if err := b.Submit(); err != nil {
 		return err
 	}
-	s.pos++
-	p.H, p.PreMix = out, mix
-	if s.source >= m.from {
-		p.Source, p.CompKV, p.IndexK = s.source, kv, ik
-	}
-	if s.topkSet {
-		p.TopK = make([]int, s.topkN)
-		for i, v := range topk {
-			p.TopK[i] = int(int32(math.Float32bits(v)))
+	s.pos += B
+	for i, p := range ps {
+		o, pp := &res[i], &s.pp[i]
+		p.H, p.PreMix = o.h, o.mix
+		if s.source >= m.from {
+			p.Source, p.CompKV, p.IndexK = s.source, o.kv, o.ik
 		}
-	}
-	if s.candSet {
-		p.Candidates = make([]bool, s.candLen)
-		for i, v := range cand {
-			p.Candidates[i] = math.Float32bits(v) != 0
+		if pp.topkSet {
+			p.TopK = make([]int, pp.topkN)
+			for j, v := range o.topk {
+				p.TopK[j] = int(int32(math.Float32bits(v)))
+			}
+		}
+		if pp.candSet {
+			p.Candidates = make([]bool, pp.candLen)
+			for j, v := range o.cand {
+				p.Candidates[j] = math.Float32bits(v) != 0
+			}
 		}
 	}
 	return nil
 }
 
-// block records one block, as State.block, and returns the batch to go on
-// with: a new one if host experts had the batch submitted.
-func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, p *Payload, pos int) (*gpu.Batch, error) {
+// block records one block for the batch, as State.block for each
+// position, and returns the batch to go on with: a new one if host
+// experts had it submitted.
+func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) (*gpu.Batch, error) {
 	c := s.p.m.Cfg
 	l := &s.l
+	B := len(ps)
 	dim, hc := c.Dim, c.HCMult
 	v := l.vecs
+	h := func(i int) int { return l.h + i*hc*dim }
+	x := func(i int) int { return l.x + i*dim }
 	if e := g.b.engram; e != nil {
-		emb, err := e.embeddings(p.Hashes[e.index], c)
-		if err != nil {
-			return b, err
+		for i, p := range ps {
+			emb, err := e.embeddings(p.Hashes[e.index], c)
+			if err != nil {
+				return b, err
+			}
+			b.Write(l.emb+i*l.embLen, emb)
 		}
-		b.Write(l.emb, emb)
-		b.MatVecs([]*gpu.Matrix{g.ewkv}, []int{l.ekv}, l.emb)
-		b.EngramGate(dim, l.h, l.ekv, v+g.qk, c.NormEps, float32(1/math.Sqrt(float64(dim))))
+		b.MatVecsBatch(g.ewkv, l.ekv, dim*(hc+1), l.emb, l.embLen, B, l.qx, l.xs)
+		for i := range B {
+			b.EngramGate(dim, h(i), l.ekv+i*dim*(hc+1), v+g.qk, c.NormEps, float32(1/math.Sqrt(float64(dim))))
+		}
 	}
-	b.Copy(l.h, l.res, hc*dim)
-	b.MatVecs([]*gpu.Matrix{g.hcAttn}, []int{l.mix}, l.h)
-	b.HCSplit(l.mix, l.h, hc*dim, v+g.aBase, v+g.aScale, c.HCSinkhornIters, c.HCEps, c.NormEps, l.aPre, l.aPost, l.aComb)
-	b.HCPre(dim, l.h, l.preMix, l.x)
-	b.DSNorm(l.x, l.x, v+g.attnNorm, dim, 1, 0, c.NormEps)
-	s.attention(b, g, pos, p.Prefill)
-	b.HCPost(dim, l.h, l.y, l.res, l.aPost, l.aComb)
-
-	b.Copy(l.h, l.res, hc*dim)
-	b.MatVecs([]*gpu.Matrix{g.hcFFN}, []int{l.mix}, l.h)
-	b.HCSplit(l.mix, l.h, hc*dim, v+g.fBase, v+g.fScl, c.HCSinkhornIters, c.HCEps, c.NormEps, l.fPre, l.fPost, l.fComb)
-	b.HCPre(dim, l.h, l.aPre, l.x)
-	b.DSNorm(l.x, l.x, v+g.ffnNorm, dim, 1, 0, c.NormEps)
-	b, err := s.moe(b, g)
+	for i := range B {
+		b.Copy(h(i), l.res+i*hc*dim, hc*dim)
+		b.MatVecs([]*gpu.Matrix{g.hcAttn}, []int{l.mix}, h(i))
+		b.HCSplit(l.mix, h(i), hc*dim, v+g.aBase, v+g.aScale, c.HCSinkhornIters, c.HCEps, c.NormEps, l.aPre+i*hc, l.aPost+i*hc, l.aComb+i*hc*hc)
+		b.HCPre(dim, h(i), l.preMix+i*hc, x(i))
+		b.DSNorm(x(i), x(i), v+g.attnNorm, dim, 1, 0, c.NormEps)
+	}
+	s.attention(b, g, ps, pos)
+	for i := range B {
+		b.HCPost(dim, h(i), l.y+i*dim, l.res+i*hc*dim, l.aPost+i*hc, l.aComb+i*hc*hc)
+		b.Copy(h(i), l.res+i*hc*dim, hc*dim)
+		b.MatVecs([]*gpu.Matrix{g.hcFFN}, []int{l.mix}, h(i))
+		b.HCSplit(l.mix, h(i), hc*dim, v+g.fBase, v+g.fScl, c.HCSinkhornIters, c.HCEps, c.NormEps, l.fPre+i*hc, l.fPost+i*hc, l.fComb+i*hc*hc)
+		b.HCPre(dim, h(i), l.aPre+i*hc, x(i))
+		b.DSNorm(x(i), x(i), v+g.ffnNorm, dim, 1, 0, c.NormEps)
+	}
+	b, err := s.moe(b, g, B)
 	if err != nil {
 		return nil, err
 	}
-	b.HCPost(dim, l.h, l.y, l.res, l.fPost, l.fComb)
-	b.Copy(l.fPre, l.preMix, hc)
+	for i := range B {
+		b.HCPost(dim, h(i), l.y+i*dim, l.res+i*hc*dim, l.fPost+i*hc, l.fComb+i*hc*hc)
+		b.Copy(l.fPre+i*hc, l.preMix+i*hc, hc)
+	}
 	return b, nil
 }
 
@@ -571,100 +616,150 @@ func bf16Lin(b *gpu.Batch, m *gpu.Matrix, lin *linear, out, in int) {
 	}
 }
 
-// attention records State.attention for the block's input at x into y.
-func (s *GPUStage) attention(b *gpu.Batch, g *gpuBlock, pos, prefillN int) {
+// attention records State.attention for the batch's inputs at x into y:
+// the products for all positions at once, the rest position by position.
+func (s *GPUStage) attention(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) {
 	c := s.p.m.Cfg
 	l := &s.l
 	a := g.b.attn
 	id := g.b.id
+	B := len(ps)
 	hd, rd, v := c.HeadDim, c.RopeDim, l.vecs
-	cs := l.cs // plain rope at pos
-	if a.ratio > 0 {
-		cs = l.cs + rd // compressed
-	}
-	csGroup := cs // at pos+1-ratio
-	if a.ratio == 2 {
-		csGroup = l.cs + 2*rd
-	} else if a.ratio > 2 {
+	qDim, ql, lowDim := c.Heads*hd, c.QLoRA, c.OGroups*c.OLoRA
+	if a.ratio > 2 {
 		panic("dsv41: GPU compression ratios above 2 are not supported")
 	}
+	// The rotary tables of position i: plain or compressed, and at the
+	// group's first position.
+	cs := func(i int) int {
+		if a.ratio > 0 {
+			return l.cs + i*csSlots*rd + rd
+		}
+		return l.cs + i*csSlots*rd
+	}
+	csGroup := func(i int) int {
+		if a.ratio == 2 {
+			return l.cs + i*csSlots*rd + 2*rd
+		}
+		return cs(i)
+	}
 
-	b.MatVecs([]*gpu.Matrix{g.wqA}, []int{l.qr}, l.x)
-	b.DSNorm(l.qr, l.qr, v+g.qNorm, c.QLoRA, 1, 0, c.NormEps)
-	b.MatVecs([]*gpu.Matrix{g.wqB}, []int{l.q}, l.qr)
-	b.RopeDS(l.q+hd-rd, rd/2, c.Heads, hd, cs, false)
-
-	slot := l.window[id] + (pos%c.Window)*hd
-	b.MatVecs([]*gpu.Matrix{g.wkv}, []int{slot}, l.x)
-	b.DSNorm(slot, slot, v+g.kvNorm, hd, 1, 0, c.NormEps)
-	b.RopeDS(slot+hd-rd, rd/2, 1, 0, cs, false)
-	b.ActQuantInPlace(slot, hd)
-
-	rows := s.windowRows(id, pos, prefillN)
-	nTop := 0
-	if a.ratio > 0 {
-		latent := false
-		if a.kvSource {
-			if a.ratio == 1 {
-				bf16Lin(b, g.compWKV, a.compWKV, l.latent, l.x)
-				latent = true
-			} else {
-				j := pos % a.ratio
-				b.MatVecs([]*gpu.Matrix{g.compWKV, g.compGate}, []int{l.kvSlots[id] + j*hd, l.scSlots[id] + j*hd}, l.x)
-				if (pos+1)%a.ratio == 0 {
-					b.Compress(hd, a.ratio, l.kvSlots[id], l.scSlots[id], l.latent)
+	b.MatVecsBatch(g.wqA, l.qr, ql, l.x, c.Dim, B, l.qx, l.xs)
+	for i := range B {
+		b.DSNorm(l.qr+i*ql, l.qr+i*ql, v+g.qNorm, ql, 1, 0, c.NormEps)
+	}
+	b.MatVecsBatch(g.wqB, l.q, qDim, l.qr, ql, B, l.qx, l.xs)
+	b.MatVecsBatch(g.wkv, l.kvb, hd, l.x, c.Dim, B, l.qx, l.xs)
+	if a.idxSrc {
+		b.MatVecsBatch(g.idxWqB, l.iq, c.IndexHeads*c.IndexDim, l.qr, ql, B, l.qx, l.xs)
+	}
+	for i := range B {
+		b.RopeDS(l.q+i*qDim+hd-rd, rd/2, c.Heads, hd, cs(i), false)
+		kv := l.kvb + i*hd
+		b.DSNorm(kv, kv, v+g.kvNorm, hd, 1, 0, c.NormEps)
+		b.RopeDS(kv+hd-rd, rd/2, 1, 0, cs(i), false)
+		b.ActQuantInPlace(kv, hd)
+	}
+	// A compressor's open group from before the batch, at the head of its
+	// rows: ext row j is position base+j.
+	base := pos
+	if a.kvSource && a.ratio > 1 {
+		base = pos - pos%a.ratio
+		for q := base; q < pos; q++ {
+			b.Copy(l.kvSlots[id]+(q%a.ratio)*hd, l.kvExt+(q-base)*hd, hd)
+			b.Copy(l.scSlots[id]+(q%a.ratio)*hd, l.scExt+(q-base)*hd, hd)
+		}
+	}
+	for i, p := range ps {
+		q := pos + i
+		pp := &s.pp[i]
+		x := l.x + i*c.Dim
+		rows := s.windowRows(id, q, p.Prefill, pos)
+		nTop := 0
+		if a.ratio > 0 {
+			latent := false
+			if a.kvSource {
+				if a.ratio == 1 {
+					bf16Lin(b, g.compWKV, a.compWKV, l.latent, x)
 					latent = true
+				} else {
+					j := q - base
+					b.MatVecs([]*gpu.Matrix{g.compWKV, g.compGate}, []int{l.kvExt + j*hd, l.scExt + j*hd}, x)
+					if (q+1)%a.ratio == 0 {
+						first := q + 1 - a.ratio - base
+						b.Compress(hd, a.ratio, l.kvExt+first*hd, l.scExt+first*hd, l.latent)
+						latent = true
+					}
 				}
+				if latent {
+					b.DSNorm(l.latent, l.latent, v+g.compNorm, hd, 1, 0, c.NormEps)
+				}
+				s.source = id
+				pp.newKV, pp.newIdx = false, false
+			}
+			n := s.compN[id] // this source's entries before this position's
+			if a.idxSrc {
+				s.indexer(b, g, i, q, p.Prefill, latent, n, csGroup(i), cs(i))
 			}
 			if latent {
-				b.DSNorm(l.latent, l.latent, v+g.compNorm, hd, 1, 0, c.NormEps)
+				b.RopeDS(l.latent+hd-rd, rd/2, 1, 0, csGroup(i), false)
+				b.FP4QuantInPlace(l.latent, hd, true)
+				b.Copy(l.latent, l.comp[id]+n*hd, hd)
+				s.compN[id]++
+				pp.newKV, pp.entry = true, n
 			}
-			s.source, s.newKV, s.newIdx = id, false, false
+			if pp.topkSet {
+				nTop = pp.topkN
+			}
 		}
-		n := s.compN[id] // this source's entries before the step's
-		if a.idxSrc {
-			s.indexer(b, g, pos, prefillN, latent, n, csGroup, cs)
+		comp := 0
+		if s.source >= 0 {
+			comp = l.comp[s.source]
 		}
-		if latent {
-			b.RopeDS(l.latent+hd-rd, rd/2, 1, 0, csGroup, false)
-			b.FP4QuantInPlace(l.latent, hd, true)
-			b.Copy(l.latent, l.comp[id]+n*hd, hd)
-			s.compN[id]++
-			s.newKV = true
-		}
-		if s.topkSet {
-			nTop = s.topkN
+		o := l.o + i*qDim
+		b.WriteWords(l.rows, words(rows))
+		b.SparseAttention(c.Heads, hd, l.q+i*qDim, l.rows, len(rows), l.topk+i*max(c.IndexTopK, 1), nTop, comp, v+g.sink,
+			float32(1/math.Sqrt(float64(hd))), l.acc, o)
+		b.RopeDS(o+hd-rd, rd/2, c.Heads, hd, cs(i), true)
+		gw := qDim / c.OGroups
+		for gi := range c.OGroups {
+			b.ActQuantInPlace(o+gi*gw, gw)
 		}
 	}
-	comp := 0
-	if s.source >= 0 {
-		comp = l.comp[s.source]
+	// The batch's window rows into the ring, and a compressor's groups.
+	for i := range B {
+		q := pos + i
+		b.Copy(l.kvb+i*hd, l.window[id]+(q%c.Window)*hd, hd)
+		if a.kvSource && a.ratio > 1 {
+			b.Copy(l.kvExt+(q-base)*hd, l.kvSlots[id]+(q%a.ratio)*hd, hd)
+			b.Copy(l.scExt+(q-base)*hd, l.scSlots[id]+(q%a.ratio)*hd, hd)
+		}
 	}
-	b.WriteWords(l.rows, words(rows))
-	b.SparseAttention(c.Heads, hd, l.q, l.rows, len(rows), l.topk, nTop, comp, v+g.sink, float32(1/math.Sqrt(float64(hd))), l.acc, l.o)
-	b.RopeDS(l.o+hd-rd, rd/2, c.Heads, hd, cs, true)
-	gw := c.Heads * hd / c.OGroups
+	gw := qDim / c.OGroups
 	for gi, m := range g.woA {
-		og := l.o + gi*gw
-		b.ActQuantInPlace(og, gw)
-		b.MatVecs([]*gpu.Matrix{m}, []int{l.low + gi*c.OLoRA}, og)
+		b.MatVecsBatch(m, l.low+gi*c.OLoRA, lowDim, l.o+gi*gw, qDim, B, l.qx, l.xs)
 	}
-	b.MatVecs([]*gpu.Matrix{g.woB}, []int{l.y}, l.low)
+	b.MatVecsBatch(g.woB, l.y, c.Dim, l.low, lowDim, B, l.qx, l.xs)
 }
 
-// windowRows lists the window rows the position attends to, as
-// State.windowRows, as word offsets (-1 for an empty slot).
-func (s *GPUStage) windowRows(layer, pos, prefillN int) []int {
+// windowRows lists the window rows position pos attends to, as
+// State.windowRows, as word offsets (-1 for an empty slot): the ring's for
+// positions before the batch's first, first, the batch's own after.
+func (s *GPUStage) windowRows(layer, pos, prefillN, first int) []int {
 	c := s.p.m.Cfg
 	win := c.Window
-	ring := s.l.window[layer]
-	row := func(slot int) int { return ring + slot*c.HeadDim }
+	row := func(q int) int {
+		if q >= first {
+			return s.l.kvb + (q-first)*c.HeadDim
+		}
+		return s.l.window[layer] + (q%win)*c.HeadDim
+	}
 	var rows []int
 	if prefillN > 0 {
 		start := max(pos-win+1, 0)
 		for i := range min(prefillN, win) {
-			if p := start + i; p <= pos {
-				rows = append(rows, row(p%win))
+			if q := start + i; q <= pos {
+				rows = append(rows, row(q))
 			} else {
 				rows = append(rows, -1)
 			}
@@ -677,18 +772,21 @@ func (s *GPUStage) windowRows(layer, pos, prefillN int) []int {
 		if pos < win-1 && slot > pos {
 			rows = append(rows, -1)
 		} else {
-			rows = append(rows, row(slot))
+			// The latest position at most pos in that slot.
+			rows = append(rows, row(pos-((pos%win-slot+win)%win)))
 		}
 	}
 	return rows
 }
 
-// indexer records State.indexer; n is the source's entries before the step.
-func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, pos, prefillN int, latent bool, n, csGroup, cs int) {
+// indexer records State.indexer for batch position i (position pos); n is
+// the source's entries before it.
+func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, i, pos, prefillN int, latent bool, n, csGroup, cs int) {
 	c := s.p.m.Cfg
 	l := &s.l
 	a := g.b.attn
 	id := g.b.id
+	pp := &s.pp[i]
 	idim, rd, ih, v := c.IndexDim, c.RopeDim, c.IndexHeads, l.vecs
 	if latent && a.kvSource {
 		k := l.idx[id] + n*idim
@@ -696,12 +794,12 @@ func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, pos, prefillN int, latent 
 		b.DSNorm(k, k, v+g.idxKNorm, idim, 1, 0, c.NormEps)
 		b.RopeDS(k+idim-rd, rd/2, 1, 0, csGroup, false)
 		b.FP4QuantInPlace(k, idim, false)
-		s.newIdx = true
+		pp.newIdx = true
 	}
-	b.MatVecs([]*gpu.Matrix{g.idxWqB}, []int{l.iq}, l.qr)
-	b.RopeDS(l.iq+idim-rd, rd/2, ih, idim, cs, false)
-	b.FP4QuantInPlace(l.iq, ih*idim, false)
-	bf16Lin(b, g.idxW, a.idxWeights, l.iw, l.x)
+	iq := l.iq + i*ih*idim
+	b.RopeDS(iq+idim-rd, rd/2, ih, idim, cs, false)
+	b.FP4QuantInPlace(iq, ih*idim, false)
+	bf16Lin(b, g.idxW, a.idxWeights, l.iw, l.x+i*c.Dim)
 	b.RoundScale(l.iw, ih, float32(1/math.Sqrt(float64(idim))/math.Sqrt(float64(ih))))
 
 	visible := (pos + 1) / a.ratio
@@ -710,69 +808,71 @@ func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, pos, prefillN int, latent 
 		width = prefillN / a.ratio
 	}
 	keys := l.idx[s.source]
+	cand := l.cand + i*s.positions
 	switch {
 	case id == c.CandidateSource:
-		b.IndexScores(width, visible, l.iq, keys, l.iw, ih, idim, l.scores, 0, 0, false)
+		b.IndexScores(width, visible, iq, keys, l.iw, ih, idim, l.scores, 0, 0, false)
 		if width > 0 {
-			b.CandidatePool(width, visible, c.CandidateBlocks, c.CandidateBlockSize, l.scores, l.bs, l.sel, l.cand)
+			b.CandidatePool(width, visible, c.CandidateBlocks, c.CandidateBlockSize, l.scores, l.bs, l.sel, cand)
 		}
-		s.candSet, s.candLen = true, width
-	case c.CandidateSource >= 0 && c.CandidateSource < id && s.candSet:
-		b.IndexScores(width, visible, l.iq, keys, l.iw, ih, idim, l.scores, l.cand, s.candLen, true)
+		pp.candSet, pp.candLen = true, width
+	case c.CandidateSource >= 0 && c.CandidateSource < id && pp.candSet:
+		b.IndexScores(width, visible, iq, keys, l.iw, ih, idim, l.scores, cand, pp.candLen, true)
 	default:
-		b.IndexScores(width, visible, l.iq, keys, l.iw, ih, idim, l.scores, 0, 0, false)
+		b.IndexScores(width, visible, iq, keys, l.iw, ih, idim, l.scores, 0, 0, false)
 	}
 	k := min(c.IndexTopK, width)
 	if k > 0 {
-		b.SelectSorted(width, k, l.scores, l.topk, l.flags, visible)
+		b.SelectSorted(width, k, l.scores, l.topk+i*max(c.IndexTopK, 1), l.flags, visible)
 	}
-	s.topkSet, s.topkN = true, k
+	pp.topkSet, pp.topkN = true, k
 }
 
-// moe records State.moe for the input at x into y. With host experts the
-// batch is submitted once the experts are chosen: the CPU computes them
-// as State.expert does, and a new batch takes their outputs.
-func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock) (*gpu.Batch, error) {
+// moe records State.moe for the batch's inputs at x into y. With host
+// experts the batch is submitted once the experts are chosen: the CPU
+// computes them as State.expert does, and a new batch takes their outputs.
+func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock, B int) (*gpu.Batch, error) {
 	c := s.p.m.Cfg
 	l := &s.l
 	f := g.b.ffn
 	k, E, inter, dim := f.active, len(f.experts), c.MoEInter, c.Dim
-	b.MatVecs([]*gpu.Matrix{g.gate}, []int{l.z}, l.x)
-	b.MoEScores(E, l.z, l.vecs+g.gateBias, f.scoreFn == "sigmoid", l.score, l.biased)
-	b.TopK(E, k, l.biased, l.esel)
-	b.MoEWeights(k, l.score, l.esel, f.normTopK, f.scale, l.order, l.ew)
+	for i := range B {
+		b.MatVecs([]*gpu.Matrix{g.gate}, []int{l.z}, l.x+i*dim)
+		b.MoEScores(E, l.z, l.vecs+g.gateBias, f.scoreFn == "sigmoid", l.score, l.biased)
+		b.TopK(E, k, l.biased, l.esel)
+		b.MoEWeights(k, l.score, l.esel, f.normTopK, f.scale, l.order+i*k, l.ew+i*k)
+	}
+	// The shared expert.
+	b.MatVecsBatch(g.s1, l.sg, inter, l.x, dim, B, l.qx, l.xs)
+	b.MatVecsBatch(g.s3, l.su, inter, l.x, dim, B, l.qx, l.xs)
+	b.SiluMulDS(inter, l.sg, l.su, f.limit, false, 0, B, inter)
+	b.MatVecsBatch(g.s2, l.sout, dim, l.sg, inter, B, l.qx, l.xs)
 	if s.p.hostExperts {
-		// The shared expert first, recorded before the batch goes.
-		b.MatVecs([]*gpu.Matrix{g.s1, g.s3}, []int{l.sg, l.su}, l.x)
-		b.SiluMulDS(inter, l.sg, l.su, f.limit, false, 0, 1, 0)
-		b.MatVecs([]*gpu.Matrix{g.s2}, []int{l.sout}, l.sg)
-		x, order, w := make([]float32, dim), make([]float32, k), make([]float32, k)
+		x, order, w := make([]float32, B*dim), make([]float32, B*k), make([]float32, B*k)
 		b.Read(l.x, x)
 		b.Read(l.order, order)
 		b.Read(l.ew, w)
 		if err := b.Submit(); err != nil {
 			return nil, err
 		}
-		outs := make([]float32, 0, k*dim)
-		for i := range k {
+		outs := make([]float32, 0, B*k*dim)
+		for i := range B * k {
 			e := int(math.Float32bits(order[i]))
 			if e >= E {
 				return nil, fmt.Errorf("dsv41: expert %d of %d", e, E)
 			}
-			outs = append(outs, runExpert(&f.experts[e], x, w[i], true, f.limit, &s.act)...)
+			outs = append(outs, runExpert(&f.experts[e], x[i/k*dim:(i/k+1)*dim], w[i], true, f.limit, &s.act)...)
 		}
 		b = s.a.Begin()
 		b.Write(l.eouts, outs)
-		b.MoESum(dim, l.eouts, k, dim, l.sout, l.y)
-		return b, nil
+	} else {
+		b.ExpertMatVecs(g.w1, inter, l.order, B*k, l.x, dim, k, l.eg, inter, l.eqx, l.exs)
+		b.ExpertMatVecs(g.w3, inter, l.order, B*k, l.x, dim, k, l.eu, inter, l.eqx, l.exs)
+		b.SiluMulDS(inter, l.eg, l.eu, f.limit, true, l.ew, B*k, inter)
+		b.ExpertMatVecs(g.w2, dim, l.order, B*k, l.eg, inter, 1, l.eouts, dim, l.eqx, l.exs)
 	}
-	b.ExpertMatVecs(g.w1, inter, l.order, k, l.x, 0, l.eg, inter, l.eqx, l.exs)
-	b.ExpertMatVecs(g.w3, inter, l.order, k, l.x, 0, l.eu, inter, l.eqx, l.exs)
-	b.SiluMulDS(inter, l.eg, l.eu, f.limit, true, l.ew, k, inter)
-	b.ExpertMatVecs(g.w2, dim, l.order, k, l.eg, inter, l.eouts, dim, l.eqx, l.exs)
-	b.MatVecs([]*gpu.Matrix{g.s1, g.s3}, []int{l.sg, l.su}, l.x)
-	b.SiluMulDS(inter, l.sg, l.su, f.limit, false, 0, 1, 0)
-	b.MatVecs([]*gpu.Matrix{g.s2}, []int{l.sout}, l.sg)
-	b.MoESum(dim, l.eouts, k, dim, l.sout, l.y)
+	for i := range B {
+		b.MoESum(dim, l.eouts+i*k*dim, k, dim, l.sout+i*dim, l.y+i*dim)
+	}
 	return b, nil
 }

@@ -373,6 +373,17 @@ func (d *deepseekStage) forward(in []byte, pos, tokens int) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if bs, ok := d.stage.(interface {
+		ForwardBatch(ps []*dsv41.Payload, pos int) error
+	}); ok {
+		// A GPU stage: the weights read once for a batch of positions.
+		for t := 0; t < len(ps); t += dsv41.GPUBatch {
+			if err := bs.ForwardBatch(ps[t:min(t+dsv41.GPUBatch, len(ps))], pos+t); err != nil {
+				return nil, err
+			}
+		}
+		return dsv41.EncodePayloads(d.c, ps)
+	}
 	for t, p := range ps {
 		if err := d.stage.Forward(p, pos+t); err != nil {
 			return nil, err

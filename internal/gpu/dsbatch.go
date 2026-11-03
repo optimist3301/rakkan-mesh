@@ -141,25 +141,23 @@ func (b *Batch) MoEWeights(k, score, sel int, norm bool, scale float32, order, w
 }
 
 // ExpertMatVecs multiplies the experts selected at ids (slots of them) of
-// m, E2M1 experts of perExpert rows each, by their inputs at in (inStride
-// apart, 0 for one input) into out (outStride apart). qx and xs are
-// scratch for the quantized inputs.
-func (b *Batch) ExpertMatVecs(m *Matrix, perExpert, ids, slots, in, inStride, out, outStride, qx, xs int) {
+// m, E2M1 experts of perExpert rows each, by inputs at in (inStride
+// apart), slot s taking input s/div (div 0: one input for all), into out
+// (outStride apart). qx and xs are scratch for the quantized inputs.
+func (b *Batch) ExpertMatVecs(m *Matrix, perExpert, ids, slots, in, inStride, div, out, outStride, qx, xs int) {
 	if m.kind != kindFP4 || m.rows%perExpert != 0 {
 		b.err = errors.New("gpu: not a matrix of E2M1 experts")
 		return
 	}
 	n := m.cols
 	inputs := 1
-	if inStride != 0 {
-		inputs = slots
+	if div > 0 {
+		inputs = (slots + div - 1) / div
+	} else {
+		div = slots
 	}
 	for s := range inputs {
 		b.dispatch(kindActFP8, 0, groups(n/32, flatGroup), 1, uint32(n), uint32(in+s*inStride), uint32(qx+s*n), uint32(xs+s*n/32))
-	}
-	qxStride, xsStride := 0, 0
-	if inStride != 0 {
-		qxStride, xsStride = n, n/32
 	}
 	for _, pt := range m.parts {
 		if pt.row0%perExpert != 0 || pt.rows%perExpert != 0 {
@@ -168,9 +166,41 @@ func (b *Batch) ExpertMatVecs(m *Matrix, perExpert, ids, slots, in, inStride, ou
 		}
 		e0 := pt.row0 / perExpert
 		b.dispatch(kindFP4Experts, pt.set, groups(perExpert, 2*mxRows), slots, uint32(perExpert), uint32(n), 0, uint32(out),
-			uint32(qx), uint32(xs), 0, uint32(ids), uint32(e0), uint32(e0+pt.rows/perExpert), uint32(qxStride), uint32(xsStride), uint32(outStride))
+			uint32(qx), uint32(xs), 0, uint32(ids), uint32(e0), uint32(e0+pt.rows/perExpert), uint32(n), uint32(n/32), uint32(outStride), uint32(div))
 	}
 }
+
+// MatVecsBatch multiplies an E4M3 matrix by n inputs at in (inStride
+// apart) into out (outStride apart), reading the weights once for up to
+// MatBatchMax of them; qx and xs are scratch for the quantized inputs
+// (n·cols and n·cols/32 words). The results are MatVecs' each.
+func (b *Batch) MatVecsBatch(m *Matrix, out, outStride, in, inStride, n, qx, xs int) {
+	if m.kind != kindFP8 {
+		for j := range n {
+			b.MatVecs([]*Matrix{m}, []int{out + j*outStride}, in+j*inStride)
+		}
+		return
+	}
+	c := m.cols
+	for j := range n {
+		b.dispatch(kindActFP8, 0, groups(c/32, flatGroup), 1, uint32(c), uint32(in+j*inStride), uint32(qx+j*c), uint32(xs+j*c/32))
+	}
+	raw := b2w(m.unrounded)
+	for j0 := 0; j0 < n; j0 += mxBatchMax {
+		nj := min(mxBatchMax, n-j0)
+		for _, pt := range m.parts {
+			g := groups(pt.rows, 2*mxRows)
+			gx := min(g, 65535)
+			gy := groups(g, gx)
+			b.dispatch(kindFP8Batch, pt.set, gx, gy, uint32(pt.rows), uint32(c), uint32(gx), uint32(out+j0*outStride+pt.row0),
+				uint32(qx+j0*c), uint32(xs+j0*c/32), raw, uint32(nj), uint32(c), uint32(c/32), uint32(outStride))
+		}
+	}
+}
+
+// MatBatchMax is how many inputs MatVecsBatch takes in one reading of the
+// weights.
+const MatBatchMax = mxBatchMax
 
 // SiluMulDS is dsv41's expert activation on slots of n floats.
 func (b *Batch) SiluMulDS(n, g, u int, limit float32, weighted bool, w, slots, stride int) {

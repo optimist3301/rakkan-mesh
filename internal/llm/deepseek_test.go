@@ -287,7 +287,8 @@ func TestDeepSeekGPUGuestWitnessedByCPU(t *testing.T) {
 	}
 	coord := c.add(false)
 	member := c.addNode(true, false, 1<<30)
-	guest := c.addOpts(nodeOpts{serve: true, guest: true, dev: dev, devBytes: 1 << 30, mem: 2 << 30, speed: 1})
+	// The guest offers more memory, so the stage goes to it first.
+	guest := c.addOpts(nodeOpts{serve: true, guest: true, dev: dev, devBytes: 2 << 30, mem: 2 << 30, speed: 1})
 	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
 	waitServers(t, coord, 2)
 	want := localDeepSeek(t, tok, dsPrompt, 12)

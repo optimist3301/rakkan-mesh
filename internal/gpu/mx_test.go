@@ -1,6 +1,7 @@
 package gpu
 
 import (
+	"fmt"
 	"math"
 	"math/rand/v2"
 	"testing"
@@ -362,5 +363,59 @@ func TestFP4Chunks(t *testing.T) {
 		sameBits(t, d.Info().Name, got, want)
 		t.Logf("%s: %d parts", d.Info().Name, len(m.parts))
 		m.Free()
+	}
+}
+
+// Several inputs through one reading of the weights give each input's
+// own product, bit for bit, unrounded too.
+func TestMatVecsBatch(t *testing.T) {
+	r := rand.New(rand.NewPCG(51, 52))
+	for _, d := range devices(t) {
+		for _, shape := range [][2]int{{7, 32}, {300, 896}, {1000, 1280}} {
+			rows, cols := shape[0], shape[1]
+			w, s := randomFP8(r, rows, cols, d.info.modes.denormPreserve)
+			m, err := d.Upload(rows, cols, Format{FP8: w, E8M0: s})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, raw := range []bool{false, true} {
+				m.unrounded = raw
+				for _, n := range []int{1, 3, 8, 11} {
+					a, err := d.NewArena(n*cols+n*rows+n*cols+n*cols/32+64, n*(cols+rows)+64)
+					if err != nil {
+						t.Fatal(err)
+					}
+					xs := make([][]float32, n)
+					b := a.Begin()
+					for j := range n {
+						xs[j] = mxInput(r, cols)
+						b.Write(j*cols, xs[j])
+					}
+					out := n * cols
+					b.MatVecsBatch(m, out, rows, 0, cols, n, out+n*rows, out+n*rows+n*cols)
+					got := make([][]float32, n)
+					for j := range n {
+						got[j] = make([]float32, rows)
+						b.Read(out+j*rows, got[j])
+					}
+					if err := b.Submit(); err != nil {
+						t.Fatal(err)
+					}
+					for j := range n {
+						var q num.ActFP8
+						num.QuantizeActFP8(xs[j], &q)
+						want := make([]float32, rows)
+						if raw {
+							num.MatVecFP8Unrounded(want, w, s, &q)
+						} else {
+							num.MatVecFP8(want, w, s, &q)
+						}
+						sameBits(t, fmt.Sprintf("%s %d×%d, input %d of %d, unrounded %v", d.Info().Name, rows, cols, j, n, raw), got[j], want)
+					}
+					a.Free()
+				}
+			}
+			m.Free()
+		}
 	}
 }
