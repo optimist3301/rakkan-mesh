@@ -79,6 +79,7 @@ type diff struct {
 	n, same  int
 	maxRel   float64 // largest |difference| / rms of the reference
 	maxUlpBF int     // largest difference in bf16 units in the last place
+	maxL2    float64 // largest ||difference|| / ||reference|| of one added vector
 }
 
 func (d *diff) add(got, want []float32) {
@@ -87,6 +88,12 @@ func (d *diff) add(got, want []float32) {
 		ss += float64(w) * float64(w)
 	}
 	rms := math.Sqrt(ss/float64(len(want))) + 1e-30
+	var dd float64
+	for i := range want {
+		e := float64(got[i]) - float64(want[i])
+		dd += e * e
+	}
+	d.maxL2 = max(d.maxL2, math.Sqrt(dd/(ss+1e-300)))
 	for i := range want {
 		d.n++
 		if math.Float32bits(got[i]) == math.Float32bits(want[i]) {
@@ -107,7 +114,7 @@ func abs(x int) int {
 }
 
 func (d diff) String() string {
-	return fmt.Sprintf("%6.2f%% identical, max %.2g rms, %d bf16 ulp", 100*float64(d.same)/float64(max(d.n, 1)), d.maxRel, d.maxUlpBF)
+	return fmt.Sprintf("%6.2f%% identical, max %.2g rms, %d bf16 ulp, L2 error up to %.2g", 100*float64(d.same)/float64(max(d.n, 1)), d.maxRel, d.maxUlpBF, d.maxL2)
 }
 
 // stepName is the golden's name of the step that computed position pos.

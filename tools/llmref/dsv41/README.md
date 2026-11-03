@@ -18,6 +18,7 @@ DeepSeek-V4.1-Flash. Это только инструменты разработ
 | `vectors.py` | Эталонные значения для Go-реализаций того, что эталон берёт из библиотек Python (токенайзер, хеш Engram) |
 | `chat_vectors.py` | Эталонные промпты и разборы ответов формата чата (`encoding.py`) для порта на Go |
 | `num_vectors.py` | Эталонные значения для арифметики FP8/FP4/bf16 движка (`internal/num`) |
+| `layer_check.py` | Выходы одного настоящего слоя на эмбеддингах настоящего текста, для `internal/llm/dsv41/real_test.go` |
 | `check_kernels.py` | На машине с GPU NVIDIA сверяет `kernel_cpu` с настоящими ядрами |
 
 ## Установка (CPU)
@@ -51,6 +52,18 @@ git status --short ../../../internal   # должно быть пусто
 `tiny.py` детерминирован: повторный запуск с теми же версиями пакетов даёт
 побитово те же файлы. Если фикстура изменилась, значит изменилось поведение
 эталона или PyTorch — с этим надо разобраться, прежде чем коммитить.
+
+## Проверка на настоящих слоях
+
+```sh
+cd tools/llmref/dsv41 && . ../.venv/bin/activate
+DIR=$(python -c 'import fetch; print(fetch.default_cache(fetch.pins()["revision"]))')
+python layer_check.py 2 $DIR/layer2.safetensors     # скачает шард слоя (6,9 ГиБ) и эмбеддингов
+python layer_check.py 20 $DIR/layer20.safetensors
+cd ../../.. && RAKKAN_DSV41_REAL=$DIR go test -run RealLayers -v ./internal/llm/dsv41
+```
+
+Нужно около 16 ГБ памяти. Эталон считает слой около 3 минут, тест на Go — около 2.
 
 ## Проверка на GPU
 

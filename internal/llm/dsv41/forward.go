@@ -32,6 +32,8 @@ type State struct {
 	// each index source's selected compressed positions (-1: none).
 	AfterBlock func(layer, pos int, h, preMix []float32)
 	Indices    func(layer, pos int, idx []int)
+
+	trace func(name string, v []float32) // for tests: sublayer outputs
 }
 
 type compressorState struct {
@@ -154,6 +156,9 @@ func (s *State) block(b *block, h, preMix []float32, pos int, sh *shared) []floa
 	hcPre(x, h, preMix)
 	rmsNorm(x, x, b.attnNorm, c.NormEps)
 	y := s.attention(b, x, pos, sh)
+	if s.trace != nil {
+		s.trace("attn", y)
+	}
 	hcPost(h, y, res, aPost, aComb)
 
 	copy(res, h)
@@ -161,6 +166,9 @@ func (s *State) block(b *block, h, preMix []float32, pos int, sh *shared) []floa
 	hcPre(x, h, aPre)
 	rmsNorm(x, x, b.ffnNorm, c.NormEps)
 	y = s.moe(b.ffn, x)
+	if s.trace != nil {
+		s.trace("ffn", y)
+	}
 	hcPost(h, y, res, fPost, fComb)
 	return fPre
 }
@@ -185,6 +193,13 @@ func (s *State) moe(f *moe, x []float32) []float32 {
 		biased[e] = score[e] + f.bias[e]
 	}
 	sel := topK(biased, f.active)
+	if s.trace != nil {
+		ids := make([]float32, len(sel))
+		for i, e := range sel {
+			ids[i] = float32(e)
+		}
+		s.trace("experts", ids)
+	}
 	w := make([]float32, len(sel))
 	var sum float32
 	for i, e := range sel {
@@ -251,12 +266,19 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 	for h := range c.Heads {
 		a.rope.apply(q[(h+1)*hd-rd:(h+1)*hd], pos, false)
 	}
+	if s.trace != nil {
+		s.trace("qr", qr)
+		s.trace("q", q)
+	}
 
 	kv := make([]float32, hd)
 	a.wkv.apply(kv, x, &s.act)
 	rmsNorm(kv, kv, a.kvNorm, c.NormEps)
 	a.rope.apply(kv[hd-rd:], pos, false)
 	num.ActQuantInPlace(kv)
+	if s.trace != nil {
+		s.trace("kv", kv)
+	}
 	ring := s.window[b.id]
 	ring[pos%c.Window] = kv
 
@@ -288,6 +310,9 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 	}
 
 	o := s.sparseAttention(q, rows, a.sink)
+	if s.trace != nil {
+		s.trace("o", o)
+	}
 	for h := range c.Heads {
 		a.rope.apply(o[(h+1)*hd-rd:(h+1)*hd], pos, true)
 	}
@@ -298,6 +323,9 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 		num.ActQuantInPlace(og)
 		num.QuantizeActFP8(og, &s.act)
 		a.woA.applyRowsFP8(low[g*c.OLoRA:(g+1)*c.OLoRA], g*c.OLoRA, &s.act)
+	}
+	if s.trace != nil {
+		s.trace("low", low)
 	}
 	y := make([]float32, c.Dim)
 	a.woB.apply(y, low, &s.act)
