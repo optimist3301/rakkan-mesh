@@ -18,6 +18,8 @@ config, so the Go code can be checked without them:
   tokenize       token ids of texts covering the pre-tokenizer's splits,
                  CJK, digits, whitespace runs, accents, emoji, special
                  tokens and invalid UTF-8 boundaries (tokenizers library)
+  tokenize_random  token ids of 400 seeded random strings mixing every
+                 character class the splitting patterns distinguish
 
 usage: vectors.py OUT.json.gz
 """
@@ -47,7 +49,43 @@ TEXTS = [
     "",
     " ",
     "\n",
+    # Marks inside words: Devanagari vowel signs (Mn, Mc), Thai, Arabic
+    # harakat, Hebrew points, decomposed Latin and Cyrillic.
+    "नमस्ते दुनिया, हिन्दी भाषा",
+    "สวัสดีครับ ภาษาไทย",
+    "مَرْحَبًا بِكُمْ",
+    "שָׁלוֹם עֲלֵיכֶם",
+    "Cafe\u0301 re\u0301sume\u0301 nai\u0308ve, \u0418\u0306 \u0435\u0308",
+    "x\u0301\u0301 '\u0301 .\u0308a",
 ]
+
+
+# Character pools for random strings: each class the patterns tell apart.
+POOLS = [
+    "abcxyzABCXYZ",
+    "0123456789",
+    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+    " ", "  ", "\t", "\n", "\r\n", "\u00a0", "\u3000", "\u2003", "\u0085",
+    "日本語中文测试", "ひらがなカタカナ", "абвгдЁЖЩ", "αβγΣ", "مرحبا", "שלום",
+    "\u0301\u0308\u0327",  # combining marks
+    "éüñçøå", "ǅﬁ①ⅫＡｂ", "€£¥©®™∑∫√≠≤", "👍🏽🇺🇦👨‍👩‍👧😀",
+    "\u200b\u200d\u2060\ufeff", "\x00\x01\x07\x1b\x7f", "\ue000\U000f0000",
+    "١٢٣४५६",  # non-ASCII digits
+]
+
+
+def random_texts(n, seed=20261103):
+    import random
+    rng = random.Random(seed)
+    out = []
+    for _ in range(n):
+        parts = []
+        for _ in range(rng.randint(1, 12)):
+            pool = rng.choice(POOLS)
+            k = rng.randint(1, 4)
+            parts.append("".join(rng.choice(pool) for _ in range(k)) if len(pool) > 3 else pool * rng.randint(1, 2))
+        out.append("".join(parts))
+    return out
 
 
 def main():
@@ -75,6 +113,8 @@ def main():
             h = hstate(torch.tensor([ids]), 0)  # [1, L, layers, cols]
             hashes.append({"ids": ids, "hash_ids": h[0].tolist()})
 
+    tokenize_random = [{"text": t, "ids": tok.encode(t, add_special_tokens=False).ids} for t in random_texts(400)]
+
     mults = E.compute_hash_multipliers(tuple(range(64)), args.engram_max_ngram_size, compressed)
     vectors = {
         "revision": fetch.pins()["revision"],
@@ -94,6 +134,7 @@ def main():
         },
         "hashes": hashes,
         "tokenize": tokenize,
+        "tokenize_random": tokenize_random,
     }
     with gzip.open(out, "wt", encoding="utf-8") as f:
         json.dump(vectors, f, ensure_ascii=False)
