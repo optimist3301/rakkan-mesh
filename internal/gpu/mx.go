@@ -243,6 +243,7 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 				for e := range xs {
 					xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
 				}
+				xs = k.mxInputs(kind, xs)
 				xsc := k.get(k.at(xsOff, blk))
 				for q := range uint32(mxRows) {
 					row := k.iadd(base, k.u32(q))
@@ -280,8 +281,8 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 
 // mxBlock is block blk's term of a row: its exact sum rounded to
 // float32, times the input's scale xsc, times the weight's.
-// mxTable fills a table in shared memory of every code's value (E4M3 for
-// FP8, E2M1 for FP4), the values e4m3F and e2m1F compute, by a
+// mxTable fills a table in shared memory of every code's value: E4M3's for
+// FP8 as e4m3F computes it, twice E2M1's for FP4 as an integer, by a
 // workgroup's threads threads.
 func (k *kbuilder) mxTable(kind kernelKind, threads uint32) id {
 	n := uint32(256)
@@ -295,7 +296,8 @@ func (k *kbuilder) mxTable(kind kernelKind, threads uint32) id {
 		if kind == kindFP8 {
 			k.store(k.shared(lut, c), k.e4m3F(c))
 		} else {
-			k.store(k.shared(lut, c), k.e2m1F(c))
+			// Twice the value, an integer (mxSum), its bits in the table.
+			k.store(k.shared(lut, c), k.toF(k.toU(k.fToI(k.fmul(k.e2m1F(c), k.f32(2))))))
 		}
 	})
 	k.barrier()
@@ -305,6 +307,19 @@ func (k *kbuilder) mxTable(kind kernelKind, threads uint32) id {
 func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []id, xsc, lut id) id {
 	wv, wsc := k.mxWeights(kind, w, ws, row, cols, nb, blk, lut)
 	return k.mxSum(kind, wv, wsc, xv, xsc)
+}
+
+// mxInputs are a block's inputs as mxSum takes them: for FP4 integers, in
+// units of 2^-9.
+func (k *kbuilder) mxInputs(kind kernelKind, xs []id) []id {
+	if kind == kindFP8 {
+		return xs
+	}
+	out := make([]id, len(xs))
+	for i, x := range xs {
+		out[i] = k.fToI(k.fmul(x, k.f32(512)))
+	}
+	return out
 }
 
 // mxWeights decodes a block of 32 of a row's weights, and its scale.
@@ -340,8 +355,9 @@ func (k *kbuilder) mxWeights(kind kernelKind, w, ws, row, cols, nb, blk, lut id)
 	return wv, k.e8m0(sbyte)
 }
 
-// mxSum is a block's term: the exact sum of its 32 products in float32
-// buckets and integers, times the input's scale and the weights'.
+// mxSum is a block's term: the exact sum of its 32 products, in float32
+// buckets and integers for FP8, in integers for FP4 (xv mxInputs's), times
+// the input's scale and the weights'.
 func (k *kbuilder) mxSum(kind kernelKind, wv []id, wsc id, xv []id, xsc id) id {
 	var sum id
 	// Magnitudes compare as their bits do: |p| < 2^-6, |p| < 64.
@@ -365,19 +381,14 @@ func (k *kbuilder) mxSum(kind kernelKind, wv []id, wsc id, xv []id, xsc id) id {
 		lo := k.iaddS(i0, k.toI(k.shl(k.and(k.toU(i1), k.u32(0x7ff)), k.u32(5))))
 		sum = k.intToF(hi, lo, 18)
 	} else {
-		b0, b1 := k.f32(0), k.f32(0)
+		// Exactly in integers: twice a weight (at most 12) times an input
+		// in units of 2^-9 (E4M3's smallest; at most 448·2^9), so 32
+		// products in units of 2^-10 stay below 2^31.
+		si := k.i32(0)
 		for e := range 32 {
-			p := k.fmul(wv[e], xv[e])
-			small := below(p, 4)
-			b0 = k.fadd(b0, k.selF(small, p, k.f32(0)))
-			b1 = k.fadd(b1, k.selF(small, k.f32(0), p))
+			si = k.iaddS(si, k.imulS(k.toI(k.toU(wv[e])), xv[e]))
 		}
-		// In units of 2^-10: i0 + i1·2^7.
-		i0 := k.fToI(k.fmul(b0, k.f32(1<<10)))
-		i1 := k.fToI(k.fmul(b1, k.f32(8)))
-		hi := k.sar(i1, k.u32(9))
-		lo := k.iaddS(i0, k.toI(k.shl(k.and(k.toU(i1), k.u32(0x1ff)), k.u32(7))))
-		sum = k.intToF(hi, lo, 10)
+		sum = k.intToF(k.i32(0), si, 10)
 	}
 	return k.fmul(k.fmul(sum, xsc), wsc)
 }
@@ -430,7 +441,7 @@ func mxBatchKernel(kind kernelKind, modes floatModes) []uint32 {
 						xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
 					}
 					xsc := k.get(k.at(k.iadd(xsOff, k.imul(j, xsStride)), blk))
-					k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.mxSum(kind, wv, wsc, xs, xsc))
+					k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.mxSum(kind, wv, wsc, k.mxInputs(kind, xs), xsc))
 				})
 			})
 			k.ifThen(k.op(opLogicalNot, k.tBool, ok), func() {
