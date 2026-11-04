@@ -12,12 +12,18 @@ pil vectors (internal/pil/testdata/pillow.json.gz):
            side each way, the vertical pass first (height shrinking more
            than twice the width), one-pixel sides
   pad      ImageOps.pad(image, size, color=(127, 127, 127))
+  jpeg     JPEG files and the RGB pixels of Image.open(...).convert("RGB")
+           (for more than 1100 pixels, their sha256):
+           Pillow's encodings (4:4:4, 4:2:2, 4:2:0, progressive, optimized,
+           restart markers, RGB kept, grey, CMYK) and jpeg_encode.py's
+           (4:4:0, 4:1:1, 4:1:0, Adobe RGB and YCCK, CMYK without Adobe,
+           component identifiers R, G, B), at sizes from 1x1
 
 dsv41 vectors (internal/llm/dsv41/testdata/images.json.gz):
 
   grid     plan_image_grid(width, height, args) for many sizes and args:
            (n_llm_h, n_llm_w, best_height, best_width)
-  load     load_image(record, args) for PNG files: the grids and the sha256
+  load     load_image(record, args) for PNG and JPEG files: the grids and the sha256
            of the patches' bf16 bits, little-endian, with the first patch
 
 Images are bytes base64, pixel arrays raw RGB base64.
@@ -149,6 +155,61 @@ def decode_cases():
     return cases
 
 
+def jpeg_case(name, data):
+    with Image.open(io.BytesIO(data)) as im:
+        mode = im.mode
+        rgb = im.convert("RGB")
+    c = {"name": name, "mode": mode, "file": b64(data), "w": rgb.width, "h": rgb.height}
+    if rgb.width * rgb.height <= 1100:
+        c["rgb"] = b64(rgb.tobytes())
+    else:  # large: the pixels' digest
+        c["sha256"] = hashlib.sha256(rgb.tobytes()).hexdigest()
+    return c
+
+
+def jpeg_cases():
+    import jpeg_encode as J
+
+    cases = []
+    sizes = [(1, 1), (2, 3), (3, 2), (5, 7), (17, 9), (33, 31), (64, 48), (101, 67)]
+    for w, h in sizes:
+        for kind in ("noise", "gradient", "edges"):
+            im = random_rgb(w, h, kind)
+            for sub in (0, 1, 2):
+                for quality in (40, 95):
+                    for extra in ({}, {"progressive": True}, {"optimize": True}, {"restart_marker_blocks": 1}):
+                        if extra and (kind != "gradient" or quality != 95):
+                            continue
+                        buf = io.BytesIO()
+                        im.save(buf, "JPEG", quality=quality, subsampling=sub, **extra)
+                        cases.append(jpeg_case(f"pillow-{kind}-{w}x{h}-sub{sub}-q{quality}-{list(extra)}", buf.getvalue()))
+            for mode, extra in (("RGB", {"keep_rgb": True}), ("L", {}), ("L", {"progressive": True}), ("CMYK", {}), ("CMYK", {"progressive": True})):
+                buf = io.BytesIO()
+                im.convert(mode).save(buf, "JPEG", quality=85, **extra)
+                cases.append(jpeg_case(f"pillow-{kind}-{w}x{h}-{mode}-{list(extra)}", buf.getvalue()))
+    for w, h in [(1, 1), (2, 2), (3, 5), (9, 4), (21, 13), (53, 37)]:
+        y, x = np.mgrid[0:h, 0:w]
+        p3 = [((x * 9 + y * 2) % 256).astype(np.uint8), ((y * 7 + 40) % 256).astype(np.uint8), np.array([[rng.randint(0, 255) for _ in range(w)] for _ in range(h)], dtype=np.uint8)]
+        k = ((x * y) % 256).astype(np.uint8)
+        for name, planes, factors, ids, adobe, jfif in (
+            ("440", p3, [(1, 2), (1, 1), (1, 1)], [1, 2, 3], None, True),
+            ("411", p3, [(4, 1), (1, 1), (1, 1)], [1, 2, 3], None, False),
+            ("410", p3, [(4, 2), (1, 1), (1, 1)], [1, 2, 3], None, False),
+            ("422-nomarker", p3, [(2, 1), (1, 1), (1, 1)], [1, 2, 3], None, False),
+            ("adobe-rgb", p3, [(1, 1), (1, 1), (1, 1)], [1, 2, 3], 0, False),
+            ("adobe-ycc", p3, [(2, 2), (1, 1), (1, 1)], [1, 2, 3], 1, False),
+            ("ids-rgb", p3, [(1, 1), (1, 1), (1, 1)], [82, 71, 66], None, False),
+            ("ids-other", p3, [(2, 2), (1, 1), (1, 1)], [7, 8, 9], None, False),
+            ("jfif-over-adobe-rgb", p3, [(1, 1), (1, 1), (1, 1)], [1, 2, 3], 0, True),
+            ("grey-22", p3[:1], [(2, 2)], [1], None, False),
+            ("ycck", p3 + [k], [(2, 2), (1, 1), (1, 1), (2, 2)], [1, 2, 3, 4], 2, False),
+            ("cmyk-adobe", p3 + [k], [(1, 1), (1, 1), (1, 1), (1, 1)], [1, 2, 3, 4], 0, False),
+            ("cmyk-plain", p3 + [k], [(1, 1), (1, 1), (1, 1), (1, 1)], [1, 2, 3, 4], None, False),
+        ):
+            cases.append(jpeg_case(f"encoder-{name}-{w}x{h}", J.encode(planes, factors, ids, adobe=adobe, jfif=jfif)))
+    return cases
+
+
 def random_rgb(w, h, kind=None):
     kind = kind or rng.choice(("noise", "gradient", "edges"))
     if kind == "noise":
@@ -250,14 +311,17 @@ def load_cases():
             if rng.random() < 0.3:
                 im = im.convert("RGBA")
             buf = io.BytesIO()
-            im.save(buf, "PNG")
+            if (w + h) % 2:  # some as JPEG
+                im.convert("RGB").save(buf, "JPEG", quality=90)
+            else:
+                im.save(buf, "PNG")
             data = buf.getvalue()
             patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = IP.load_image({"data": data}, ns)
             bits = patches.contiguous().view(-1).view(dtype=__import__("torch").int16).numpy().astype("<i2").tobytes()
             cases.append(
                 {
                     "args": args,
-                    "png": b64(data),
+                    "file": b64(data),
                     "grid": [n_vit_h, n_vit_w, n_llm_h, n_llm_w],
                     "sha256": hashlib.sha256(bits).hexdigest(),
                     "first": b64(bits[: patches.shape[1] * patches.shape[2] * patches.shape[3] * 2]),
@@ -277,7 +341,9 @@ def main():
     import PIL
 
     pil_out, ds_out = sys.argv[1:3]
-    write(pil_out, {"pillow": PIL.__version__, "decode": decode_cases(), "resize": resize_cases(), "pad": pad_cases()})
+    from PIL import features
+
+    write(pil_out, {"pillow": PIL.__version__, "libjpeg_turbo": features.version("libjpeg_turbo"), "decode": decode_cases(), "resize": resize_cases(), "pad": pad_cases(), "jpeg": jpeg_cases()})
     write(ds_out, {"pillow": PIL.__version__, "grid": grid_cases(), "load": load_cases()})
 
 

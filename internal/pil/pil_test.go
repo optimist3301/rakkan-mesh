@@ -3,9 +3,13 @@ package pil
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"math/rand/v2"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -27,6 +31,10 @@ func load(t *testing.T) (v struct {
 		W, H                 int
 	}
 	Resize, Pad []sized
+	JPEG        []struct {
+		Name, Mode, File, RGB, SHA256 string
+		W, H                          int
+	}
 }) {
 	t.Helper()
 	f, err := os.Open("testdata/pillow.json.gz")
@@ -113,6 +121,75 @@ func TestDecodeRefuses(t *testing.T) {
 	for _, b := range [][]byte{nil, []byte("GIF89a"), []byte("\x89PNG\r\n\x1a\n")} {
 		if _, err := Decode(b); err == nil {
 			t.Errorf("%q decoded", b)
+		}
+	}
+}
+
+func TestJPEGMatchesPillow(t *testing.T) {
+	v := load(t)
+	bad := 0
+	for _, c := range v.JPEG {
+		m, err := Decode(unb64(t, c.File))
+		if err != nil {
+			t.Errorf("%s: %v", c.Name, err)
+			continue
+		}
+		if c.SHA256 != "" {
+			if sum := sha256.Sum256(m.Pix); m.W != c.W || m.H != c.H || hex.EncodeToString(sum[:]) != c.SHA256 {
+				if bad++; bad <= 25 {
+					t.Errorf("%s (Pillow mode %s): %d×%d, the pixels differ", c.Name, c.Mode, m.W, m.H)
+				}
+			}
+			continue
+		}
+		if c.SHA256 != "" {
+			if sum := sha256.Sum256(m.Pix); m.W != c.W || m.H != c.H || hex.EncodeToString(sum[:]) != c.SHA256 {
+				if bad++; bad <= 25 {
+					t.Errorf("%s (Pillow mode %s): %d×%d, the pixels differ", c.Name, c.Mode, m.W, m.H)
+				}
+			}
+			continue
+		}
+		want := unb64(t, c.RGB)
+		if m.W != c.W || m.H != c.H || !bytes.Equal(m.Pix, want) {
+			x, y, ch := firstDiff(c.W, m.Pix, want)
+			n := 0
+			for i := range min(len(want), len(m.Pix)) {
+				if m.Pix[i] != want[i] {
+					n++
+				}
+			}
+			if bad++; bad <= 25 {
+				t.Errorf("%s (Pillow mode %s): %d×%d, %d of %d values differ, the first at (%d, %d) channel %d", c.Name, c.Mode, m.W, m.H, n, len(want), x, y, ch)
+			}
+		}
+	}
+	t.Logf("%d JPEG files, %d differ", len(v.JPEG), bad)
+}
+
+// Damaged files fail or decode; they do not crash the node.
+func TestJPEGDamaged(t *testing.T) {
+	v := load(t)
+	r := rand.New(rand.NewPCG(5, 6))
+	for i, c := range v.JPEG {
+		if i%7 != 0 {
+			continue
+		}
+		data := unb64(t, c.File)
+		for range 40 {
+			d := slices.Clone(data)
+			switch r.IntN(3) {
+			case 0:
+				d = d[:r.IntN(len(d))]
+			case 1:
+				for range 1 + r.IntN(4) {
+					d[r.IntN(len(d))] = byte(r.Uint32())
+				}
+			default:
+				at := r.IntN(len(d))
+				d = append(d[:at], d[min(at+1+r.IntN(16), len(d)):]...)
+			}
+			Decode(d)
 		}
 	}
 }

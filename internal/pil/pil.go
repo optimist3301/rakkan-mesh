@@ -11,8 +11,9 @@
 // kept unfused here (an explicit conversion stops Go fusing a*b+c on
 // arm64), so the results do not depend on the processor.
 //
-// Formats: PNG, all of its colour types and depths, as Pillow reads them.
-// Others are refused.
+// Formats: PNG, all of its colour types and depths, as Pillow reads them;
+// JPEG, baseline and progressive, as libjpeg-turbo decodes it for Pillow
+// (package ljpeg). Others are refused.
 package pil
 
 import (
@@ -22,6 +23,8 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+
+	"github.com/optimist3301/rakkan-mesh/internal/pil/ljpeg"
 )
 
 // RGB is an 8-bit RGB image, Pillow's mode "RGB": Pix holds W·H pixels,
@@ -49,8 +52,11 @@ const MaxPixels = 64 << 20
 // three channels; 16-bit samples keep their high byte, but for 16-bit
 // grey, which Pillow opens as mode I;16 and clips to 255.
 func Decode(data []byte) (*RGB, error) {
+	if bytes.HasPrefix(data, []byte("\xff\xd8\xff")) {
+		return decodeJPEG(data)
+	}
 	if !bytes.HasPrefix(data, []byte("\x89PNG\r\n\x1a\n")) {
-		return nil, errors.New("pil: not a PNG image")
+		return nil, errors.New("pil: neither a PNG nor a JPEG image")
 	}
 	cfg, err := png.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
@@ -159,6 +165,38 @@ func toRGB(img image.Image, grey16 bool) (*RGB, error) {
 		}
 	default:
 		return nil, fmt.Errorf("pil: unexpected decoded image %T", img)
+	}
+	return m, nil
+}
+
+// decodeJPEG is Image.open(...).convert("RGB") for a JPEG: libjpeg-turbo's
+// grey, RGB or CMYK samples; Pillow takes CMYK as Adobe's, inverted
+// (CMYK;I), and converts it with cmyk2rgb (Convert.c).
+func decodeJPEG(data []byte) (*RGB, error) {
+	img, err := ljpeg.Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("pil: %w", err)
+	}
+	m := &RGB{W: img.W, H: img.H, Pix: make([]byte, 3*img.W*img.H)}
+	switch img.Mode {
+	case "L":
+		for i, v := range img.Pix {
+			m.Pix[3*i], m.Pix[3*i+1], m.Pix[3*i+2] = v, v, v
+		}
+	case "RGB":
+		copy(m.Pix, img.Pix)
+	case "CMYK":
+		for i := range img.W * img.H {
+			nk := int(img.Pix[4*i+3]) // 255 − the inverted K
+			for c := range 3 {
+				inv := 255 - int(img.Pix[4*i+c])
+				t := inv*nk + 128 // MULDIV255
+				v := nk - ((t>>8)+t)>>8
+				m.Pix[3*i+c] = byte(min(max(v, 0), 255))
+			}
+		}
+	default:
+		return nil, fmt.Errorf("pil: JPEG mode %s", img.Mode)
 	}
 	return m, nil
 }

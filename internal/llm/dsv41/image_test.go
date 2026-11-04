@@ -41,8 +41,8 @@ func imageVectors(t *testing.T) (v struct {
 	}
 	Load []struct {
 		Args          imageArgs
-		PNG           string
-		Grid          []int // n_vit_h, n_vit_w, n_llm_h, n_llm_w
+		File          string // PNG or JPEG
+		Grid          []int  // n_vit_h, n_vit_w, n_llm_h, n_llm_w
 		SHA256, First string
 	}
 }) {
@@ -83,7 +83,7 @@ func TestPlanImageMatchesReference(t *testing.T) {
 func TestPrepareImageMatchesReference(t *testing.T) {
 	v := imageVectors(t)
 	for i, c := range v.Load {
-		data, _ := base64.StdEncoding.DecodeString(c.PNG)
+		data, _ := base64.StdEncoding.DecodeString(c.File)
 		img, err := c.Args.config().PrepareImage(data)
 		if err != nil {
 			t.Errorf("case %d: %v", i, err)

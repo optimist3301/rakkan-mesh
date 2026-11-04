@@ -19,6 +19,7 @@ DeepSeek-V4.1-Flash. Это только инструменты разработ
 | `chat_vectors.py` | Эталонные промпты и разборы ответов формата чата (`encoding.py`) для порта на Go |
 | `num_vectors.py` | Эталонные значения для арифметики FP8/FP4/bf16 движка (`internal/num`) |
 | `image_vectors.py` | Эталонная подготовка картинок: Pillow (`internal/pil`) и `image_processor.py` (`dsv41/image.go`) |
+| `jpeg_encode.py` | Маленький кодировщик JPEG для `image_vectors.py`: прореживание и маркеры, которых нет у Pillow |
 | `layer_check.py` | Выходы одного настоящего слоя на эмбеддингах настоящего текста, для `internal/llm/dsv41/real_test.go` |
 | `check_kernels.py` | На машине с GPU NVIDIA сверяет `kernel_cpu` с настоящими ядрами |
 
