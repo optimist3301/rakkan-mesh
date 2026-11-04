@@ -470,3 +470,105 @@ func TestGPUStagesRewind(t *testing.T) {
 		}
 	}
 }
+
+// A prompt with an image on the GPU, prefilled in batches that mix image
+// and text positions: the same bits as the CPU's.
+func TestGPUImagePromptMatchesCPU(t *testing.T) {
+	cfg, tensors, tables := fixtureParts(t)
+	head, err := NewHead(cfg, layerTensors(tensors, -1, -1), tables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vis, g := loadVision(t)
+	tokens, types := g.ints(t, "vl.tokens"), g.ints(t, "vl.types")
+	prompt := len(tokens) - 6
+	img, err := cfg.PrepareImage(g["vl.png"].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	span, err := vis.Span(img.ImageGrid, g.f32(t, "vl.embeds"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	hist := slices.Clone(tokens)
+	var start [][]byte // each position's first payload, encoded
+	k := 0
+	for pos := range tokens {
+		prefill := 0
+		if pos < prompt {
+			prefill = prompt
+		}
+		var p *Payload
+		if types[pos] != TokenText {
+			hist[pos] = ImagePosition
+			p, err = head.EmbedImage(hist[:pos+1], span[k], prefill)
+			k++
+		} else {
+			p, err = head.Embed(hist[:pos+1], prefill)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		enc, _ := AppendPayload(nil, cfg, p)
+		start = append(start, enc)
+	}
+	for _, d := range gpuDevices(t) {
+		for _, cuts := range [][]int{{0, 8}, {0, 3, 6, 8}} {
+			t.Run(fmt.Sprintf("%s/%v", d.Info().Name, cuts), func(t *testing.T) {
+				ps := make([]*Payload, len(start))
+				for i, enc := range start {
+					ps[i], _, _ = DecodePayload(enc, cfg, len(tokens))
+				}
+				for i := range len(cuts) - 1 {
+					part, err := NewPart(cfg, layerTensors(tensors, cuts[i], cuts[i+1]), cuts[i], cuts[i+1], nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					cpu := part.NewStage()
+					gpart, err := NewPart(cfg, layerTensors(tensors, cuts[i], cuts[i+1]), cuts[i], cuts[i+1], nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					gp, err := gpart.ToGPU(d, GPUOptions{})
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(gp.Free)
+					st, err := gp.NewStage(len(tokens))
+					if err != nil {
+						t.Fatal(err)
+					}
+					t.Cleanup(st.Close)
+					for pos := 0; pos < len(ps); {
+						n := 1
+						if pos < prompt {
+							n = min(GPUBatch, prompt-pos)
+						}
+						batch := make([]*Payload, n)
+						for j := range n {
+							in, _ := AppendPayload(nil, cfg, ps[pos+j])
+							if batch[j], _, err = DecodePayload(in, cfg, len(tokens)); err != nil {
+								t.Fatal(err)
+							}
+							if err := cpu.Forward(ps[pos+j], pos+j); err != nil {
+								t.Fatal(err)
+							}
+						}
+						if err := st.ForwardBatch(batch, pos); err != nil {
+							t.Fatal(err)
+						}
+						for j := range n {
+							want, _ := AppendPayload(nil, cfg, ps[pos+j])
+							got, _ := AppendPayload(nil, cfg, batch[j])
+							if !bytes.Equal(got, want) {
+								t.Fatalf("layers %d..%d, position %d: %s", cuts[i], cuts[i+1], pos+j, payloadDiff(cfg, batch[j], ps[pos+j]))
+							}
+							ps[pos+j] = batch[j]
+						}
+						pos += n
+					}
+				}
+			})
+		}
+	}
+}

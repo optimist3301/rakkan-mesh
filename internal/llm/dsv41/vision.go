@@ -364,3 +364,23 @@ func gelu(x float32) float32 {
 	e := float32(num.Erf(float64(float32(x * math.Sqrt2 / 2))))
 	return float32(x*0.5) * (1 + e)
 }
+
+// Span is the inputs of an image span's positions (merge_image_embeddings):
+// the delimiters' embeddings around the encoded rows, a line's end after
+// each row of LLMW. emb is Encode's.
+func (vis *Vision) Span(g ImageGrid, emb []float32) ([][]float32, error) {
+	d := vis.cfg.Dim
+	if len(emb) != g.LLMH*g.LLMW*d {
+		return nil, fmt.Errorf("dsv41: %d encoded values for a %d×%d grid", len(emb), g.LLMH, g.LLMW)
+	}
+	rows := make([][]float32, 0, g.Tokens())
+	rows = append(rows, vis.start)
+	for i := range g.LLMH {
+		for j := range g.LLMW {
+			k := i*g.LLMW + j
+			rows = append(rows, emb[k*d:(k+1)*d])
+		}
+		rows = append(rows, vis.newLine)
+	}
+	return append(rows, vis.end), nil
+}

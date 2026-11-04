@@ -71,6 +71,7 @@ type attention struct {
 type moe struct {
 	gate     *linear // bf16 widened to float32
 	bias     []float32
+	biasVL   []float32 // for image positions; nil without an image encoder
 	experts  []expert
 	shared   expert
 	limit    float32
@@ -297,6 +298,10 @@ func (m *Model) loadBlock(w *weights, i int) (*block, error) {
 	f := &moe{limit: c.SwiGLULimit, scoreFn: c.ScoreFunc, normTopK: c.NormTopK, scale: c.RouteScale, active: active}
 	lin(&f.gate, "ffn.gate", experts, c.Dim, kindBF16F32)
 	vec(&f.bias, "ffn.gate.bias", experts)
+	if c.Vision.Layers > 0 && i < c.Layers {
+		// Drafts are text: the DSpark blocks' image biases go unused.
+		vec(&f.biasVL, "ffn.gate.bias_vl", experts)
+	}
 	for e := range experts {
 		var x expert
 		q := fmt.Sprintf("ffn.experts.%d.", e)

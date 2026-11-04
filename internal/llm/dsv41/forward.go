@@ -27,6 +27,7 @@ type State struct {
 	tokens   []int // the last tokens, oldest first, for Engram's n-grams
 	act      num.ActFP8
 	prefillN int       // prompt length while prefilling, else 0
+	image    bool      // the position being run is an image span's
 	undo     []undoRec // the last positions' changes, newest last
 	cur      *undoRec  // the position being run
 
@@ -74,6 +75,34 @@ func (s *State) Prefill(tokens []int) []float32 {
 
 // Decode runs one token and returns the logits after it.
 func (s *State) Decode(token int) []float32 { return s.step(token, 0, true) }
+
+// PrefillImages is Prefill for a prompt with image spans: rows[i], when
+// not nil, is position i's input (Vision.Span's), tokens[i] then unread.
+func (s *State) PrefillImages(tokens []int, rows [][]float32) []float32 {
+	var logits []float32
+	for i, t := range tokens {
+		if rows[i] == nil {
+			logits = s.step(t, len(tokens), i == len(tokens)-1)
+			continue
+		}
+		hist := append(slices.Clone(s.tokens), ImagePosition)
+		if len(hist) > max(s.m.Cfg.EngramMaxNgram, 1) {
+			hist = hist[1:]
+		}
+		p, err := s.m.head.EmbedImage(hist, rows[i], len(tokens))
+		if err == nil {
+			err = s.run(p, s.pos)
+		}
+		if err != nil {
+			panic(err)
+		}
+		s.tokens = hist
+		if i == len(tokens)-1 {
+			logits = s.m.head.Logits(p)
+		}
+	}
+	return logits
+}
 
 // shared is what attention layers hand down within a step: the latest
 // source's compressed KV and indexer keys, the latest selection and the
@@ -155,9 +184,10 @@ func (s *State) run(p *Payload, pos int) (err error) {
 	}
 	s.pos++
 	s.prefillN = p.Prefill
+	s.image = p.Image
 	for i := m.from; i < m.to; i++ {
 		b := m.layers[i]
-		if b.engram != nil {
+		if b.engram != nil && !p.Image { // the reference's gate is 0 there
 			if err := b.engram.apply(p.H, p.Hashes[b.engram.index], c, &s.act); err != nil {
 				return err
 			}
@@ -337,9 +367,13 @@ func (s *State) moe(f *moe, x []float32) []float32 {
 			panic("dsv41: softmax gating not implemented")
 		}
 	}
+	bias := f.bias
+	if s.image && f.biasVL != nil {
+		bias = f.biasVL
+	}
 	biased := make([]float32, len(z))
 	for e := range z {
-		biased[e] = score[e] + f.bias[e]
+		biased[e] = score[e] + bias[e]
 	}
 	sel := topK(biased, f.active)
 	if s.trace != nil {

@@ -48,6 +48,7 @@ type gpuBlock struct {
 	qNorm, kvNorm, sink        int
 	compNorm, idxKNorm         int
 	gateBias, qk               int
+	gateBiasVL                 int // the image positions' bias; gateBias without one
 }
 
 // GPUOptions chooses what of a part goes to the GPU.
@@ -133,6 +134,10 @@ func (p *GPUPart) upload(b *block) (*gpuBlock, error) {
 		g.compNorm, g.idxKNorm = p.vec(a.compNorm), p.vec(a.idxKNorm)
 	}
 	g.gateBias = p.vec(b.ffn.bias)
+	g.gateBiasVL = g.gateBias
+	if b.ffn.biasVL != nil {
+		g.gateBiasVL = p.vec(b.ffn.biasVL)
+	}
 	var err error
 	set := func(dst **gpu.Matrix, l *linear) {
 		if err == nil {
@@ -615,14 +620,20 @@ func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) (*gp
 	x := func(i int) int { return l.x + i*dim }
 	if e := g.b.engram; e != nil {
 		for i, p := range ps {
-			emb, err := e.embeddings(p.Hashes[e.index], c)
-			if err != nil {
-				return b, err
+			emb := make([]float32, l.embLen) // unused at image positions
+			if !p.Image {
+				var err error
+				if emb, err = e.embeddings(p.Hashes[e.index], c); err != nil {
+					return b, err
+				}
 			}
 			b.Write(l.emb+i*l.embLen, emb)
 		}
 		b.MatVecsBatch(g.ewkv, l.ekv, dim*(hc+1), l.emb, l.embLen, B, l.qx, l.xs)
 		for i := range B {
+			if ps[i].Image {
+				continue // the reference's gate is 0 there
+			}
 			b.EngramGate(dim, h(i), l.ekv+i*dim*(hc+1), v+g.qk, c.NormEps, float32(1/math.Sqrt(float64(dim))))
 		}
 	}
@@ -650,7 +661,7 @@ func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) (*gp
 		b.HCPre(dim, h(i), l.aPre+i*hc, x(i))
 		b.DSNorm(x(i), x(i), v+g.ffnNorm, dim, 1, 0, c.NormEps)
 	}
-	b, err := s.moe(b, g, B)
+	b, err := s.moe(b, g, ps)
 	if err != nil {
 		return nil, err
 	}
@@ -892,14 +903,19 @@ func (s *GPUStage) indexer(b *gpu.Batch, g *gpuBlock, i, pos, prefillN int, late
 // moe records State.moe for the batch's inputs at x into y. With host
 // experts the batch is submitted once the experts are chosen: the CPU
 // computes them as State.expert does, and a new batch takes their outputs.
-func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock, B int) (*gpu.Batch, error) {
+func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock, ps []*Payload) (*gpu.Batch, error) {
 	c := s.p.m.Cfg
 	l := &s.l
 	f := g.b.ffn
+	B := len(ps)
 	k, E, inter, dim := f.active, len(f.experts), c.MoEInter, c.Dim
 	for i := range B {
+		bias := g.gateBias
+		if ps[i].Image {
+			bias = g.gateBiasVL
+		}
 		b.MatVecs([]*gpu.Matrix{g.gate}, []int{l.z}, l.x+i*dim)
-		b.MoEScores(E, l.z, l.vecs+g.gateBias, f.scoreFn == "sigmoid", l.score, l.biased)
+		b.MoEScores(E, l.z, l.vecs+bias, f.scoreFn == "sigmoid", l.score, l.biased)
 		b.TopK(E, k, l.biased, l.esel)
 		b.MoEWeights(k, l.score, l.esel, f.normTopK, f.scale, l.order+i*k, l.ew+i*k)
 	}

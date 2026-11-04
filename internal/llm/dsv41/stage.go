@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
@@ -28,9 +29,12 @@ import (
 type Payload struct {
 	// Prefill is the prompt's length while the prompt runs, else 0.
 	Prefill int
-	H       []float32 // [hc][dim], bf16 values: the stream
-	PreMix  []float32 // [hc]: how the next block mixes its input
-	Hashes  [][]int64 // per Engram layer: the table rows of this position's n-grams
+	// Image marks a position of an image span: its gates route with the
+	// image bias, and Engram leaves it alone.
+	Image  bool
+	H      []float32 // [hc][dim], bf16 values: the stream
+	PreMix []float32 // [hc]: how the next block mixes its input
+	Hashes [][]int64 // per Engram layer: the table rows of this position's n-grams
 	// Source is the latest KV source run, -1 for none; CompKV and IndexK
 	// the entries it cached at this position, if any.
 	Source         int
@@ -47,33 +51,59 @@ type Payload struct {
 }
 
 // Embed starts a position's Payload: history holds the tokens so far, the
-// position's own last (only the last Engram n-gram's worth are read).
-// prefill is the prompt's length while it runs, else 0.
+// position's own last (only the last Engram n-gram's worth are read),
+// ImagePosition for the positions of image spans. prefill is the prompt's
+// length while it runs, else 0.
 func (h *Head) Embed(history []int, prefill int) (*Payload, error) {
-	c := h.Cfg
-	if len(history) == 0 {
+	if len(history) == 0 || history[len(history)-1] == ImagePosition {
 		return nil, errors.New("dsv41: no token")
 	}
-	for _, t := range history[max(len(history)-max(c.EngramMaxNgram, 1), 0):] {
-		if t < 0 || t >= c.Vocab {
+	return h.embed1(history, nil, prefill)
+}
+
+// ImagePosition stands for a position of an image span in a history.
+const ImagePosition = -1
+
+// EmbedImage starts the Payload of an image span's position: row is its
+// input (Vision.Span's), history as for Embed with ImagePosition last.
+func (h *Head) EmbedImage(history []int, row []float32, prefill int) (*Payload, error) {
+	if len(history) == 0 || history[len(history)-1] != ImagePosition {
+		return nil, errors.New("dsv41: an image row for a text position")
+	}
+	if len(row) != h.Cfg.Dim {
+		return nil, fmt.Errorf("dsv41: an image row of %d values, want %d", len(row), h.Cfg.Dim)
+	}
+	return h.embed1(history, row, prefill)
+}
+
+func (h *Head) embed1(history []int, row []float32, prefill int) (*Payload, error) {
+	c := h.Cfg
+	window := history[max(len(history)-max(c.EngramMaxNgram, 1), 0):]
+	for _, t := range window {
+		if (t < 0 || t >= c.Vocab) && t != ImagePosition {
 			return nil, fmt.Errorf("dsv41: token %d outside the vocabulary of %d", t, c.Vocab)
 		}
 	}
-	token := history[len(history)-1]
 	dim, hc := c.Dim, c.HCMult
-	p := &Payload{Prefill: prefill, H: make([]float32, hc*dim), PreMix: make([]float32, hc), Source: -1}
+	p := &Payload{Prefill: prefill, H: make([]float32, hc*dim), PreMix: make([]float32, hc), Source: -1, Image: row != nil}
 	for k := range hc {
 		for d := range dim {
-			p.H[k*dim+d] = num.BF16(h.embed[token*dim+d])
+			if row != nil {
+				p.H[k*dim+d] = bf16(row[d])
+			} else {
+				p.H[k*dim+d] = num.BF16(h.embed[history[len(history)-1]*dim+d])
+			}
 		}
 	}
 	p.PreMix[0] = 1
 	if len(c.EngramLayers) > 0 {
-		n := h.engram.MaxNgram
+		// n-grams stop at an image span (NgramHashState's DEAD tokens): an
+		// image position's own are all padding, and unused.
 		var ids []int64
-		for _, t := range history[max(len(history)-n, 0):] {
-			ids = append(ids, h.engram.TokenMap[t])
+		for i := len(window) - 1; i >= 0 && window[i] != ImagePosition && len(ids) < h.engram.MaxNgram; i-- {
+			ids = append(ids, h.engram.TokenMap[window[i]])
 		}
+		slices.Reverse(ids)
 		p.Hashes = h.engram.hash(ids)
 	}
 	return p, nil
@@ -131,6 +161,7 @@ const (
 	hasIndexK
 	hasCandidates
 	hasMain
+	hasImage
 )
 
 // MaxPayloadBytes bounds a position's encoded Payload.
@@ -159,6 +190,9 @@ func AppendPayload(b []byte, c *Config, p *Payload) ([]byte, error) {
 	}
 	if p.WantMain {
 		flags |= hasMain
+	}
+	if p.Image {
+		flags |= hasImage
 	}
 	if len(p.Main)%c.Dim != 0 || len(p.Main) > c.Dim*len(c.DraftTargets) || !p.WantMain && len(p.Main) > 0 {
 		return nil, errors.New("dsv41: payload does not fit the model")
@@ -274,10 +308,11 @@ func DecodePayload(b []byte, c *Config, positions int) (*Payload, []byte, error)
 	prefill := u32()
 	p.Source = int(int32(u32()))
 	flags := u32()
-	if bad || prefill > uint32(positions) || flags&^(hasCompKV|hasIndexK|hasCandidates|hasMain) != 0 {
+	if bad || prefill > uint32(positions) || flags&^(hasCompKV|hasIndexK|hasCandidates|hasMain|hasImage) != 0 {
 		return nil, nil, errPayload
 	}
 	p.Prefill = int(prefill)
+	p.Image = flags&hasImage != 0
 	if p.Source != -1 && !c.isKVSource(p.Source) {
 		return nil, nil, errPayload
 	}
