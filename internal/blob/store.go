@@ -451,7 +451,14 @@ func (s *Store) evict() {
 			partial = append(partial, h)
 		}
 	}
-	slices.SortFunc(partial, func(a, b Hash) int { return s.partial[a].Compare(s.partial[b]) })
+	// The oldest first; chunks released together go in the order of their
+	// hashes, not of the map's iteration.
+	slices.SortFunc(partial, func(a, b Hash) int {
+		if c := s.partial[a].Compare(s.partial[b]); c != 0 {
+			return c
+		}
+		return bytes.Compare(a[:], b[:])
+	})
 	for _, h := range partial {
 		if s.size <= s.maxBytes {
 			break

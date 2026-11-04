@@ -160,10 +160,17 @@ func TestPartialChunksEvictedFirst(t *testing.T) {
 	if !s.HasChunk(leftovers[0]) {
 		t.Fatal("partial chunks dropped while under budget: a retry could not resume")
 	}
-	// Going over budget sheds partial chunks before any complete blob.
+	// Going over budget by a chunk sheds a partial chunk, not a complete
+	// blob.
 	s.PutBytes(randomBytes(ChunkSize))
-	if !s.Has(kept) || s.HasChunk(leftovers[0]) {
-		t.Fatalf("kept=%v partial=%v", s.Has(kept), s.HasChunk(leftovers[0]))
+	left := 0
+	for _, h := range leftovers {
+		if s.HasChunk(h) {
+			left++
+		}
+	}
+	if !s.Has(kept) || left != 1 {
+		t.Fatalf("kept=%v, %d of 2 partial chunks left", s.Has(kept), left)
 	}
 }
 
