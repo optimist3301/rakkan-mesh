@@ -202,6 +202,7 @@ const (
 // Device is an opened GPU. Its methods are safe for concurrent use; the
 // submissions run one at a time.
 type Device struct {
+	prof   *profile // timing kernels, if set (profile.go)
 	info   Info
 	dev    uintptr
 	queue  uintptr

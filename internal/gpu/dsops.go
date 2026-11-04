@@ -565,93 +565,135 @@ func candPoolKernel(modes floatModes) []uint32 {
 // empty slot. acc holds hd floats per head. Push heads, hd, q, rows, nWin,
 // topk, nTop, comp, sink, scale, acc, out.
 func sparseAttnKernel(modes floatModes) []uint32 {
-	k := newKernel(modes, 64, 1)
+	// A workgroup per head: 8 rows of 32 lanes score rows of a block of
+	// 64, a lane summing the elements l, l+32, ... (Dot32's order); the
+	// exps run in parallel; one thread adds the block's sums in order; a
+	// thread per two dimensions adds the block's values in order of rows.
+	const threads = 256
+	const ways = threads / laneCount
+	k := newKernel(modes, threads, 1)
+	qs := k.workgroupFloats(sparseAttnMaxHD)
+	accs := k.workgroupFloats(sparseAttnMaxHD)
+	red := k.workgroupFloats(64 * laneCount)
 	sc := k.workgroupFloats(64)
-	state := k.workgroupFloats(3) // m, sum, rescale
+	rowsS := k.workgroupFloats(64) // each row's offset, as bits; none: -1
+	state := k.workgroupFloats(3)  // m, sum, rescale
 	lid, wid := k.ids()
 	tid, h := k.component(lid, 0), k.component(wid, 0)
+	lane, way := k.umod(tid, k.u32(laneCount)), k.floorDiv(tid, k.u32(laneCount))
 	hd, q, rows, nWin, topk, nTop, comp := k.p(1), k.p(2), k.p(3), k.p(4), k.p(5), k.p(6), k.p(7)
-	sink, scale, acc, out := k.p(8), k.pf(9), k.p(10), k.p(11)
+	sink, scale, out := k.p(8), k.pf(9), k.p(11)
 	total := k.iadd(nWin, nTop)
 	qh := k.iadd(q, k.imul(h, hd))
-	acch := k.iadd(acc, k.imul(h, hd))
 	rowAt := func(j id) id {
 		win := k.iget(k.at(rows, k.sel(k.ult(j, nWin), j, k.u32(0))))
 		g := k.iget(k.at(topk, k.sel(k.ult(j, nWin), k.u32(0), k.op(opISub, k.tU32, j, nWin))))
 		c := k.sel(k.isNone(g), g, k.iadd(comp, k.imul(g, hd)))
 		return k.sel(k.ult(j, nWin), win, c)
 	}
-	k.forRange(tid, hd, k.u32(64), func(d id) { k.put(k.at(acch, d), k.f32(0)) })
+	k.forRange(tid, hd, k.u32(threads), func(d id) {
+		k.store(k.shared(qs, d), k.get(k.at(qh, d)))
+		k.store(k.shared(accs, d), k.f32(0))
+	})
 	k.ifThen(k.ieq(tid, k.u32(0)), func() {
 		k.store(k.shared(state, k.u32(0)), k.f32(-1e30))
 		k.store(k.shared(state, k.u32(1)), k.f32(0))
 	})
-	k.barrier()
 	blocks := k.shr(k.iadd(total, k.u32(63)), k.u32(6))
+	rowOf := func(j id) id { return k.toU(k.load(k.tF32, k.shared(rowsS, j))) }
 	k.forRange(k.u32(0), blocks, k.u32(1), func(blk id) {
 		first := k.imul(blk, k.u32(64))
 		count := k.op(opISub, k.tU32, total, first)
 		count = k.sel(k.ult(k.u32(64), count), k.u32(64), count)
-		// Each thread scores a row.
-		s := k.local(k.tF32)
-		k.store(s, k.toF(k.u32(negInfBits)))
+		k.barrier()
 		k.ifThen(k.ult(tid, count), func() {
-			r := rowAt(k.iadd(first, tid))
+			k.store(k.shared(rowsS, tid), k.toF(rowAt(k.iadd(first, tid))))
+		})
+		k.barrier()
+		// Lane sums: way w scores rows w, w+8, ...
+		k.forRange(way, count, k.u32(ways), func(j id) {
+			r := rowOf(j)
 			k.ifThen(k.op(opLogicalNot, k.tBool, k.isNone(r)), func() {
-				d := k.dot32(hd, func(i id) id { return k.get(k.at(qh, i)) }, func(i id) id { return k.get(k.at(r, i)) })
-				k.store(s, k.fmul(d, scale))
+				acc := k.local(k.tF32)
+				k.store(acc, k.f32(0))
+				k.forRange(lane, hd, k.u32(laneCount), func(i id) {
+					k.store(acc, k.fadd(k.load(k.tF32, acc), k.fmul(k.load(k.tF32, k.shared(qs, i)), k.get(k.at(r, i)))))
+				})
+				k.store(k.shared(red, k.iadd(k.imul(j, k.u32(laneCount)), lane)), k.load(k.tF32, acc))
 			})
 		})
-		k.store(k.shared(sc, tid), k.load(k.tF32, s))
 		k.barrier()
-		// One thread: the block's max, the new running max, exps and sums.
+		// A thread per row: its lanes in the fixed tree, the score.
+		k.ifThen(k.ult(tid, count), func() {
+			s := k.local(k.tF32)
+			k.store(s, k.toF(k.u32(negInfBits)))
+			k.ifThen(k.op(opLogicalNot, k.tBool, k.isNone(rowOf(tid))), func() {
+				base := k.imul(tid, k.u32(laneCount))
+				at := func(l int) id { return k.load(k.tF32, k.shared(red, k.iadd(base, k.u32(uint32(l))))) }
+				var e [8]id
+				for j := range e {
+					e[j] = k.fadd(k.fadd(at(j), at(j+8)), k.fadd(at(j+16), at(j+24)))
+				}
+				k.store(s, k.fmul(k.combine8(e), scale))
+			})
+			k.store(k.shared(sc, tid), k.load(k.tF32, s))
+		})
+		k.barrier()
+		// One thread: the block's max and the new running max.
 		k.ifThen(k.ieq(tid, k.u32(0)), func() {
 			bm := k.local(k.tF32)
 			k.store(bm, k.toF(k.u32(negInfBits)))
 			k.forRange(k.u32(0), count, k.u32(1), func(j id) {
-				r := rowAt(k.iadd(first, j))
-				k.ifThen(k.op(opLogicalNot, k.tBool, k.isNone(r)), func() {
+				k.ifThen(k.op(opLogicalNot, k.tBool, k.isNone(rowOf(j))), func() {
 					k.store(bm, k.gomax(k.load(k.tF32, bm), k.load(k.tF32, k.shared(sc, j))))
 				})
 			})
 			prev := k.load(k.tF32, k.shared(state, k.u32(0)))
 			m := k.gomax(prev, k.load(k.tF32, bm))
-			rescale := k.exp32(k.fsub(prev, m))
-			bsum := k.local(k.tF32)
-			k.store(bsum, k.f32(0))
-			k.forRange(k.u32(0), count, k.u32(1), func(j id) {
-				e := k.exp32(k.fsub(k.load(k.tF32, k.shared(sc, j)), m))
-				k.store(k.shared(sc, j), e)
-				k.store(bsum, k.fadd(k.load(k.tF32, bsum), e))
-			})
-			sum := k.load(k.tF32, k.shared(state, k.u32(1)))
-			k.store(k.shared(state, k.u32(1)), k.fadd(k.fmul(sum, rescale), k.load(k.tF32, bsum)))
 			k.store(k.shared(state, k.u32(0)), m)
-			k.store(k.shared(state, k.u32(2)), rescale)
+			k.store(k.shared(state, k.u32(2)), k.exp32(k.fsub(prev, m)))
+		})
+		k.barrier()
+		m := k.load(k.tF32, k.shared(state, k.u32(0)))
+		k.ifThen(k.ult(tid, count), func() {
+			k.store(k.shared(sc, tid), k.exp32(k.fsub(k.load(k.tF32, k.shared(sc, tid)), m)))
 		})
 		k.barrier()
 		rescale := k.load(k.tF32, k.shared(state, k.u32(2)))
-		k.forRange(tid, hd, k.u32(64), func(d id) {
+		k.ifThen(k.ieq(tid, k.u32(0)), func() {
+			bsum := k.local(k.tF32)
+			k.store(bsum, k.f32(0))
+			k.forRange(k.u32(0), count, k.u32(1), func(j id) {
+				k.store(bsum, k.fadd(k.load(k.tF32, bsum), k.load(k.tF32, k.shared(sc, j))))
+			})
+			sum := k.load(k.tF32, k.shared(state, k.u32(1)))
+			k.store(k.shared(state, k.u32(1)), k.fadd(k.fmul(sum, rescale), k.load(k.tF32, bsum)))
+		})
+		k.forRange(tid, hd, k.u32(threads), func(d id) {
 			v := k.local(k.tF32)
 			k.store(v, k.f32(0))
 			k.forRange(k.u32(0), count, k.u32(1), func(j id) {
-				r := rowAt(k.iadd(first, j))
+				r := rowOf(j)
 				k.ifThen(k.op(opLogicalNot, k.tBool, k.isNone(r)), func() {
 					p := k.fmul(k.roundBF16(k.load(k.tF32, k.shared(sc, j))), k.get(k.at(r, d)))
 					k.store(v, k.fadd(k.load(k.tF32, v), p))
 				})
 			})
-			k.put(k.at(acch, d), k.fadd(k.fmul(k.get(k.at(acch, d)), rescale), k.load(k.tF32, v)))
+			k.store(k.shared(accs, d), k.fadd(k.fmul(k.load(k.tF32, k.shared(accs, d)), rescale), k.load(k.tF32, v)))
 		})
-		k.barrier()
 	})
+	k.barrier()
 	m := k.load(k.tF32, k.shared(state, k.u32(0)))
 	sum := k.fadd(k.load(k.tF32, k.shared(state, k.u32(1))), k.exp32(k.fsub(k.get(k.at(sink, h)), m)))
-	k.forRange(tid, hd, k.u32(64), func(d id) {
-		k.put(k.at(k.iadd(out, k.imul(h, hd)), d), k.roundBF16(k.fdiv(k.get(k.at(acch, d)), sum)))
+	k.forRange(tid, hd, k.u32(threads), func(d id) {
+		k.put(k.at(k.iadd(out, k.imul(h, hd)), d), k.roundBF16(k.fdiv(k.load(k.tF32, k.shared(accs, d)), sum)))
 	})
 	return k.finish()
 }
+
+// sparseAttnMaxHD bounds the head width of the sparse attention kernel,
+// whose query and sums sit in shared memory.
+const sparseAttnMaxHD = 512
 
 // moeScoreKernel is the gate's scores of E experts: sqrt(softplus(z)) (fn
 // 0) or sigmoid(z) (1), and those plus the selection bias. Push E, z,

@@ -187,17 +187,24 @@ func (b *Batch) dispatch(k kernelKind, set0 uint64, gx, gy int, push ...uint32) 
 		}
 		d.kernels[k] = p
 	}
-	vk.CmdBindPipeline(b.cb, bindPointCompute, d.kernels[k].pipe)
-	if set0 != 0 {
-		vk.CmdBindDescriptorSets(b.cb, bindPointCompute, d.layout, 0, 1, &set0, 0, nil)
+	record := func() {
+		vk.CmdBindPipeline(b.cb, bindPointCompute, d.kernels[k].pipe)
+		if set0 != 0 {
+			vk.CmdBindDescriptorSets(b.cb, bindPointCompute, d.layout, 0, 1, &set0, 0, nil)
+		}
+		set1 := b.a.set
+		vk.CmdBindDescriptorSets(b.cb, bindPointCompute, d.layout, 1, 1, &set1, 0, nil)
+		var pc [pushWords]uint32
+		copy(pc[:], push)
+		vk.CmdPushConstants(b.cb, d.layout, stageCompute, 0, 4*pushWords, unsafe.Pointer(&pc[0]))
+		vk.CmdDispatch(b.cb, uint32(gx), uint32(gy), 1)
+		barrier(b.cb)
 	}
-	set1 := b.a.set
-	vk.CmdBindDescriptorSets(b.cb, bindPointCompute, d.layout, 1, 1, &set1, 0, nil)
-	var pc [pushWords]uint32
-	copy(pc[:], push)
-	vk.CmdPushConstants(b.cb, d.layout, stageCompute, 0, 4*pushWords, unsafe.Pointer(&pc[0]))
-	vk.CmdDispatch(b.cb, uint32(gx), uint32(gy), 1)
-	barrier(b.cb)
+	if d.prof != nil {
+		b.profiled(k, record)
+		return
+	}
+	record()
 }
 
 func groups(n, per int) int { return (n + per - 1) / per }

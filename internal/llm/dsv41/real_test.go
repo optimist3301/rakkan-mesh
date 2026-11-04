@@ -491,3 +491,115 @@ func TestRealVision(t *testing.T) {
 		t.Logf("%s: the CPU's bits, in %v", dev.Info().Name, time.Since(start))
 	}
 }
+
+// TestProfileRealLayerGPU times the GPU's kernels on a real layer: the
+// prompt in batches, then generation, each kind of kernel apart
+// (RAKKAN_GPU_PROFILE=1; RAKKAN_DSV41_LAYER picks the layer, 2 by default).
+func TestProfileRealLayerGPU(t *testing.T) {
+	dir := os.Getenv("RAKKAN_DSV41_REAL")
+	if dir == "" || os.Getenv("RAKKAN_GPU_PROFILE") == "" {
+		t.Skip("RAKKAN_DSV41_REAL and RAKKAN_GPU_PROFILE not set")
+	}
+	var dev *gpu.Device
+	for _, d := range gpuDevices(t) {
+		if d.Info().Type != "cpu" {
+			dev = d
+			break
+		}
+	}
+	if dev == nil {
+		t.Skip("no hardware GPU")
+	}
+	needMemory(t, 14)
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(10 << 30))
+	layer := 2
+	if s := os.Getenv("RAKKAN_DSV41_LAYER"); s != "" {
+		fmt.Sscan(s, &layer)
+	}
+	cfg, err := LoadConfig("../../../tools/llmref/dsv41/upstream/config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := ReadSafetensors(filepath.Join(dir, fmt.Sprintf("layer%d.safetensors", layer)))
+	if err != nil {
+		t.Skipf("no reference inputs: %v", err)
+	}
+	tensors, err := ReadSafetensors(filepath.Join(dir, fmt.Sprintf("model-%05d-of-00048.safetensors", layer+3)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	part, err := NewPart(cfg, layerTensors(tensors, layer, layer+1), layer, layer+1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tensors = nil
+	input := golden(g).f32(t, "input")
+	T := len(golden(g).ints(t, "tokens"))
+	const P = 1024
+	width := cfg.HCMult * cfg.Dim
+	hashes := make([][]int64, len(cfg.EngramLayers))
+	for i := range hashes {
+		hashes[i] = make([]int64, (cfg.EngramMaxNgram-1)*cfg.EngramHeads)
+	}
+	mk := func(pos int) *Payload {
+		prefill := 0
+		if pos < P {
+			prefill = P
+		}
+		p := &Payload{Prefill: prefill, H: slices.Clone(input[pos*width : (pos+1)*width]), PreMix: make([]float32, cfg.HCMult),
+			Hashes: hashes, Source: sourceBefore(cfg, layer)}
+		p.PreMix[0] = 1
+		return p
+	}
+	gp, err := part.ToGPU(dev, GPUOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gp.Free()
+	gs, err := gp.NewStage(T)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gs.Close()
+	report := func(what string, n int, run func()) {
+		start := time.Now()
+		run()
+		plain := time.Since(start)
+		t.Logf("%s: %v per position (%d positions)", what, (plain / time.Duration(n)).Round(10*time.Microsecond), n)
+	}
+	profile := func(what string, n int, run func()) {
+		dev.StartProfile()
+		run()
+		var total time.Duration
+		entries := dev.StopProfile()
+		for _, e := range entries {
+			total += e.Time
+		}
+		for _, e := range entries {
+			if e.Time*100 >= total {
+				t.Logf("  %s %-12s %5.1f%%  %8v per position, %5d calls", what, e.Kernel, 100*float64(e.Time)/float64(total), (e.Time / time.Duration(n)).Round(time.Microsecond), e.Calls)
+			}
+		}
+	}
+	batches := func(from, to, per int) func() {
+		return func() {
+			for pos := from; pos < to; {
+				n := min(per, to-pos)
+				ps := make([]*Payload, n)
+				for j := range ps {
+					ps[j] = mk(pos + j)
+				}
+				if err := gs.ForwardBatch(ps, pos); err != nil {
+					t.Fatal(err)
+				}
+				pos += n
+			}
+		}
+	}
+	// Plain timing first, then the same positions again, profiled (a stage
+	// rewinds only a few positions: a new stage for each).
+	report("prompt", 512, batches(0, 512, GPUBatch))
+	profile("prompt", 512, batches(512, P, GPUBatch))
+	report("decode", T-P-40, batches(P, T-40, 1))
+	profile("decode", 40, batches(T-40, T, 1))
+}
