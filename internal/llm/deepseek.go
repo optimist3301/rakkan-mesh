@@ -8,6 +8,7 @@ import (
 	"io"
 	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -45,8 +46,10 @@ func parseManifestV2(m *Manifest) (*Manifest, error) {
 		return nil, fmt.Errorf("model manifest lists %d layers and %d Engram tables, config says %d", len(m.Layers), len(m.Engram), c.Layers)
 	}
 	ids := append([]string{m.Head, m.Tokenizer}, m.Layers...)
-	if m.Draft != "" {
-		ids = append(ids, m.Draft)
+	for _, id := range []string{m.Draft, m.Vision} {
+		if id != "" {
+			ids = append(ids, id)
+		}
 	}
 	for i, e := range m.Engram {
 		if (e != "") != slices.Contains(c.EngramLayers, i) {
@@ -184,7 +187,7 @@ func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Man
 		}
 	}
 	groups := map[int][]string{}
-	var head, draft []string
+	var head, draft, vision []string
 	for name := range tensors {
 		if l, ok := dsv41.TensorLayer(name); ok && l < c.Layers {
 			groups[l] = append(groups[l], name)
@@ -192,8 +195,9 @@ func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Man
 			head = append(head, name)
 		} else if dsv41.IsDraftTensor(name) {
 			draft = append(draft, name)
+		} else if dsv41.IsVisionTensor(name) {
+			vision = append(vision, name)
 		}
-		// The rest is vision, not run yet.
 	}
 	m := &Manifest{Version: 2, Name: name, Arch: "dsv41", ModelConfig: src.Config, TokenizerFormat: "hf"}
 	put := func(r io.Reader) (string, error) {
@@ -229,6 +233,11 @@ func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Man
 	}
 	if len(draft) > 0 {
 		if m.Draft, err = put(safetensorsReader(tensors, draft)); err != nil {
+			return blob.ID{}, nil, err
+		}
+	}
+	if len(vision) > 0 && c.Vision.Layers > 0 {
+		if m.Vision, err = put(safetensorsReader(tensors, vision)); err != nil {
 			return blob.ID{}, nil, err
 		}
 	}
@@ -534,6 +543,116 @@ type deepseekCoord struct {
 	draftOnce sync.Once
 	draft     *dsv41.Draft // loaded when first asked for
 	draftErr  error
+
+	visionOnce sync.Once
+	vision     *dsv41.Vision // loaded when first asked for
+	visionErr  error
+}
+
+// deepseekVision loads the model's image encoder, once.
+func (s *Service) deepseekVision(ctx context.Context, m *Manifest, cm *deepseekCoord, providers []peer.ID) (*dsv41.Vision, error) {
+	cm.visionOnce.Do(func() {
+		cm.vision, cm.visionErr = s.loadVision(ctx, m, providers)
+	})
+	return cm.vision, cm.visionErr
+}
+
+func (s *Service) loadVision(ctx context.Context, m *Manifest, providers []peer.ID) (*dsv41.Vision, error) {
+	tensors := map[string]*dsv41.Tensor{}
+	switch {
+	case m.ds.Vision.Layers == 0:
+		return nil, errors.New("the model has no image encoder")
+	case m.Hub != nil && len(m.Hub.Vision) > 0:
+		all, closer, err := s.hubTensors(ctx, m.Hub, m.Hub.Vision)
+		if err != nil {
+			return nil, err
+		}
+		defer closer()
+		for name, t := range all {
+			if dsv41.IsVisionTensor(name) {
+				if tensors[name], err = dsTensor(name, t); err != nil {
+					return nil, err
+				}
+			}
+		}
+	case m.Vision != "":
+		id := mustID(m.Vision)
+		if err := s.blobs.Fetch(ctx, id, providers, 8<<30); err != nil {
+			return nil, err
+		}
+		r, err := s.blobs.Store().Open(id)
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		all := map[string]*stTensor{}
+		if err := readSafetensors(&lockedReaderAt{r: r}, all); err != nil {
+			return nil, err
+		}
+		for name, t := range all {
+			if tensors[name], err = dsTensor(name, t); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, errors.New("the model's manifest has no image encoder")
+	}
+	return dsv41.NewVision(m.ds, tensors)
+}
+
+// MaxImages bounds the images of one request.
+const MaxImages = 16
+
+// images expands each image token of tokens into its image's span: the
+// span's positions are dsv41.ImagePosition in the tokens returned, and
+// rows holds their inputs by position.
+func (s *Service) deepseekImages(ctx context.Context, m *Manifest, cm *deepseekCoord, providers []peer.ID, tokens []int, images [][]byte) ([]int, map[int][]float32, error) {
+	c := cm.head.Cfg
+	n := 0
+	for _, t := range tokens {
+		if t == c.ImageToken {
+			n++
+		}
+	}
+	switch {
+	case n != len(images):
+		return nil, nil, fmt.Errorf("the prompt has %d image places, %d images were given", n, len(images))
+	case n == 0:
+		return tokens, nil, nil
+	case len(images) > MaxImages:
+		return nil, nil, fmt.Errorf("%d images, at most %d", len(images), MaxImages)
+	}
+	vis, err := s.deepseekVision(ctx, m, cm, providers)
+	if err != nil {
+		return nil, nil, fmt.Errorf("image encoder: %w", err)
+	}
+	out := make([]int, 0, len(tokens))
+	rows := map[int][]float32{}
+	k := 0
+	for _, t := range tokens {
+		if t != c.ImageToken {
+			out = append(out, t)
+			continue
+		}
+		img, err := c.PrepareImage(images[k])
+		if err != nil {
+			return nil, nil, fmt.Errorf("image %d: %w", k+1, err)
+		}
+		emb, err := vis.Encode(img)
+		if err != nil {
+			return nil, nil, err
+		}
+		span, err := vis.Span(img.ImageGrid, emb)
+		if err != nil {
+			return nil, nil, err
+		}
+		for _, r := range span {
+			rows[len(out)] = r
+			out = append(out, dsv41.ImagePosition)
+		}
+		k++
+	}
+	return out, rows, nil
 }
 
 // deepseekDraft loads the model's DSpark draft, once.
@@ -660,32 +779,65 @@ func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func() (map[string
 }
 
 // prompt encodes a generation's prompt: in the chat format, as one user
-// message answered without reasoning, if asked.
-func (d *deepseekCoord) prompt(text string, chat bool) ([]int, error) {
+// message answered without reasoning, if asked, the images first. Image
+// places are the model's image token, from the config: a tokenizer may
+// spell the placeholder otherwise. Without chat, the placeholder in the
+// text marks them.
+func (d *deepseekCoord) prompt(text string, chat bool, images int) ([]int, error) {
 	c := d.head.Cfg
+	if chat {
+		msg := dsv41.NewObject()
+		msg.Set("role", dsv41.NewString("user"))
+		if images == 0 {
+			msg.Set("content", dsv41.NewString(text))
+		} else {
+			var blocks []*dsv41.Value
+			for range images {
+				b := dsv41.NewObject()
+				b.Set("type", dsv41.NewString("image"))
+				b.Set("data", dsv41.NewString("-")) // the bytes travel apart
+				blocks = append(blocks, b)
+			}
+			b := dsv41.NewObject()
+			b.Set("type", dsv41.NewString("text"))
+			b.Set("text", dsv41.NewString(text))
+			msg.Set("content", dsv41.NewArray(append(blocks, b)...))
+		}
+		p, _, err := dsv41.EncodeChat([]*dsv41.Value{msg}, dsv41.ChatOptions{ThinkingMode: "chat"})
+		if err != nil {
+			return nil, err
+		}
+		text = p
+	}
+	var tokens []int
 	if !chat {
-		return append([]int{c.BOS}, d.tok.Encode(text)...), nil
+		tokens = append(tokens, c.BOS)
 	}
-	msg := dsv41.NewObject()
-	msg.Set("role", dsv41.NewString("user"))
-	msg.Set("content", dsv41.NewString(text))
-	p, _, err := dsv41.EncodeChat([]*dsv41.Value{msg}, dsv41.ChatOptions{ThinkingMode: "chat"})
-	if err != nil {
-		return nil, err
+	for i, piece := range strings.Split(text, dsv41.ImagePlaceholder) {
+		if i > 0 {
+			tokens = append(tokens, c.ImageToken)
+		}
+		tokens = append(tokens, d.tok.Encode(piece)...)
 	}
-	return d.tok.Encode(p), nil
+	return tokens, nil
 }
 
 // inputs are the Payloads of positions from.. of tokens; prompt is the
-// prompt's length.
-func (d *deepseekCoord) inputs(tokens []int, from, prompt int, wantMain bool) ([]byte, error) {
+// prompt's length, rows the inputs of its image positions.
+func (d *deepseekCoord) inputs(tokens []int, rows map[int][]float32, from, prompt int, wantMain bool) ([]byte, error) {
 	var b []byte
 	for pos := from; pos < len(tokens); pos++ {
 		prefill := 0
 		if pos < prompt {
 			prefill = prompt
 		}
-		p, err := d.head.Embed(tokens[:pos+1], prefill)
+		var p *dsv41.Payload
+		var err error
+		if tokens[pos] == dsv41.ImagePosition {
+			p, err = d.head.EmbedImage(tokens[:pos+1], rows[pos], prefill)
+		} else {
+			p, err = d.head.Embed(tokens[:pos+1], prefill)
+		}
 		if err != nil {
 			return nil, err
 		}

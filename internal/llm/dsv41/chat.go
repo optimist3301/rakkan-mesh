@@ -23,7 +23,8 @@ const (
 	assistantSP        = "<｜Assistant｜>"
 	latestReminderSP   = "<｜latest_reminder｜>"
 	systemSP           = "<｜System｜>"
-	imagePlaceholder   = "<｜deepseek_image｜>"
+	// ImagePlaceholder marks an image's place in a prompt.
+	ImagePlaceholder = "<｜deepseek_image｜>"
 
 	toolCallsBlockName   = " calls"
 	toolCallTagName      = " invoke"
@@ -95,10 +96,10 @@ func EncodeChat(messages []*Value, o ChatOptions) (string, []ImageRecord, error)
 func isString(v *Value) bool { return v != nil && v.Kind == String }
 
 func validateNoImageTokens(m *Value) error {
-	if c := m.Get("content"); isString(c) && strings.Contains(c.S, imagePlaceholder) {
+	if c := m.Get("content"); isString(c) && strings.Contains(c.S, ImagePlaceholder) {
 		return errors.New("chat: message content contains the image special token; images go in image blocks")
 	}
-	if r := m.Get("reasoning_content"); isString(r) && strings.Contains(r.S, imagePlaceholder) {
+	if r := m.Get("reasoning_content"); isString(r) && strings.Contains(r.S, ImagePlaceholder) {
 		return errors.New("chat: reasoning_content contains the image special token")
 	}
 	return nil
@@ -268,7 +269,7 @@ func processImageBlocks(blocks []*Value) ([]*Value, []*Value, error) {
 		t := b.Get("type")
 		switch {
 		case isImageBlock(b):
-			out = append(out, textBlock(NewString(imagePlaceholder)))
+			out = append(out, textBlock(NewString(ImagePlaceholder)))
 			rec, err := extractImage(b)
 			if err != nil {
 				return nil, nil, err
@@ -284,7 +285,7 @@ func processImageBlocks(blocks []*Value) ([]*Value, []*Value, error) {
 			out = append(out, b)
 			images = append(images, imgs...)
 		case isString(t) && t.S == "text":
-			if text := b.Get("text"); isString(text) && strings.Contains(text.S, imagePlaceholder) {
+			if text := b.Get("text"); isString(text) && strings.Contains(text.S, ImagePlaceholder) {
 				return nil, nil, errors.New("chat: text block contains the image placeholder")
 			}
 			out = append(out, b)

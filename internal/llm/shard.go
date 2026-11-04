@@ -53,6 +53,9 @@ type Manifest struct {
 	Hub *HubOrigin `json:"hub,omitempty"`
 	// Draft is the DSpark draft model's blob (safetensors, mtp.*), if any.
 	Draft string `json:"draft,omitempty"`
+	// Vision is the image encoder's blob (safetensors: vision.*, aligner.*,
+	// image_*), if any.
+	Vision string `json:"vision,omitempty"`
 
 	ds *dsv41.Config
 }

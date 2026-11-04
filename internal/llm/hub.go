@@ -275,7 +275,8 @@ type HubOrigin struct {
 	Files    map[string]HubFile `json:"files"`
 	Head     []string           `json:"head"`
 	Layers   [][]string         `json:"layers"`
-	Draft    []string           `json:"draft,omitempty"` // the DSpark draft model's
+	Draft    []string           `json:"draft,omitempty"`  // the DSpark draft model's
+	Vision   []string           `json:"vision,omitempty"` // the image encoder's
 }
 
 var commitID = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -294,7 +295,7 @@ func (o *HubOrigin) check(c *dsv41.Config) error {
 			return fmt.Errorf("file %q pinned as %+v", name, f)
 		}
 	}
-	for _, n := range o.Draft {
+	for _, n := range append(slices.Clone(o.Draft), o.Vision...) {
 		if _, ok := o.Files[n]; !ok {
 			return fmt.Errorf("file %q not pinned", n)
 		}
@@ -389,9 +390,11 @@ func ImportHub(ctx context.Context, store *blob.Store, hub *Hub, repo, revision,
 			add(&o.Head, file)
 		} else if dsv41.IsDraftTensor(tensor) {
 			add(&o.Draft, file)
+		} else if dsv41.IsVisionTensor(tensor) {
+			add(&o.Vision, file)
 		}
 	}
-	for _, names := range append([][]string{o.Head, o.Draft}, o.Layers...) {
+	for _, names := range append([][]string{o.Head, o.Draft, o.Vision}, o.Layers...) {
 		sort.Strings(names)
 		for _, n := range names {
 			o.Files[n] = files[n]

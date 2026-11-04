@@ -22,6 +22,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
@@ -636,6 +638,26 @@ type generateRequest struct {
 	// Draft has DeepSeek-V4.1's draft model propose tokens: the same text,
 	// fewer passes through the stages.
 	Draft bool `json:"draft,omitempty"`
+	// Images are PNG files, base64 or data: URLs, for a model with an image
+	// encoder; a node fetches nothing by URL.
+	Images []string `json:"images,omitempty"`
+}
+
+// maxGenerateBody bounds a generation request: its prompt and images.
+const maxGenerateBody = 64 << 20
+
+// decodeImage reads an image of a request: base64, or a base64 data: URL.
+func decodeImage(s string) ([]byte, error) {
+	if rest, ok := strings.CutPrefix(s, "data:"); ok {
+		header, payload, found := strings.Cut(rest, ",")
+		if !found || !strings.HasSuffix(header, ";base64") {
+			return nil, errors.New("image: a data: URL must be base64")
+		}
+		s = payload
+	} else if strings.Contains(s, "://") {
+		return nil, errors.New("image: give the bytes, not a URL")
+	}
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // generate streams a generation's tokens as NDJSON, then its statistics.
@@ -645,7 +667,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req generateRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxGenerateBody)).Decode(&req); err != nil {
 		badRequest(w, "%v", err)
 		return
 	}
@@ -654,12 +676,26 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "%v", err)
 		return
 	}
+	if len(req.Images) > llm.MaxImages {
+		badRequest(w, "%d images, at most %d", len(req.Images), llm.MaxImages)
+		return
+	}
+	var images [][]byte
+	for i, s := range req.Images {
+		b, err := decodeImage(s)
+		if err != nil {
+			badRequest(w, "image %d: %v", i+1, err)
+			return
+		}
+		images = append(images, b)
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
 		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat, Draft: req.Draft,
+		Images: images,
 	}, func(e llm.Event) error {
 		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {
 			return err

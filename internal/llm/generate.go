@@ -36,6 +36,11 @@ type GenerateRequest struct {
 	// tokens, verified a block at a time: fewer passes through the stages,
 	// the same text.
 	Draft bool
+	// Images are encoded images (PNG) for a model with an image encoder
+	// (DeepSeek-V4.1's), in the order of their places: with Chat they come
+	// before the text of the message; without, the text marks each place
+	// with the model's image placeholder.
+	Images [][]byte
 }
 
 // Event is one generated token.
@@ -156,7 +161,10 @@ func (s *Service) llamaCoordinator(ctx context.Context, cm *coordModel, provider
 // prompt encodes a generation's prompt.
 func (cm *coordModel) prompt(req GenerateRequest) ([]int, error) {
 	if cm.ds != nil {
-		return cm.ds.prompt(req.Prompt, req.Chat)
+		return cm.ds.prompt(req.Prompt, req.Chat, len(req.Images))
+	}
+	if len(req.Images) > 0 {
+		return nil, errors.New("the model takes no images")
 	}
 	m := cm.manifest
 	prompt := req.Prompt
@@ -190,9 +198,9 @@ func (cm *coordModel) piece(prev, next int) []byte {
 // inputs are the first stage's input for positions from.. of tokens, the
 // prompt being their first prompt; wantMain asks for what a draft model
 // reads (DeepSeek's).
-func (cm *coordModel) inputs(tokens []int, from, prompt int, wantMain bool) ([]byte, error) {
+func (cm *coordModel) inputs(tokens []int, rows map[int][]float32, from, prompt int, wantMain bool) ([]byte, error) {
 	if cm.ds != nil {
-		return cm.ds.inputs(tokens, from, prompt, wantMain)
+		return cm.ds.inputs(tokens, rows, from, prompt, wantMain)
 	}
 	c := cm.manifest.Config
 	xs := make([]float32, 0, (len(tokens)-from)*c.Dim)
@@ -408,6 +416,12 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 	if err != nil {
 		return nil, err
 	}
+	var rows map[int][]float32 // the inputs of image positions
+	if cm.ds != nil {
+		if tokens, rows, err = s.deepseekImages(ctx, m, cm.ds, providers, tokens, req.Images); err != nil {
+			return nil, err
+		}
+	}
 	if len(tokens) == 0 {
 		return nil, errors.New("empty prompt")
 	}
@@ -482,7 +496,7 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 
 	// Prefill: the whole prompt through each stage in one request.
 	prompt := len(tokens)
-	in, err := cm.inputs(tokens, 0, prompt, draft != nil)
+	in, err := cm.inputs(tokens, rows, 0, prompt, draft != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +550,7 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 			}
 		}
 		proposal = nil
-		if draft != nil && !done && stats.Tokens < maxTokens {
+		if draft != nil && !done && stats.Tokens < maxTokens && tokens[len(tokens)-1] >= 0 {
 			// As many as fit the generation's positions and its length.
 			k := min(m.ds.DraftBlock, maxTokens-stats.Tokens-1, positions-len(tokens))
 			if k > 0 {
@@ -551,7 +565,7 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 				stats.Drafted += len(proposal)
 			}
 		}
-		if in, err = cm.inputs(append(slices.Clone(tokens), proposal...), pos, prompt, draft != nil); err != nil {
+		if in, err = cm.inputs(append(slices.Clone(tokens), proposal...), rows, pos, prompt, draft != nil); err != nil {
 			return nil, err
 		}
 	}

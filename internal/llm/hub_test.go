@@ -403,7 +403,7 @@ func TestHubHeadOnline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := cm.inputs(tokens, 0, len(tokens), false)
+	in, err := cm.inputs(tokens, nil, 0, len(tokens), false)
 	if err != nil {
 		t.Fatal(err)
 	}

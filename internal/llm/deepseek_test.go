@@ -451,3 +451,138 @@ func TestDeepSeekDraftFailoverAndWitness(t *testing.T) {
 		t.Fatalf("stage %+v, caught %d", st, stats.Caught)
 	}
 }
+
+// fixtureImage is the PNG of the fixture's image prompt.
+func fixtureImage(t *testing.T) []byte {
+	t.Helper()
+	g, err := dsv41.ReadSafetensors(filepath.Join(dsFixture, "golden.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return g["vl.png"].Data
+}
+
+// localDeepSeekImage generates greedily in one process from text, an
+// image's span, then more text.
+func localDeepSeekImage(t *testing.T, tokData []byte, before string, png []byte, after string, maxTokens int) []int {
+	t.Helper()
+	cfg, err := dsv41.LoadConfig(filepath.Join(dsFixture, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tok, err := ReadBPE(tokData, cfg.Vocab)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tables, err := dsv41.BuildEngramTables(cfg, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tensors, err := dsv41.ReadSafetensors(filepath.Join(dsFixture, "model.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := dsv41.New(cfg, tensors, tables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vis, err := dsv41.NewVision(cfg, tensors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := cfg.PrepareImage(png)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emb, err := vis.Encode(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	span, err := vis.Span(img.ImageGrid, emb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokens := append([]int{cfg.BOS}, tok.Encode(before)...)
+	rows := make([][]float32, len(tokens))
+	for _, r := range span {
+		tokens = append(tokens, dsv41.ImagePosition)
+		rows = append(rows, r)
+	}
+	for _, x := range tok.Encode(after) {
+		tokens = append(tokens, x)
+		rows = append(rows, nil)
+	}
+	st := m.NewState()
+	logits := st.PrefillImages(tokens, rows)
+	sampler := NewSampler(0, 0)
+	var out []int
+	for len(out) < maxTokens {
+		next := sampler.Sample(logits)
+		if next == cfg.EOS {
+			break
+		}
+		out = append(out, next)
+		logits = st.Decode(next)
+	}
+	return out
+}
+
+// A prompt with an image over two nodes, the draft proposing or not, gives
+// what one process does; the coordinator encodes the image.
+func TestDeepSeekImageOverNodes(t *testing.T) {
+	c := newCluster(t)
+	coord := c.add(false)
+	for range 2 {
+		c.add(true)
+	}
+	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 2)
+	png := fixtureImage(t)
+	before, after := "Look at", " it"
+	want := localDeepSeekImage(t, tok, before, png, after, 12)
+	for _, draft := range []bool{false, true} {
+		got, stats := generate(t, coord, GenerateRequest{
+			Model: model, Prompt: before + dsv41.ImagePlaceholder + after, MaxTokens: 12, Stages: 2,
+			Images: [][]byte{png}, Draft: draft,
+		}, nil)
+		if !equalTokens(got, want) {
+			t.Fatalf("draft %v: tokens %v, one process %v", draft, got, want)
+		}
+		t.Logf("draft %v: %d prompt tokens (an image's span among them), %d new, %d passes", draft, stats.PromptTokens, stats.Tokens, stats.Passes)
+	}
+	// The places and the images must agree.
+	if _, err := coord.llm.Generate(t.Context(), GenerateRequest{Model: model, Prompt: before, Images: [][]byte{png}}, func(Event) error { return nil }); err == nil {
+		t.Error("an image without a place in the prompt was taken")
+	}
+}
+
+// In the chat format, the images come before the message's text, each
+// place the config's image token.
+func TestDeepSeekChatImagePlaces(t *testing.T) {
+	c := newCluster(t)
+	coord := c.add(false)
+	model, _ := importTinyDeepSeek(t, coord.blobs.Store())
+	cm, err := coord.llm.coordinator(t.Context(), model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := cm.ds.head.Cfg
+	tokens, err := cm.prompt(GenerateRequest{Prompt: "what is this", Chat: true, Images: make([][]byte, 2)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var places []int
+	for i, x := range tokens {
+		if x == cfg.ImageToken {
+			places = append(places, i)
+		}
+	}
+	text := cm.ds.tok.Encode("what is this")
+	at := slices.Index(tokens, text[0])
+	if len(places) != 2 || at < places[1] {
+		t.Fatalf("image places %v, the text from %d, in %v", places, at, tokens)
+	}
+	if _, err := cm.prompt(GenerateRequest{Prompt: "a " + dsv41.ImagePlaceholder, Chat: true}); err == nil {
+		t.Error("the placeholder in a chat message's text was taken")
+	}
+}
