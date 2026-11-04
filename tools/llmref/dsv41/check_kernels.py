@@ -14,8 +14,10 @@ usage: check_kernels.py [--fixture DIR] [--out REPORT.json] [--dry-run]
   --fixture  default: the committed tiny fixture. tilelang may reject its
              small widths; then make one with `tiny.py --medium DIR`.
 
-Setup on the GPU machine (Hopper or Blackwell, like the reference):
-  python -m venv .venv && .venv/bin/pip install -r upstream/inference/requirements.txt
+On the GPU machine (Hopper, like the reference), gpu_server.sh sets up
+PyTorch with CUDA and tilelang and runs this on both fixtures; by hand:
+  python -m venv .venv && .venv/bin/pip install --index-url https://download.pytorch.org/whl/cu128 torch==2.15.0
+  .venv/bin/pip install -r requirements-cpu.txt tilelang
   .venv/bin/python tiny.py --medium /tmp/medium
   .venv/bin/python check_kernels.py --fixture /tmp/medium --out report.json
 Send report.json back: it decides whether kernel_cpu needs changes.

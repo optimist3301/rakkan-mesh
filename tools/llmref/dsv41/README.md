@@ -68,26 +68,46 @@ cd ../../.. && RAKKAN_DSV41_REAL=$DIR go test -run RealLayers -v ./internal/llm/
 ## Проверка на GPU
 
 `kernel_cpu` повторяет квантование эталона операция за операцией. Совпадает
-ли он с настоящими ядрами, можно проверить только на GPU NVIDIA (Hopper или
-Blackwell: tilelang и FP8/FP4 эталона рассчитаны на них).
+ли он с настоящими ядрами, можно проверить только на GPU NVIDIA. Ядра
+tilelang считают в FP8 на тензорных ядрах (FP4-веса тоже переводятся в FP8),
+и написаны они под Hopper. Хватит одной H100 на пару часов. На Ada (L40S,
+RTX 4090) FP8 есть, но ядра могут не собраться.
+
+На сервере нужны:
+- CUDA 12.x и Python 3.10+;
+- от 64 ГБ RAM и 100 ГБ диска для проверки настоящих слоёв;
+- для тестов Vulkan — драйвер NVIDIA с Vulkan: пакеты `libnvidia-gl-*` и
+  `vulkan-tools`, проверка — `vulkaninfo --summary`.
+
+Ветка в удалённом репозитории может отставать: скопируйте рабочую копию,
+затем на сервере запустите скрипт.
 
 ```sh
-cd tools/llmref/dsv41
-python3 -m venv .venv
-.venv/bin/pip install -r upstream/inference/requirements.txt
-.venv/bin/python tiny.py --medium /tmp/medium
-.venv/bin/python check_kernels.py --fixture /tmp/medium --out report.json
-.venv/bin/python check_kernels.py --out report-tiny.json   # крошечная фикстура; tilelang может отвергнуть её размеры
+rsync -az --exclude 'tools/llmref/.venv*' --exclude 'gpu-results-*' ./ SERVER:rakkan-mesh/
+ssh SERVER 'cd rakkan-mesh && tools/llmref/dsv41/gpu_server.sh --real'
+scp 'SERVER:rakkan-mesh/gpu-results-*.tar.gz' .
 ```
+
+`gpu_server.sh` делает всё сам:
+- ставит в `tools/llmref/.venv-gpu` PyTorch 2.15 с CUDA (тот же, на котором
+  сделана фикстура) и tilelang;
+- прогоняет `check_kernels.py` на крошечной и средней фикстуре;
+- ставит Go нужной версии и прогоняет тесты движка, тесты Vulkan — на GPU
+  NVIDIA, если его драйвер даёт Vulkan;
+- с `--real` скачивает с Hub 16 ГиБ и сверяет слои 2 и 20 с эталоном на CPU и
+  GPU.
+
+Каждый шаг пишет свой лог, ошибка одного шага не останавливает остальные.
+Итог — в `summary.txt`, всё вместе — в архиве `gpu-results-*.tar.gz`. Его нужно
+вернуть в проект: по `report-*.json` решается, нужно ли править `kernel_cpu`.
+Без `--real` скрипт укладывается примерно в полчаса.
 
 **Ожидаемый результат:**
 - квантование (`act_quant*`, `fp4_quant*`) совпадает на 1.0000;
 - у умножений, внимания и Sinkhorn доля совпадений может быть меньше 1, но
   ошибки должны быть порядка округления bf16;
-- для модели `argmax` совпадает на всех шагах.
-
-Файлы `report*.json` нужно вернуть в проект: по ним решается, нужно ли
-править `kernel_cpu`.
+- для модели `argmax` совпадает на всех шагах;
+- тесты Go проходят, в том числе тесты Vulkan на GPU NVIDIA (побитово как CPU).
 
 Без GPU `check_kernels.py --dry-run` проверяет сам скрипт: `kernel_cpu`
 сравнивается сам с собой, и всё должно совпасть.
