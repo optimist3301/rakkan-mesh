@@ -356,6 +356,9 @@ func combineBlocks(sums []float64, xs []float32, ws []byte, unit float64, bf16 b
 		t = float32(t * DecodeE8M0(ws[b]))
 		acc = float32(acc + t)
 	}
+	// Processors make NaNs of different bits (x86 0xffc00000, arm64 and
+	// NVIDIA's GPUs others): one for all, so that every node gives the same.
+	acc = Canonical(acc)
 	if bf16 {
 		acc = RoundBF16(acc)
 	}

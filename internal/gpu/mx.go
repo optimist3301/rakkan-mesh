@@ -267,7 +267,8 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 			k.barrier()
 		}, func() { k.store(chunk, k.iadd(k.load(k.tU32, chunk), k.u32(1))) })
 		k.ifThen(k.land(k.ult(lane, k.u32(mxRows)), k.ult(myRow, rows)), func() {
-			v := k.load(k.tF32, acc)
+			// NaN canonical: devices make NaNs of different bits.
+			v := k.canonical(k.load(k.tF32, acc))
 			k.put(k.at(outOff, myRow), k.selF(k.ieq(raw, k.u32(0)), k.roundBF16(v), v))
 		})
 	})
@@ -403,7 +404,8 @@ func mxBatchKernel(kind kernelKind, modes floatModes) []uint32 {
 		k.barrier()
 	}, func() { k.store(chunk, k.iadd(k.load(k.tU32, chunk), k.u32(1))) })
 	k.ifThen(k.land(k.ult(myIn, nIn), k.ult(myRow, rows)), func() {
-		v := k.load(k.tF32, acc)
+		// NaN canonical: devices make NaNs of different bits.
+		v := k.canonical(k.load(k.tF32, acc))
 		k.put(k.at(k.iadd(outOff, k.imul(myIn, outStride)), myRow), k.selF(k.ieq(raw, k.u32(0)), k.roundBF16(v), v))
 	})
 	return k.finish()

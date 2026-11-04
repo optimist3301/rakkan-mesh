@@ -115,7 +115,7 @@ def kernel_checks(K, device):
         b, m, h, d, n, topk = 1, 4, 64, 512, 2048, 640
         q = torch.randn(b, m, h, d).to(torch.bfloat16)
         kv = torch.randn(b, n, d).to(torch.bfloat16)
-        sink = torch.randn(h)
+        sink = torch.randn(h, dtype=torch.float32)  # the model keeps attn_sink in float32
         idx = torch.stack([torch.randperm(n)[:topk] for _ in range(b * m)]).view(b, m, topk).int()
         idx[0, 1, 100:] = -1
         idx[0, 2, :] = -1

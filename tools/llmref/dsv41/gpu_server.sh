@@ -13,10 +13,20 @@
 # usage, from the repository copied to the machine:
 #   tools/llmref/dsv41/gpu_server.sh [--real]
 # Environment: TORCH_CUDA (the PyTorch wheel index, default: tried
-# cu128, cu126, cu130), GO_VERSION (default from go.mod), OUT (results
+# cu132, cu130, cu128, cu126), GO_VERSION (default from go.mod), OUT (results
 # directory). Every step logs to OUT/<step>.log; one failing does not stop
 # the others. The archive is OUT.tar.gz.
+#
+# Rented machines often have a small disk (20 GB) and a large /dev/shm: the
+# caches (pip, tilelang's kernels, Go's, the Hub shards of --real) go to
+# /dev/shm when it has room, the repository may stay on the disk.
 set -uo pipefail
+
+if [ -d /dev/shm ] && [ "$(df --output=avail -k /dev/shm | tail -1)" -gt $((40 << 20)) ]; then
+	export XDG_CACHE_HOME=${XDG_CACHE_HOME:-/dev/shm/cache}
+	export GOCACHE=${GOCACHE:-/dev/shm/go/cache} GOMODCACHE=${GOMODCACHE:-/dev/shm/go/mod}
+fi
+export PIP_NO_CACHE_DIR=1
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -44,7 +54,21 @@ step() {
 	fi
 }
 
+# What a bare image lacks (Ubuntu): venv, and the Vulkan loader with the
+# libraries NVIDIA's Vulkan driver loads. Root and apt only.
+packages() {
+	set -e
+	[ "$(id -u)" = 0 ] && command -v apt-get >/dev/null || { echo "not root or no apt: skipped"; return 0; }
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get update
+	apt-get install -y python3-venv "python$(python3 -c 'import sys; print(f"{sys.version_info[0]}.{sys.version_info[1]}")')-venv" \
+		libvulkan1 vulkan-tools libxext6 libx11-6 libegl1 libgl1 curl git
+}
+
 say "rakkan-mesh GPU checks, $(date -u +%FT%TZ), revision $(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+git config --global --add safe.directory "$REPO" # copied in as another user
+step packages packages
 
 # 0. The machine.
 environment() {
@@ -66,7 +90,7 @@ python_env() {
 	set -e
 	python3 -m venv "$VENV"
 	"$PY" -m pip install --upgrade pip
-	local tags=${TORCH_CUDA:-cu128 cu126 cu130}
+	local tags=${TORCH_CUDA:-cu132 cu130 cu128 cu126}
 	local ok=0
 	for tag in $tags; do
 		if "$PY" -m pip install --index-url "https://download.pytorch.org/whl/$tag" torch==2.15.0; then
@@ -76,6 +100,11 @@ python_env() {
 	done
 	[ $ok = 1 ]
 	"$PY" -m pip install -r "$HERE/requirements-cpu.txt" tilelang
+	# tilelang compiles with nvcc: the pip one, of torch's CUDA version (a
+	# newer nvcc makes PTX the older ptxas rejects, and wants its headers).
+	local cu
+	cu=$("$PY" -c 'import torch; print(torch.version.cuda)')
+	"$PY" -m pip install "nvidia-cuda-nvcc==$cu.*" "nvidia-cuda-cccl==$cu.*" "nvidia-cuda-crt==$cu.*" "nvidia-nvvm==$cu.*"
 	"$PY" - <<-'EOF'
 		import torch, tilelang
 		print("torch", torch.__version__, "cuda", torch.version.cuda, "available", torch.cuda.is_available())

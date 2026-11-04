@@ -436,7 +436,8 @@ def main():
 
 def fixture_tokens():
     g = torch.Generator().manual_seed(SEED + 1)
-    tokens = torch.randint(3, ARGS["vocab_size"], (PROMPT_LEN + DECODE_STEPS,), generator=g).tolist()
+    # On the CPU, whatever the default device: the GPU check runs with CUDA's.
+    tokens = torch.randint(3, ARGS["vocab_size"], (PROMPT_LEN + DECODE_STEPS,), generator=g, device="cpu").tolist()
     tokens[5:9] = tokens[12:16]  # a repeated 4-gram, so Engram n-grams recur
     return tokens
 
