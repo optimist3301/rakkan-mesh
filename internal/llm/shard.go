@@ -48,6 +48,9 @@ type Manifest struct {
 	Arch        string          `json:"arch,omitempty"`
 	ModelConfig json.RawMessage `json:"model_config,omitempty"`
 	Engram      []string        `json:"engram,omitempty"`
+	// Hub, instead of Layers, Head, Tokenizer and Engram, names the files of
+	// a Hugging Face repository the parts come from (hub.go).
+	Hub *HubOrigin `json:"hub,omitempty"`
 
 	ds *dsv41.Config
 }

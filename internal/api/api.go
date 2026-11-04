@@ -78,6 +78,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/trust", s.trust)
 	mux.HandleFunc("POST /v1/llm/models", s.importModel)
 	mux.HandleFunc("POST /v1/llm/generate", s.generate)
+	mux.HandleFunc("POST /v1/llm/prefetch", s.prefetch)
 	return mux
 }
 
@@ -480,7 +481,7 @@ func (s *Server) trust(w http.ResponseWriter, _ *http.Request) {
 // importRequest names uploaded blobs: a llama2.c checkpoint and tokenizer,
 // or, with format "hf", a Hugging Face model's files.
 type importRequest struct {
-	Format string `json:"format,omitempty"` // "llama2c" (default) or "hf"
+	Format string `json:"format,omitempty"` // "llama2c" (default), "hf" or "hub"
 	// Quant stores the matrices as "bf16", "q8_0", "q4_m" or "q4_0".
 	Quant      string `json:"quant,omitempty"`
 	Checkpoint string `json:"checkpoint,omitempty"`
@@ -493,6 +494,11 @@ type importRequest struct {
 	GenerationConfig string   `json:"generation_config,omitempty"`
 	TokenizerConfig  string   `json:"tokenizer_config,omitempty"`
 	Weights          []string `json:"weights,omitempty"`
+	// Hub: a DeepSeek-V4.1 repository on the Hugging Face Hub, at a
+	// revision (a commit, or a branch or tag resolved to one; default
+	// main). Nodes download the weights they serve.
+	Repo     string `json:"repo,omitempty"`
+	Revision string `json:"revision,omitempty"`
 }
 
 // importModel splits a llama2.c checkpoint into a model's blobs.
@@ -515,6 +521,16 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Format == "hf" {
 		s.importHF(w, req, read)
+		return
+	}
+	if req.Format == "hub" {
+		id, m, err := s.LLM.ImportHub(r.Context(), req.Repo, req.Revision, req.Name)
+		if err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.ModelConfig, "chat": true,
+			"repo": m.Hub.Repo, "revision": m.Hub.Revision})
 		return
 	}
 	ckData, err := read(req.Checkpoint)
@@ -688,4 +704,36 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		return err
 	}
 	return nil
+}
+
+type prefetchRequest struct {
+	Model string `json:"model"`
+	From  int    `json:"from,omitempty"`
+	To    int    `json:"to,omitempty"`
+}
+
+// prefetch gets this node the files of a Hub model's layers [from, to)
+// (all by default) ahead of serving them; it answers when they are here,
+// and the downloads go on if the request ends first.
+func (s *Server) prefetch(w http.ResponseWriter, r *http.Request) {
+	if s.LLM == nil {
+		badRequest(w, "language models are not enabled on this node")
+		return
+	}
+	var req prefetchRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	id, err := blob.ParseID(req.Model)
+	if err != nil {
+		badRequest(w, "model: %v", err)
+		return
+	}
+	n, err := s.LLM.Prefetch(r.Context(), id, req.From, req.To)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": req.Model, "bytes": n})
 }

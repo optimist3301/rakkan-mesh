@@ -28,6 +28,16 @@ var dtypeSize = map[string]int{
 	"F8_E4M3": 1, "F8_E8M0": 1,
 }
 
+// NewTensor makes a tensor of data, checking its size against the shape.
+func NewTensor(dtype string, shape []int, data []byte) (*Tensor, error) {
+	t := &Tensor{DType: dtype, Shape: shape, Data: data}
+	size, ok := dtypeSize[dtype]
+	if !ok || len(data) != t.Elems()*size {
+		return nil, fmt.Errorf("safetensors: tensor of type %s, shape %v, %d bytes", dtype, shape, len(data))
+	}
+	return t, nil
+}
+
 // ReadSafetensors reads a whole safetensors file into memory.
 func ReadSafetensors(path string) (map[string]*Tensor, error) {
 	b, err := os.ReadFile(path)

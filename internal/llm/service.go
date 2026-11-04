@@ -77,6 +77,9 @@ type advert struct {
 	// FreeHost, on a GPU node, is its RAM for what of a layer may run on
 	// the CPU beside the GPU (DeepSeek's routed experts).
 	FreeHost int64 `json:"free_host,omitempty"`
+	// Files are the Hub models' files the node offers: blobs by content
+	// (HubFile.key).
+	Files map[string]string `json:"files,omitempty"`
 	// FreeDisk is the blob store's room, for parts read from disk as
 	// they are used (DeepSeek-V4.1's Engram tables).
 	FreeDisk int64 `json:"free_disk,omitempty"`
@@ -108,6 +111,11 @@ type ServiceConfig struct {
 	// Generate). Without it every peer is trusted.
 	Trust  *trust.Service
 	Logger *slog.Logger
+	// Hub, if set, downloads the files of Hub models (ImportHub) that no
+	// member offers; DataDir, if set, keeps the list of those this node
+	// has across restarts.
+	Hub     *Hub
+	DataDir string
 }
 
 // Service serves pipeline stages and coordinates generations.
@@ -125,6 +133,7 @@ type Service struct {
 	used     int64 // bytes of caches, and of weights unless on the device
 	devUsed  int64 // bytes of weights on the device
 	adverts  map[peer.ID]advert
+	src      *sources // Hub models' files had
 	coords   map[blob.ID]*coordModel
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -204,7 +213,7 @@ func NewService(cfg ServiceConfig) (*Service, error) {
 	s := &Service{
 		cfg: cfg, node: cfg.Node, blobs: cfg.Blobs, log: cfg.Logger,
 		shards: map[Shard]*loaded{}, adverts: map[peer.ID]advert{}, coords: map[blob.ID]*coordModel{},
-		changed: make(chan struct{}, 1),
+		changed: make(chan struct{}, 1), src: newSources(cfg.DataDir),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.speed = cfg.Speed
@@ -298,6 +307,9 @@ func (s *Service) advert() advert {
 			a.Shards = append(a.Shards, sh)
 		}
 	}
+	s.mu.Unlock()
+	a.Files = s.offeredFiles()
+	s.mu.Lock()
 	return a
 }
 

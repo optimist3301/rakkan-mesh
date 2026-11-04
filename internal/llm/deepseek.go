@@ -3,6 +3,7 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"slices"
@@ -30,6 +31,16 @@ func parseManifestV2(m *Manifest) (*Manifest, error) {
 	if err != nil {
 		return nil, fmt.Errorf("model manifest: %w", err)
 	}
+	if m.Hub != nil {
+		if len(m.Layers) > 0 || len(m.Engram) > 0 || m.Head != "" || m.Tokenizer != "" {
+			return nil, errors.New("model manifest: parts both from the Hub and as blobs")
+		}
+		if err := m.Hub.check(c); err != nil {
+			return nil, fmt.Errorf("model manifest: hub: %w", err)
+		}
+		m.ds = c
+		return m, nil
+	}
 	if len(m.Layers) != c.Layers || len(m.Engram) != c.Layers {
 		return nil, fmt.Errorf("model manifest lists %d layers and %d Engram tables, config says %d", len(m.Layers), len(m.Engram), c.Layers)
 	}
@@ -54,7 +65,7 @@ func parseManifestV2(m *Manifest) (*Manifest, error) {
 // shape returns what planning needs of the model's layers.
 func (m *Manifest) shape() shape {
 	if m.ds != nil {
-		return dsShape{m.ds}
+		return dsShape{m.ds, m.Hub}
 	}
 	return llamaShape{m.Config}
 }
@@ -82,13 +93,24 @@ func (s llamaShape) cacheBytes(from, to, positions int) int64 {
 func (s llamaShape) gas(from, to, tokens int) int64 { return StageGas(s.c, to-from, tokens) }
 func (s llamaShape) payloadBytes(tokens int) int    { return 4 * tokens * s.c.Dim }
 
-type dsShape struct{ c *dsv41.Config }
+type dsShape struct {
+	c   *dsv41.Config
+	hub *HubOrigin // where the layers come from, if from the Hub
+}
 
 func (s dsShape) numLayers() int         { return s.c.Layers }
 func (s dsShape) layerBytes(i int) int64 { return dsv41.LayerBytes(s.c, i) }
-func (s dsShape) diskBytes(i int) int64  { return dsv41.EngramTableBytes(s.c, i) }
-func (s dsShape) readBytes(i int) int64  { return dsv41.ActiveBytes(s.c, i) }
-func (s dsShape) hostBytes(i int) int64  { return dsv41.ExpertBytes(s.c, i) }
+
+// diskBytes: the Engram table kept apart, or a Hub model's files, which
+// stay in the blob store as they are.
+func (s dsShape) diskBytes(i int) int64 {
+	if s.hub != nil {
+		return hubDiskBytes(s.hub, i)
+	}
+	return dsv41.EngramTableBytes(s.c, i)
+}
+func (s dsShape) readBytes(i int) int64 { return dsv41.ActiveBytes(s.c, i) }
+func (s dsShape) hostBytes(i int) int64 { return dsv41.ExpertBytes(s.c, i) }
 func (s dsShape) cacheBytes(from, to, positions int) int64 {
 	return dsv41.CacheBytes(s.c, from, to, positions)
 }
@@ -202,7 +224,13 @@ func checkDeepSeekParts(store *blob.Store, m *Manifest) error {
 	if err != nil {
 		return err
 	}
-	_, err = newDeepseekCoord(m, tok, func(max int64) ([]byte, error) { return store.ReadAll(mustID(m.Head), max) })
+	_, err = newDeepseekCoord(m, tok, func() (map[string]*dsv41.Tensor, error) {
+		data, err := store.ReadAll(mustID(m.Head), dsv41.HeadBytes(m.ds))
+		if err != nil {
+			return nil, err
+		}
+		return dsv41.ParseSafetensors(data)
+	})
 	return err
 }
 
@@ -340,6 +368,13 @@ func (s *Service) loadDeepSeek(ctx context.Context, m *Manifest, from, to int, p
 		return nil, nil, 0, err
 	}
 	defer s.unreserve(size) // accounted by the caller once loaded
+	if m.Hub != nil {
+		part, closer, err := s.loadHubPart(ctx, m, from, to)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		return part, closer, size, nil
+	}
 	for i := from; i < to; i++ {
 		if err := s.blobs.Fetch(ctx, mustID(m.Layers[i]), providers, sh.layerBytes(i)); err != nil {
 			return nil, nil, 0, err
@@ -463,6 +498,32 @@ type deepseekCoord struct {
 }
 
 func (s *Service) deepseekCoordinator(ctx context.Context, m *Manifest, providers []peer.ID) (*deepseekCoord, error) {
+	if o := m.Hub; o != nil {
+		id, err := s.hubFile(ctx, o, "tokenizer.json")
+		if err != nil {
+			return nil, err
+		}
+		tok, err := s.blobs.Store().ReadAll(id, 64<<20)
+		if err != nil {
+			return nil, err
+		}
+		return newDeepseekCoord(m, tok, func() (map[string]*dsv41.Tensor, error) {
+			all, closer, err := s.hubTensors(ctx, o, o.Head)
+			if err != nil {
+				return nil, err
+			}
+			defer closer()
+			out := map[string]*dsv41.Tensor{}
+			for name, t := range all {
+				if dsv41.IsHeadTensor(name) {
+					if out[name], err = dsTensor(name, t); err != nil {
+						return nil, err
+					}
+				}
+			}
+			return out, nil
+		})
+	}
 	part := func(idStr string, max int64) ([]byte, error) {
 		id := mustID(idStr)
 		if err := s.blobs.Fetch(ctx, id, providers, max); err != nil {
@@ -474,12 +535,18 @@ func (s *Service) deepseekCoordinator(ctx context.Context, m *Manifest, provider
 	if err != nil {
 		return nil, err
 	}
-	return newDeepseekCoord(m, data, func(max int64) ([]byte, error) { return part(m.Head, max) })
+	return newDeepseekCoord(m, data, func() (map[string]*dsv41.Tensor, error) {
+		data, err := part(m.Head, dsv41.HeadBytes(m.ds))
+		if err != nil {
+			return nil, err
+		}
+		return dsv41.ParseSafetensors(data)
+	})
 }
 
 // newDeepseekCoord builds a coordinator's part from the tokenizer and the
 // head's blob: the Engram hash tables come from the tokenizer.
-func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func(max int64) ([]byte, error)) (*deepseekCoord, error) {
+func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func() (map[string]*dsv41.Tensor, error)) (*deepseekCoord, error) {
 	c := m.ds
 	tok, err := ReadBPE(tokenizer, c.Vocab)
 	if err != nil {
@@ -491,11 +558,7 @@ func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func(max int64) ([
 			return nil, err
 		}
 	}
-	data, err := readHead(dsv41.HeadBytes(c))
-	if err != nil {
-		return nil, err
-	}
-	ts, err := dsv41.ParseSafetensors(data)
+	ts, err := readHead()
 	if err != nil {
 		return nil, err
 	}

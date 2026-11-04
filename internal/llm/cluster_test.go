@@ -82,6 +82,7 @@ type nodeOpts struct {
 	dev          *gpu.Device
 	devBytes     int64
 	speed        float64
+	hub          *Hub
 }
 
 func (c *cluster) addOpts(o nodeOpts) *llmNode {
@@ -117,7 +118,7 @@ func (c *cluster) addOpts(o nodeOpts) *llmNode {
 		}
 	}
 	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve, MemoryBytes: mem, Trust: n.trust,
-		Device: o.dev, DeviceBytes: o.devBytes, Speed: o.speed}); err != nil {
+		Device: o.dev, DeviceBytes: o.devBytes, Speed: o.speed, Hub: o.hub, DataDir: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { n.close() })
