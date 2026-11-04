@@ -31,6 +31,7 @@ commands:
   network open      admit guests that prove work on their identity
   network close     stop admitting guests
   network show      print a certificate, revocation list or policy
+  network announce  publish in the Mainline DHT the members newcomers find
   run <task.wasm>   execute a task locally in the sandbox
   version           print the version
 `

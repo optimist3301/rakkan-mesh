@@ -81,6 +81,14 @@ type Config struct {
 	PeerCache string
 	// MDNS enables discovery on the local network.
 	MDNS bool
+	// Mainline enables bootstrap through the BitTorrent Mainline DHT
+	// (mainline.go): finding announcers there, keeping the root's record
+	// alive, publishing the node's addresses if it is an announcer, every
+	// MainlineInterval (default 30m). MainlineBootstrap overrides the DHT's
+	// entry points (host:port), for tests.
+	Mainline          bool
+	MainlineInterval  time.Duration
+	MainlineBootstrap []string
 	// NAT enables UPnP port mapping, hole punching and AutoNAT.
 	NAT bool
 	// RelayService lets this node relay traffic between members that cannot
@@ -118,6 +126,9 @@ func (c *Config) setDefaults() {
 	}
 	if c.MaxGuests <= 0 {
 		c.MaxGuests = 256
+	}
+	if c.MainlineInterval <= 0 {
+		c.MainlineInterval = 30 * time.Minute
 	}
 	if c.Logger == nil {
 		c.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -319,6 +330,9 @@ func (n *Node) startServices() error {
 	n.wg.Go(n.healthLoop)
 	n.wg.Go(n.dialLoop)
 	n.wg.Go(n.discoveryLoop)
+	if n.cfg.Mainline {
+		n.wg.Go(n.mainlineLoop)
+	}
 	return nil
 }
 

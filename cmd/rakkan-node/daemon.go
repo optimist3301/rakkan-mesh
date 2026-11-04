@@ -48,6 +48,7 @@ func daemonCmd(args []string) int {
 	bootstrap := flags.String("bootstrap", "", "comma-separated multiaddrs of known members, ending in /p2p/<peer ID>")
 	peerCache := flags.String("peers", "peers.json", "file remembering members' addresses across restarts; empty disables")
 	mdnsOn := flags.Bool("mdns", true, "discover members on the local network")
+	mainline := flags.Bool("mainline", true, "find members through the BitTorrent Mainline DHT, and keep the network's records there (network announce)")
 	nat := flags.Bool("nat", true, "UPnP port mapping, hole punching and AutoNAT")
 	relay := flags.Bool("relay", false, "relay traffic for members; enable on publicly reachable nodes")
 	reach := flags.String("reachability", "auto", "auto (from interface addresses), public, or private (behind NAT)")
@@ -116,7 +117,7 @@ func daemonCmd(args []string) int {
 	if err != nil {
 		return fail(err)
 	}
-	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, NAT: *nat, RelayService: *relay, Reachability: reachability, PeerCache: *peerCache}
+	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, Mainline: *mainline, NAT: *nat, RelayService: *relay, Reachability: reachability, PeerCache: *peerCache}
 	if *policyPath != "" {
 		if cfg.Policy, err = membership.LoadPolicy(*policyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fail(err)
@@ -146,7 +147,7 @@ func daemonCmd(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *proofPath)
+		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *mainline, *proofPath)
 		if err != nil {
 			return fail(err)
 		}
