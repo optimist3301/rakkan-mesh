@@ -55,7 +55,14 @@ type Config struct {
 	// EngramCompressed the size of the compressed token map.
 	EngramVocab, EngramPad, EngramCompressed int
 	MTPLayers                                int
-	BOS, EOS                                 int
+	// DSpark, the draft model (draft.go): BlockSize tokens drafted at once,
+	// the first the last accepted, the rest Noise; it reads the stream's
+	// mean at the input of the Targets layers. Its blocks' MoE has
+	// DraftExperts experts, DraftActive of them per token.
+	DraftBlock, DraftNoise, DraftRank int
+	DraftTargets                      []int
+	DraftExperts, DraftActive         int
+	BOS, EOS                          int
 	// MaxPositions is the longest context the model was trained for.
 	MaxPositions int
 }
@@ -124,6 +131,12 @@ type hfConfig struct {
 		EngramPad          int     `json:"engram_pad_token_id"`
 		EngramCompressed   int     `json:"engram_compressed_vocab_size"`
 		MTPLayers          int     `json:"num_nextn_predict_layers"`
+		DSparkBlock        int     `json:"dspark_block_size"`
+		DSparkNoise        int     `json:"dspark_noise_token_id"`
+		DSparkTargets      []int   `json:"dspark_target_layer_ids"`
+		DSparkRank         int     `json:"dspark_markov_rank"`
+		DSparkExperts      int     `json:"dspark_n_routed_experts"`
+		DSparkActive       int     `json:"dspark_num_experts_per_tok"`
 	} `json:"text_config"`
 }
 
@@ -180,6 +193,11 @@ func ParseConfig(b []byte) (*Config, error) {
 		EngramHeads: t.EngramHeads, EngramDim: t.EngramDim, MTPLayers: t.MTPLayers,
 		EngramVocab: t.EngramVocab, EngramPad: t.EngramPad, EngramCompressed: t.EngramCompressed,
 		BOS: h.BOS, EOS: h.EOS,
+		DraftBlock: t.DSparkBlock, DraftNoise: t.DSparkNoise, DraftRank: t.DSparkRank, DraftTargets: t.DSparkTargets,
+		DraftExperts: t.DSparkExperts, DraftActive: t.DSparkActive,
+	}
+	if c.DraftExperts == 0 {
+		c.DraftExperts, c.DraftActive = c.RoutedExperts, c.ActiveExperts
 	}
 	if t.CandidateSource != nil {
 		c.CandidateSource = *t.CandidateSource

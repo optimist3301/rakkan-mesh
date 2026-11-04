@@ -346,3 +346,108 @@ func TestDeepSeekHostExperts(t *testing.T) {
 		}
 	}
 }
+
+// With the draft, the text is the one without it, at any temperature,
+// whatever the draft gets right: all of a block, part of it (the stages
+// rewinding as deep as the rest), or none. Fewer passes when it is right.
+func TestDeepSeekDraftSameText(t *testing.T) {
+	c := newCluster(t)
+	coord := c.add(false)
+	nodes := []*llmNode{c.add(true), c.add(true)}
+	model, _ := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 2)
+	for _, temp := range []float32{0, 0.9} {
+		req := GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 24, Stages: 2, Temperature: temp, Seed: 7}
+		want, plain := generate(t, coord, req, nil)
+		req.Draft = true
+		got, stats := generate(t, coord, req, nil)
+		if !equalTokens(got, want) {
+			t.Fatalf("temperature %v: with the draft %v, without %v", temp, got, want)
+		}
+		t.Logf("temperature %v, the draft as it is: %d passes (%d without), %d of %d drafted taken", temp, stats.Passes, plain.Passes, stats.Accepted, stats.Drafted)
+		// Drafts right up to a point that moves: 0..k tokens taken a pass.
+		step := 0
+		coord.llm.redraft = func(tokens, proposal []int) []int {
+			n := len(tokens) - stats.PromptTokens // tokens generated so far
+			right := step % (len(proposal) + 1)
+			step++
+			out := make([]int, len(proposal))
+			for i := range out {
+				if i < right && n+i < len(want) {
+					out[i] = want[n+i]
+				} else {
+					out[i] = (proposal[i] + 1) % 512
+				}
+			}
+			return out
+		}
+		got, stats = generate(t, coord, req, nil)
+		coord.llm.redraft = nil
+		if !equalTokens(got, want) {
+			t.Fatalf("temperature %v, drafts right in part: %v, without the draft %v", temp, got, want)
+		}
+		if stats.Accepted == 0 || stats.Passes >= plain.Passes {
+			t.Fatalf("temperature %v: %d drafted taken in %d passes (%d without)", temp, stats.Accepted, stats.Passes, plain.Passes)
+		}
+		t.Logf("temperature %v, drafts right in part: %d passes (%d without), %d of %d drafted taken", temp, stats.Passes, plain.Passes, stats.Accepted, stats.Drafted)
+	}
+	_ = nodes
+}
+
+// Drafting over a GPU node and a CPU node, a stage failing mid-generation
+// (its replacement replays only the positions kept), and a guest
+// witnessed (the witness rewinding with it): the same text still.
+func TestDeepSeekDraftFailoverAndWitness(t *testing.T) {
+	dev := testDevice(t)
+	c := newCluster(t)
+	var err error
+	if c.open, err = membership.IssuePolicy(c.root, membership.Policy{Network: c.net.ID, Seq: 1, Open: true, PowBits: 8}); err != nil {
+		t.Fatal(err)
+	}
+	coord := c.add(false)
+	gpuNode := c.addOpts(nodeOpts{serve: true, dev: dev, devBytes: 1 << 30, mem: 1 << 30, speed: 50})
+	cpu := c.addOpts(nodeOpts{serve: true, mem: 1 << 30, speed: 5})
+	spare := c.addOpts(nodeOpts{serve: true, mem: 1 << 30, speed: 1})
+	model, _ := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 3)
+	req := GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 24, Stages: 2, Temperature: 0.7, Seed: 3}
+	want, _ := generate(t, coord, req, nil)
+	step := 0
+	coord.llm.redraft = func(tokens, proposal []int) []int {
+		n := len(tokens) - 21
+		right := step % (len(proposal) + 1)
+		step++
+		out := slices.Clone(proposal)
+		for i := range right {
+			if n+i < len(want) {
+				out[i] = want[n+i]
+			}
+		}
+		return out
+	}
+	var forwards atomic.Int64
+	gpuNode.llm.failNext = func(Shard) bool { return forwards.Add(1) == 5 }
+	req.Draft = true
+	got, stats := generate(t, coord, req, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("with the draft and a failover: %v, without %v", got, want)
+	}
+	if stats.Failovers == 0 || stats.Accepted == 0 {
+		t.Fatalf("%d failovers, %d drafted taken", stats.Failovers, stats.Accepted)
+	}
+	t.Logf("%d passes, %d taken of %d, %d failovers, stages %+v", stats.Passes, stats.Accepted, stats.Drafted, stats.Failovers, stats.Stages)
+	_, _ = cpu, spare
+
+	// A guest's stage, witnessed, through drafts taken and rejected.
+	// The fastest, so the stage goes to it.
+	guest := c.addOpts(nodeOpts{serve: true, guest: true, mem: 4 << 30, speed: 100})
+	waitServers(t, coord, 4)
+	step = 0
+	got, stats = generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 24, Stages: 1, Temperature: 0.7, Seed: 3, Draft: true}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("witnessed: %v, without the draft %v", got, want)
+	}
+	if st := stats.Stages[0]; st.Node != guest.node.ID() || st.Witness == "" || stats.Caught != 0 {
+		t.Fatalf("stage %+v, caught %d", st, stats.Caught)
+	}
+}

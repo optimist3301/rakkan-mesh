@@ -261,6 +261,12 @@ func TestHubModelOverNodes(t *testing.T) {
 		}
 	}
 
+	// The draft model from its files too (from the coordinator's Hub client): the same text.
+	drafted, _ := generate(t, coord, GenerateRequest{Model: model, Prompt: dsPrompt, MaxTokens: 12, Stages: 2, Draft: true}, nil)
+	if !equalTokens(drafted, want) {
+		t.Fatalf("with the draft %v, without %v", drafted, want)
+	}
+
 	// A node joining later gets the files from the members, not the Hub.
 	before := map[string]int64{}
 	for name := range files {
@@ -397,7 +403,7 @@ func TestHubHeadOnline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	in, err := cm.inputs(tokens, 0, len(tokens))
+	in, err := cm.inputs(tokens, 0, len(tokens), false)
 	if err != nil {
 		t.Fatal(err)
 	}

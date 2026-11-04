@@ -26,7 +26,9 @@ type State struct {
 	compBuf  []compressorState
 	tokens   []int // the last tokens, oldest first, for Engram's n-grams
 	act      num.ActFP8
-	prefillN int // prompt length while prefilling, else 0
+	prefillN int       // prompt length while prefilling, else 0
+	undo     []undoRec // the last positions' changes, newest last
+	cur      *undoRec  // the position being run
 
 	// Hooks, for tests: called after each block with the stream ([hc][dim])
 	// and the next block's input mix, which they may overwrite; and with
@@ -90,17 +92,18 @@ type shared struct {
 // step runs a whole model on one token, in one process.
 func (s *State) step(token, prefill int, wantLogits bool) []float32 {
 	h := s.m.head
-	s.tokens = append(s.tokens, token)
-	if len(s.tokens) > max(s.m.Cfg.EngramMaxNgram, 1) {
-		s.tokens = s.tokens[1:]
+	hist := append(slices.Clone(s.tokens), token)
+	if len(hist) > max(s.m.Cfg.EngramMaxNgram, 1) {
+		hist = hist[1:]
 	}
-	p, err := h.Embed(s.tokens, prefill)
+	p, err := h.Embed(hist, prefill)
 	if err == nil {
 		err = s.run(p, s.pos)
 	}
 	if err != nil {
 		panic(err) // a whole model in memory: only a bad token gets here
 	}
+	s.tokens = hist
 	if !wantLogits {
 		return nil
 	}
@@ -109,11 +112,23 @@ func (s *State) step(token, prefill int, wantLogits bool) []float32 {
 
 // run runs the blocks the model has on the payload of position pos, which
 // must be the state's next: the payload leaves as the next stage's input.
-func (s *State) run(p *Payload, pos int) error {
+func (s *State) run(p *Payload, pos int) (err error) {
 	m, c := s.m, s.m.Cfg
 	if pos != s.pos {
 		return fmt.Errorf("dsv41: position %d, the stage expects %d", pos, s.pos)
 	}
+	rec := s.begin()
+	defer func() {
+		if err != nil {
+			s.restore(rec) // a refused payload leaves no trace
+			return
+		}
+		s.undo = append(s.undo, *rec)
+		if len(s.undo) > Rewindable {
+			s.undo = s.undo[1:]
+		}
+		s.cur = nil
+	}()
 	if want := sourceBefore(c, m.from); p.Source != want {
 		return fmt.Errorf("dsv41: payload from the KV source %d, layer %d follows %d", p.Source, m.from, want)
 	}
@@ -147,6 +162,10 @@ func (s *State) run(p *Payload, pos int) error {
 				return err
 			}
 		}
+		if p.WantMain && slices.Contains(c.DraftTargets, i) {
+			// The draft reads the attention input of its target layers.
+			p.Main = append(p.Main, hcMean(p.H, c.Dim)...)
+		}
 		p.PreMix = s.block(b, p.H, p.PreMix, pos, &sh)
 		if s.AfterBlock != nil {
 			s.AfterBlock(i, pos, p.H, p.PreMix)
@@ -154,6 +173,96 @@ func (s *State) run(p *Payload, pos int) error {
 	}
 	p.Source, p.CompKV, p.IndexK, p.TopK, p.Candidates = sh.source, sh.newKV, sh.newIdxK, sh.topk, sh.candidates
 	return nil
+}
+
+// Rewindable is how many positions back a stage can be rewound: enough
+// for a draft's verification.
+const Rewindable = 16
+
+// undoRec is what running a position changed: the cache rows it
+// replaced, the compressed caches' lengths before it, the tokens.
+type undoRec struct {
+	rows            []rowUndo
+	compLen, idxLen []int
+	tokens          []int
+	pos             int
+}
+
+type rowUndo struct {
+	at  *[]float32
+	old []float32
+}
+
+func (s *State) begin() *undoRec {
+	rec := &undoRec{pos: s.pos, tokens: slices.Clone(s.tokens)}
+	for i := range s.compKV {
+		rec.compLen = append(rec.compLen, len(s.compKV[i]))
+		rec.idxLen = append(rec.idxLen, len(s.indexK[i]))
+	}
+	s.cur = rec
+	return rec
+}
+
+// Decode with a position, for a whole model in one process: the token at
+// pos, rewinding first if pos was run (State.Rewind).
+func (s *State) DecodeAt(token, pos int) ([]float32, error) {
+	if pos < s.pos {
+		if err := s.Rewind(pos); err != nil {
+			return nil, err
+		}
+	}
+	if pos != s.pos {
+		return nil, fmt.Errorf("dsv41: position %d, the state is at %d", pos, s.pos)
+	}
+	return s.step(token, 0, true), nil
+}
+
+// save notes a cache row about to be replaced.
+func (s *State) save(at *[]float32) {
+	if s.cur != nil {
+		s.cur.rows = append(s.cur.rows, rowUndo{at, *at})
+	}
+}
+
+func (s *State) restore(rec *undoRec) {
+	for i := len(rec.rows) - 1; i >= 0; i-- {
+		*rec.rows[i].at = rec.rows[i].old
+	}
+	for i := range s.compKV {
+		s.compKV[i] = s.compKV[i][:rec.compLen[i]]
+		s.indexK[i] = s.indexK[i][:rec.idxLen[i]]
+	}
+	s.tokens, s.pos = rec.tokens, rec.pos
+}
+
+// Rewind takes the state back to before position pos, at most Rewindable
+// positions back: what a rejected draft's positions cached goes.
+func (s *State) Rewind(pos int) error {
+	n := s.pos - pos
+	if n < 0 || n > len(s.undo) {
+		return fmt.Errorf("dsv41: rewinding from position %d to %d", s.pos, pos)
+	}
+	for range n {
+		rec := s.undo[len(s.undo)-1]
+		s.undo = s.undo[:len(s.undo)-1]
+		s.restore(&rec)
+	}
+	return nil
+}
+
+// hcMean is the mean of the stream's copies, in bf16: summed in order in
+// float32, then a quarter (h.mean(dim=2) of the reference).
+func hcMean(h []float32, dim int) []float32 {
+	hc := len(h) / dim
+	out := make([]float32, dim)
+	for d := range dim {
+		var s float32
+		for k := range hc {
+			s += h[k*dim+d]
+		}
+		out[d] = bf16(float32(s / float32(hc)))
+	}
+	return out
 }
 
 // sourceBefore is the latest KV source before layer l, -1 for none: whose
@@ -325,6 +434,7 @@ func (s *State) attention(b *block, x []float32, pos int, sh *shared) []float32 
 		s.trace("kv", kv)
 	}
 	ring := s.window[b.id]
+	s.save(&ring[pos%c.Window])
 	ring[pos%c.Window] = kv
 
 	rows := s.windowRows(ring, pos)
@@ -427,6 +537,8 @@ func (s *State) compress(b *block, x []float32, pos int) []float32 {
 	a.compWKV.apply(kv, x, nil)
 	a.compGate.apply(sc, x, nil)
 	slot := pos % a.ratio
+	s.save(&st.kv[slot])
+	s.save(&st.score[slot])
 	st.kv[slot], st.score[slot] = kv, sc
 	if (pos+1)%a.ratio != 0 {
 		return nil

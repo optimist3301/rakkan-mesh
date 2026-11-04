@@ -39,6 +39,11 @@ type Payload struct {
 	// Candidates the candidate pool, nil before the candidate source.
 	TopK       []int
 	Candidates []bool
+	// WantMain asks the stages for Main: the stream's mean (bf16) at the
+	// input of each DSpark target layer passed, dim values each, in layer
+	// order, for the draft model.
+	WantMain bool
+	Main     []float32
 }
 
 // Embed starts a position's Payload: history holds the tokens so far, the
@@ -96,9 +101,16 @@ func (m *Model) NewStage() *Stage { return &Stage{st: m.NewState()} }
 // Forward runs the blocks on the Payload of position pos in place.
 // Positions come in order from 0; a failed stage is replaced by a new one
 // replaying them.
+// A position already run is rewound to first (State.Rewind): a draft's
+// verification goes on from the last accepted position.
 func (s *Stage) Forward(p *Payload, pos int) error {
 	if s.st.m.hostless {
 		return errors.New("dsv41: the part's weights are on a GPU only")
+	}
+	if pos < s.st.pos {
+		if err := s.st.Rewind(pos); err != nil {
+			return err
+		}
 	}
 	return s.st.run(p, pos)
 }
@@ -118,6 +130,7 @@ const (
 	hasCompKV = 1 << iota
 	hasIndexK
 	hasCandidates
+	hasMain
 )
 
 // MaxPayloadBytes bounds a position's encoded Payload.
@@ -127,6 +140,7 @@ func MaxPayloadBytes(c *Config) int {
 	n += 4*c.HeadDim + 4*c.IndexDim
 	n += 4 + 4*c.IndexTopK
 	n += 8 + 4*c.CandidateBlocks
+	n += 4 + 2*c.Dim*len(c.DraftTargets)
 	return n
 }
 
@@ -142,6 +156,12 @@ func AppendPayload(b []byte, c *Config, p *Payload) ([]byte, error) {
 	}
 	if p.Candidates != nil {
 		flags |= hasCandidates
+	}
+	if p.WantMain {
+		flags |= hasMain
+	}
+	if len(p.Main)%c.Dim != 0 || len(p.Main) > c.Dim*len(c.DraftTargets) || !p.WantMain && len(p.Main) > 0 {
+		return nil, errors.New("dsv41: payload does not fit the model")
 	}
 	if len(p.H) != c.HCMult*c.Dim || len(p.PreMix) != c.HCMult || len(p.Hashes) != len(c.EngramLayers) ||
 		p.CompKV != nil && len(p.CompKV) != c.HeadDim || p.IndexK != nil && len(p.IndexK) != c.IndexDim || len(p.TopK) > c.IndexTopK {
@@ -197,6 +217,16 @@ func AppendPayload(b []byte, c *Config, p *Payload) ([]byte, error) {
 			b = le.AppendUint32(b, v)
 		}
 	}
+	if p.WantMain {
+		b = le.AppendUint32(b, uint32(len(p.Main)/c.Dim))
+		for _, v := range p.Main {
+			bits := math.Float32bits(v)
+			if bits&0xffff != 0 {
+				return nil, errors.New("dsv41: main stream value not bf16")
+			}
+			b = le.AppendUint16(b, uint16(bits>>16))
+		}
+	}
 	return b, nil
 }
 
@@ -244,7 +274,7 @@ func DecodePayload(b []byte, c *Config, positions int) (*Payload, []byte, error)
 	prefill := u32()
 	p.Source = int(int32(u32()))
 	flags := u32()
-	if bad || prefill > uint32(positions) || flags&^(hasCompKV|hasIndexK|hasCandidates) != 0 {
+	if bad || prefill > uint32(positions) || flags&^(hasCompKV|hasIndexK|hasCandidates|hasMain) != 0 {
 		return nil, nil, errPayload
 	}
 	p.Prefill = int(prefill)
@@ -305,6 +335,18 @@ func DecodePayload(b []byte, c *Config, positions int) (*Payload, []byte, error)
 			prev = i
 			for t := i * size; t < min((i+1)*size, int(n)); t++ {
 				p.Candidates[t] = true
+			}
+		}
+	}
+	if flags&hasMain != 0 {
+		p.WantMain = true
+		n := u32()
+		if n > uint32(len(c.DraftTargets)) {
+			bad = true
+		} else if x := take(2 * int(n) * c.Dim); x != nil {
+			p.Main = make([]float32, int(n)*c.Dim)
+			for i := range p.Main {
+				p.Main[i] = math.Float32frombits(uint32(le.Uint16(x[2*i:])) << 16)
 			}
 		}
 	}

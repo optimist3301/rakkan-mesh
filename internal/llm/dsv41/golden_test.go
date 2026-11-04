@@ -196,16 +196,6 @@ func compareLogits(t *testing.T, g golden, logits [][]float32) (argmaxSame int, 
 	return argmaxSame, worst
 }
 
-func argmax(v []float32) int {
-	best := 0
-	for i, x := range v {
-		if x > v[best] {
-			best = i
-		}
-	}
-	return best
-}
-
 // Teacher-forced, every block starts from the reference's stream, so
 // differences cannot compound: what is left is rounding where the
 // reference's order of operations is unspecified (norms, softmax, float32

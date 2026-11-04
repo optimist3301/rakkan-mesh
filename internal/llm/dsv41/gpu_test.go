@@ -312,6 +312,8 @@ func TestGPUBatchesMatchCPU(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The draft's means, asked for at some positions.
+		p.WantMain = pos%3 != 1
 		return p
 	}
 	for _, cuts := range [][]int{{0, 8}, {0, 3, 6, 8}} {
@@ -378,6 +380,92 @@ func TestGPUBatchesMatchCPU(t *testing.T) {
 						}
 					})
 				}
+			}
+		}
+	}
+}
+
+// The GPU stages rewind as the CPU's: batches of wrong tokens run and
+// rewound leave no trace.
+func TestGPUStagesRewind(t *testing.T) {
+	cfg, tensors, tables := fixtureParts(t)
+	head, err := NewHead(cfg, layerTensors(tensors, -1, -1), tables)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, g := loadFixture(t)
+	tokens := g.ints(t, "tokens")
+	embed := func(toks []int, pos int) *Payload {
+		prefill := 0
+		if pos < promptLen {
+			prefill = promptLen
+		}
+		p, err := head.Embed(toks[:pos+1], prefill)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.WantMain = true
+		return p
+	}
+	cuts := []int{0, 3, 6, 8}
+	var cpu []*Stage
+	for i := range len(cuts) - 1 {
+		part, _ := NewPart(cfg, layerTensors(tensors, cuts[i], cuts[i+1]), cuts[i], cuts[i+1], nil)
+		cpu = append(cpu, part.NewStage())
+	}
+	var ref [][]byte
+	for pos := range tokens {
+		p := embed(tokens, pos)
+		for _, st := range cpu {
+			if err := st.Forward(p, pos); err != nil {
+				t.Fatal(err)
+			}
+		}
+		b, _ := AppendPayload(nil, cfg, p)
+		ref = append(ref, b)
+	}
+	for _, d := range gpuDevices(t) {
+		for _, host := range []bool{false, true} {
+			var gpus []*GPUStage
+			for i := range len(cuts) - 1 {
+				part, _ := NewPart(cfg, layerTensors(tensors, cuts[i], cuts[i+1]), cuts[i], cuts[i+1], nil)
+				gp, err := part.ToGPU(d, GPUOptions{HostExperts: host})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer gp.Free()
+				st, err := gp.NewStage(len(tokens))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer st.Close()
+				gpus = append(gpus, st)
+			}
+			batch := func(toks []int, pos, n int) []*Payload {
+				var ps []*Payload
+				for q := pos; q < min(pos+n, len(toks)); q++ {
+					ps = append(ps, embed(toks, q))
+				}
+				for _, st := range gpus {
+					if err := st.ForwardBatch(ps, pos); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return ps
+			}
+			pos := 0
+			for depth := 1; pos < len(tokens); depth = depth%6 + 1 {
+				wrong := append([]int(nil), tokens...)
+				for q := pos; q < min(pos+depth, len(tokens)); q++ {
+					wrong[q] = (tokens[q] + 7) % cfg.Vocab
+				}
+				batch(wrong, pos, depth)
+				for j, p := range batch(tokens, pos, depth) {
+					if b, _ := AppendPayload(nil, cfg, p); string(b) != string(ref[pos+j]) {
+						t.Fatalf("%s, host experts %v: position %d after rewinding %d positions differs", d.Info().Name, host, pos+j, depth)
+					}
+				}
+				pos += depth
 			}
 		}
 	}

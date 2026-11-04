@@ -141,14 +141,15 @@ func TestPlanUnequalLayers(t *testing.T) {
 
 type testShape struct{ bytes, disk []int64 }
 
-func (s testShape) numLayers() int                   { return len(s.bytes) }
-func (s testShape) layerBytes(i int) int64           { return s.bytes[i] }
-func (s testShape) diskBytes(i int) int64            { return s.disk[i] }
-func (s testShape) readBytes(i int) int64            { return s.bytes[i] }
-func (s testShape) hostBytes(int) int64              { return 0 }
-func (s testShape) cacheBytes(from, to, _ int) int64 { return int64(to - from) }
-func (s testShape) gas(from, to, tokens int) int64   { return 0 }
-func (s testShape) payloadBytes(tokens int) int      { return tokens }
+func (s testShape) numLayers() int                       { return len(s.bytes) }
+func (s testShape) layerBytes(i int) int64               { return s.bytes[i] }
+func (s testShape) diskBytes(i int) int64                { return s.disk[i] }
+func (s testShape) readBytes(i int) int64                { return s.bytes[i] }
+func (s testShape) hostBytes(int) int64                  { return 0 }
+func (s testShape) cacheBytes(from, to, _ int) int64     { return int64(to - from) }
+func (s testShape) gas(from, to, tokens int) int64       { return 0 }
+func (s testShape) payloadBytes(tokens int) int          { return tokens }
+func (s testShape) sizes(b []byte, n int) ([]int, error) { return nil, nil }
 
 // hybridShape's layers keep part of themselves in RAM on a GPU node.
 type hybridShape struct {

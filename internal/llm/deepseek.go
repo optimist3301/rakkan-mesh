@@ -45,6 +45,9 @@ func parseManifestV2(m *Manifest) (*Manifest, error) {
 		return nil, fmt.Errorf("model manifest lists %d layers and %d Engram tables, config says %d", len(m.Layers), len(m.Engram), c.Layers)
 	}
 	ids := append([]string{m.Head, m.Tokenizer}, m.Layers...)
+	if m.Draft != "" {
+		ids = append(ids, m.Draft)
+	}
 	for i, e := range m.Engram {
 		if (e != "") != slices.Contains(c.EngramLayers, i) {
 			return nil, fmt.Errorf("model manifest: Engram table of layer %d", i)
@@ -92,6 +95,16 @@ func (s llamaShape) cacheBytes(from, to, positions int) int64 {
 }
 func (s llamaShape) gas(from, to, tokens int) int64 { return StageGas(s.c, to-from, tokens) }
 func (s llamaShape) payloadBytes(tokens int) int    { return 4 * tokens * s.c.Dim }
+func (s llamaShape) sizes(b []byte, n int) ([]int, error) {
+	if len(b) != 4*n*s.c.Dim {
+		return nil, errors.New("activations of the wrong size")
+	}
+	out := make([]int, n)
+	for i := range out {
+		out[i] = 4 * s.c.Dim
+	}
+	return out, nil
+}
 
 type dsShape struct {
 	c   *dsv41.Config
@@ -125,6 +138,21 @@ func (s dsShape) gas(from, to, tokens int) int64 {
 	return 8 * n * int64(tokens)
 }
 func (s dsShape) payloadBytes(tokens int) int { return tokens * dsv41.MaxPayloadBytes(s.c) }
+func (s dsShape) sizes(b []byte, n int) ([]int, error) {
+	out := make([]int, n)
+	for i := range out {
+		_, rest, err := dsv41.DecodePayload(b, s.c, 1<<30)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = len(b) - len(rest)
+		b = rest
+	}
+	if len(b) != 0 {
+		return nil, errors.New("payloads of the wrong size")
+	}
+	return out, nil
+}
 
 // IsDeepSeek reports whether a config.json is DeepSeek-V4.1's, which
 // ImportDeepSeek imports rather than ImportHF.
@@ -156,14 +184,16 @@ func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Man
 		}
 	}
 	groups := map[int][]string{}
-	var head []string
+	var head, draft []string
 	for name := range tensors {
 		if l, ok := dsv41.TensorLayer(name); ok && l < c.Layers {
 			groups[l] = append(groups[l], name)
 		} else if dsv41.IsHeadTensor(name) {
 			head = append(head, name)
+		} else if dsv41.IsDraftTensor(name) {
+			draft = append(draft, name)
 		}
-		// The rest is DSpark and vision, not run yet.
+		// The rest is vision, not run yet.
 	}
 	m := &Manifest{Version: 2, Name: name, Arch: "dsv41", ModelConfig: src.Config, TokenizerFormat: "hf"}
 	put := func(r io.Reader) (string, error) {
@@ -196,6 +226,11 @@ func ImportDeepSeek(store *blob.Store, src HFSource, name string) (blob.ID, *Man
 	}
 	if m.Tokenizer, err = put(bytesReader(src.Tokenizer)); err != nil {
 		return blob.ID{}, nil, err
+	}
+	if len(draft) > 0 {
+		if m.Draft, err = put(safetensorsReader(tensors, draft)); err != nil {
+			return blob.ID{}, nil, err
+		}
 	}
 	data, _ := json.Marshal(m)
 	parsed, err := ParseManifest(data)
@@ -495,6 +530,61 @@ func (s *Service) deepseekToDevice(m *Manifest, part *dsv41.Model, from, to int)
 type deepseekCoord struct {
 	head *dsv41.Head
 	tok  *BPE
+
+	draftOnce sync.Once
+	draft     *dsv41.Draft // loaded when first asked for
+	draftErr  error
+}
+
+// deepseekDraft loads the model's DSpark draft, once.
+func (s *Service) deepseekDraft(ctx context.Context, m *Manifest, cm *deepseekCoord, providers []peer.ID) (*dsv41.Draft, error) {
+	cm.draftOnce.Do(func() {
+		cm.draft, cm.draftErr = s.loadDraft(ctx, m, providers)
+	})
+	return cm.draft, cm.draftErr
+}
+
+func (s *Service) loadDraft(ctx context.Context, m *Manifest, providers []peer.ID) (*dsv41.Draft, error) {
+	tensors := map[string]*dsv41.Tensor{}
+	switch {
+	case m.Hub != nil && len(m.Hub.Draft) > 0:
+		all, closer, err := s.hubTensors(ctx, m.Hub, m.Hub.Draft)
+		if err != nil {
+			return nil, err
+		}
+		defer closer()
+		for name, t := range all {
+			if dsv41.IsDraftTensor(name) {
+				if tensors[name], err = dsTensor(name, t); err != nil {
+					return nil, err
+				}
+			}
+		}
+	case m.Draft != "":
+		id := mustID(m.Draft)
+		r, err := func() (*blob.Reader, error) {
+			if err := s.blobs.Fetch(ctx, id, providers, 64<<30); err != nil {
+				return nil, err
+			}
+			return s.blobs.Store().Open(id)
+		}()
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		all := map[string]*stTensor{}
+		if err := readSafetensors(&lockedReaderAt{r: r}, all); err != nil {
+			return nil, err
+		}
+		for name, t := range all {
+			if tensors[name], err = dsTensor(name, t); err != nil {
+				return nil, err
+			}
+		}
+	default:
+		return nil, errors.New("the model has no draft")
+	}
+	return dsv41.NewDraft(m.ds, tensors)
 }
 
 func (s *Service) deepseekCoordinator(ctx context.Context, m *Manifest, providers []peer.ID) (*deepseekCoord, error) {
@@ -588,7 +678,7 @@ func (d *deepseekCoord) prompt(text string, chat bool) ([]int, error) {
 
 // inputs are the Payloads of positions from.. of tokens; prompt is the
 // prompt's length.
-func (d *deepseekCoord) inputs(tokens []int, from, prompt int) ([]byte, error) {
+func (d *deepseekCoord) inputs(tokens []int, from, prompt int, wantMain bool) ([]byte, error) {
 	var b []byte
 	for pos := from; pos < len(tokens); pos++ {
 		prefill := 0
@@ -599,6 +689,7 @@ func (d *deepseekCoord) inputs(tokens []int, from, prompt int) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		p.WantMain = wantMain
 		if b, err = dsv41.AppendPayload(b, d.head.Cfg, p); err != nil {
 			return nil, err
 		}
@@ -606,11 +697,12 @@ func (d *deepseekCoord) inputs(tokens []int, from, prompt int) ([]byte, error) {
 	return b, nil
 }
 
-// logits are the scores after the last of count positions' Payloads.
-func (d *deepseekCoord) logits(out []byte, count, positions int) ([]float32, error) {
+// outputs are the last stage's Payloads for count positions: the next
+// token's scores after each, and its Main for the draft.
+func (d *deepseekCoord) outputs(out []byte, count, positions int) (logits, main func(j int) []float32, err error) {
 	ps, err := dsv41.DecodePayloads(out, d.head.Cfg, count, positions)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return d.head.Logits(ps[count-1]), nil
+	return func(j int) []float32 { return d.head.Logits(ps[j]) }, func(j int) []float32 { return ps[j].Main }, nil
 }

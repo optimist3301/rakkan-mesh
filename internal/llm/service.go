@@ -141,6 +141,8 @@ type Service struct {
 	changed  chan struct{}
 	failNext func(Shard) bool    // for tests: fail a stage's next forward
 	tamper   func(Shard, []byte) // for tests: alter a stage's outputs
+	// redraft, for tests, replaces a draft's tokens (given the tokens so far).
+	redraft func(tokens, proposal []int) []int
 }
 
 type loaded struct {

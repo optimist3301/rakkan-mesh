@@ -220,6 +220,12 @@ func (m *Model) Head() *Head { return m.head }
 func (m *Model) loadBlock(w *weights, i int) (*block, error) {
 	c := m.Cfg
 	p := fmt.Sprintf("layers.%d.", i)
+	experts, active := c.RoutedExperts, c.ActiveExperts
+	if i >= c.Layers {
+		// A DSpark block (draft.go): window attention only, its own MoE.
+		p = fmt.Sprintf("mtp.%d.", i-c.Layers)
+		experts, active = c.DraftExperts, c.DraftActive
+	}
 	b := &block{id: i}
 	var err error
 	vec := func(dst *[]float32, name string, n int) {
@@ -288,10 +294,10 @@ func (m *Model) loadBlock(w *weights, i int) (*block, error) {
 	}
 	b.attn = a
 
-	f := &moe{limit: c.SwiGLULimit, scoreFn: c.ScoreFunc, normTopK: c.NormTopK, scale: c.RouteScale, active: c.ActiveExperts}
-	lin(&f.gate, "ffn.gate", c.RoutedExperts, c.Dim, kindBF16F32)
-	vec(&f.bias, "ffn.gate.bias", c.RoutedExperts)
-	for e := range c.RoutedExperts {
+	f := &moe{limit: c.SwiGLULimit, scoreFn: c.ScoreFunc, normTopK: c.NormTopK, scale: c.RouteScale, active: active}
+	lin(&f.gate, "ffn.gate", experts, c.Dim, kindBF16F32)
+	vec(&f.bias, "ffn.gate.bias", experts)
+	for e := range experts {
 		var x expert
 		q := fmt.Sprintf("ffn.experts.%d.", e)
 		lin(&x.w1, q+"w1", c.MoEInter, c.Dim, kindFP4)

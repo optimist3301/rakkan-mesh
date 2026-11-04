@@ -61,6 +61,8 @@ type shape interface {
 	gas(from, to, tokens int) int64
 	// payloadBytes bounds what passes between stages for tokens.
 	payloadBytes(tokens int) int
+	// sizes splits what passes between stages for n positions into theirs.
+	sizes(b []byte, n int) ([]int, error)
 }
 
 // nodeFit tells which layer ranges of a model a node can hold for a

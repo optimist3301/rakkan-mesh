@@ -217,3 +217,8 @@ func (b *Batch) MoESum(dim, outs, k, stride, shared, y int) {
 func (b *Batch) EngramGate(dim, h, kv, qk int, eps, scale float32) {
 	b.dispatch(kindEngramGate, 0, 4, 1, uint32(dim), uint32(h), uint32(kv), uint32(qk), f32bits(eps), f32bits(scale))
 }
+
+// HCMean writes the mean of the stream h's 4 copies of dim, in bf16, at out.
+func (b *Batch) HCMean(dim, h, out int) {
+	b.dispatch(kindHCMean, 0, groups(dim, flatGroup), 1, uint32(dim), uint32(h), uint32(out))
+}

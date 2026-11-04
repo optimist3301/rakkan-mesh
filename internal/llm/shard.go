@@ -51,6 +51,8 @@ type Manifest struct {
 	// Hub, instead of Layers, Head, Tokenizer and Engram, names the files of
 	// a Hugging Face repository the parts come from (hub.go).
 	Hub *HubOrigin `json:"hub,omitempty"`
+	// Draft is the DSpark draft model's blob (safetensors, mtp.*), if any.
+	Draft string `json:"draft,omitempty"`
 
 	ds *dsv41.Config
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 
 	"github.com/optimist3301/rakkan-mesh/internal/gpu"
 	"github.com/optimist3301/rakkan-mesh/internal/num"
@@ -214,13 +215,20 @@ type GPUStage struct {
 	// The batch's positions' shared attention state, as State's.
 	pp         []gpuPos
 	maxEntries int
-	act        num.ActFP8 // host experts' scratch
+	// For rewinding (State.Rewind): the caches' lengths before each of the
+	// last Rewindable positions, newest last; the rows they replaced are
+	// in the arena's undo slots, by position mod Rewindable.
+	hist  [][]int
+	start []int      // compN at the batch's start
+	act   num.ActFP8 // host experts' scratch
 }
 
 // gpuPos is a batch position's shared attention state.
 type gpuPos struct {
 	topkN, candLen   int
 	topkSet, candSet bool
+	mainN            int   // Main's entries, received and made
+	appended         []int // layers whose caches it grew
 	newKV, newIdx    bool
 	entry            int // the index of the entry it cached, if new
 }
@@ -244,8 +252,10 @@ type gpuLayout struct {
 	eg, eu, eouts, sg, su, sout     int
 	eqx, exs                        int
 	emb, ekv, embLen                int
+	main                            int // the batch's Payload.Main, all targets' room
 	qx, xs, maxCols                 int
 	window, comp, idx               []int // by layer
+	undo                            []int // by layer: Rewindable sets of a ring row, a compressor's two
 	kvSlots, scSlots                []int // the compressors' open groups between batches
 	words                           int
 }
@@ -368,7 +378,12 @@ func (p *GPUPart) layout(positions int) (gpuLayout, int) {
 		l.emb, l.ekv = batch(l.embLen), batch(dim*(hc+1))
 	}
 	l.qx, l.xs = batch(l.maxCols), batch(l.maxCols/32)
+	l.main = batch(max(len(c.DraftTargets), 1) * dim)
 	l.window = make([]int, c.Layers)
+	l.undo = make([]int, c.Layers)
+	for i := p.m.from; i < p.m.to; i++ {
+		l.undo[i] = alloc(Rewindable * 3 * hd)
+	}
 	l.comp, l.idx = make([]int, c.Layers), make([]int, c.Layers)
 	l.kvSlots, l.scSlots = make([]int, c.Layers), make([]int, c.Layers)
 	src := sourceBefore(c, p.m.from)
@@ -428,7 +443,7 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 		return nil
 	case B > GPUBatch:
 		return fmt.Errorf("dsv41: %d positions in a batch, at most %d", B, GPUBatch)
-	case pos != s.pos:
+	case pos > s.pos || s.pos-pos > len(s.hist):
 		return fmt.Errorf("dsv41: position %d, the stage expects %d", pos, s.pos)
 	case pos+B > s.positions:
 		return fmt.Errorf("dsv41: positions to %d beyond the stage's %d", pos+B, s.positions)
@@ -436,6 +451,10 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 	hc, dim, rd := c.HCMult, c.Dim, c.RopeDim
 	s.pp = make([]gpuPos, B)
 	b := s.a.Begin()
+	if pos < s.pos {
+		s.rewind(b, pos)
+	}
+	s.start = slices.Clone(s.compN)
 	fail := func(err error) error {
 		b.Submit()
 		return err
@@ -460,6 +479,13 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 		}
 		b.Write(l.h+i*hc*dim, p.H)
 		b.Write(l.preMix+i*hc, p.PreMix)
+		if p.WantMain {
+			if len(p.Main)%dim != 0 || len(p.Main) > dim*len(c.DraftTargets) {
+				return fail(errors.New("dsv41: payload does not fit the model"))
+			}
+			b.Write(l.main+i*len(c.DraftTargets)*dim, p.Main)
+			s.pp[i].mainN = len(p.Main) / dim
+		}
 		if p.CompKV != nil {
 			if n >= s.maxEntries {
 				return fail(errors.New("dsv41: more compressed entries than positions"))
@@ -467,6 +493,7 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 			b.Write(l.comp[src]+n*c.HeadDim, p.CompKV)
 			b.Write(l.idx[src]+n*c.IndexDim, p.IndexK)
 			s.pp[i].newKV, s.pp[i].newIdx, s.pp[i].entry = true, true, n
+			s.pp[i].appended = append(s.pp[i].appended, src)
 			n++
 		}
 		for _, g := range p.TopK {
@@ -510,7 +537,7 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 		}
 	}
 	// What leaves: the stream, the mix, the shared state.
-	type outs struct{ h, mix, kv, ik, topk, cand []float32 }
+	type outs struct{ h, mix, kv, ik, topk, cand, main []float32 }
 	res := make([]outs, B)
 	for i := range B {
 		o, pp := &res[i], &s.pp[i]
@@ -530,14 +557,32 @@ func (s *GPUStage) ForwardBatch(ps []*Payload, pos int) error {
 			o.cand = make([]float32, pp.candLen)
 			b.Read(l.cand+i*s.positions, o.cand)
 		}
+		if ps[i].WantMain && pp.mainN > 0 {
+			o.main = make([]float32, pp.mainN*dim)
+			b.Read(l.main+i*len(c.DraftTargets)*dim, o.main)
+		}
 	}
 	if err := b.Submit(); err != nil {
 		return err
+	}
+	// The caches' lengths before each position, for rewinding.
+	counts := slices.Clone(s.start)
+	for i := range B {
+		s.hist = append(s.hist, slices.Clone(counts))
+		for _, l := range s.pp[i].appended {
+			counts[l]++
+		}
+	}
+	if len(s.hist) > Rewindable {
+		s.hist = s.hist[len(s.hist)-Rewindable:]
 	}
 	s.pos += B
 	for i, p := range ps {
 		o, pp := &res[i], &s.pp[i]
 		p.H, p.PreMix = o.h, o.mix
+		if p.WantMain {
+			p.Main = o.main
+		}
 		if s.source >= m.from {
 			p.Source, p.CompKV, p.IndexK = s.source, o.kv, o.ik
 		}
@@ -579,6 +624,14 @@ func (s *GPUStage) block(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) (*gp
 		b.MatVecsBatch(g.ewkv, l.ekv, dim*(hc+1), l.emb, l.embLen, B, l.qx, l.xs)
 		for i := range B {
 			b.EngramGate(dim, h(i), l.ekv+i*dim*(hc+1), v+g.qk, c.NormEps, float32(1/math.Sqrt(float64(dim))))
+		}
+	}
+	for i, p := range ps {
+		if p.WantMain && slices.Contains(c.DraftTargets, g.b.id) {
+			// The draft reads the attention input of its target layers.
+			pp := &s.pp[i]
+			b.HCMean(dim, h(i), l.main+(i*len(c.DraftTargets)+pp.mainN)*dim)
+			pp.mainN++
 		}
 	}
 	for i := range B {
@@ -706,6 +759,7 @@ func (s *GPUStage) attention(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) 
 				b.FP4QuantInPlace(l.latent, hd, true)
 				b.Copy(l.latent, l.comp[id]+n*hd, hd)
 				s.compN[id]++
+				pp.appended = append(pp.appended, id)
 				pp.newKV, pp.entry = true, n
 			}
 			if pp.topkSet {
@@ -727,12 +781,19 @@ func (s *GPUStage) attention(b *gpu.Batch, g *gpuBlock, ps []*Payload, pos int) 
 		}
 	}
 	// The batch's window rows into the ring, and a compressor's groups.
+	// What each position replaces goes to its undo slots first.
 	for i := range B {
 		q := pos + i
-		b.Copy(l.kvb+i*hd, l.window[id]+(q%c.Window)*hd, hd)
+		u := l.undo[id] + (q%Rewindable)*3*hd
+		ring := l.window[id] + (q%c.Window)*hd
+		b.Copy(ring, u, hd)
+		b.Copy(l.kvb+i*hd, ring, hd)
 		if a.kvSource && a.ratio > 1 {
-			b.Copy(l.kvExt+(q-base)*hd, l.kvSlots[id]+(q%a.ratio)*hd, hd)
-			b.Copy(l.scExt+(q-base)*hd, l.scSlots[id]+(q%a.ratio)*hd, hd)
+			kv, sc := l.kvSlots[id]+(q%a.ratio)*hd, l.scSlots[id]+(q%a.ratio)*hd
+			b.Copy(kv, u+hd, hd)
+			b.Copy(sc, u+2*hd, hd)
+			b.Copy(l.kvExt+(q-base)*hd, kv, hd)
+			b.Copy(l.scExt+(q-base)*hd, sc, hd)
 		}
 	}
 	gw := qDim / c.OGroups
@@ -875,4 +936,27 @@ func (s *GPUStage) moe(b *gpu.Batch, g *gpuBlock, B int) (*gpu.Batch, error) {
 		b.MoESum(dim, l.eouts+i*k*dim, k, dim, l.sout+i*dim, l.y+i*dim)
 	}
 	return b, nil
+}
+
+// rewind records taking the stage back to before position pos (State.
+// Rewind): each later position's replaced rows put back, newest first,
+// and the caches' lengths as they were.
+func (s *GPUStage) rewind(b *gpu.Batch, pos int) {
+	c, l, m := s.p.m.Cfg, &s.l, s.p.m
+	hd := c.HeadDim
+	for q := s.pos - 1; q >= pos; q-- {
+		for id := m.from; id < m.to; id++ {
+			a := m.layers[id].attn
+			u := l.undo[id] + (q%Rewindable)*3*hd
+			b.Copy(u, l.window[id]+(q%c.Window)*hd, hd)
+			if a.kvSource && a.ratio > 1 {
+				b.Copy(u+hd, l.kvSlots[id]+(q%a.ratio)*hd, hd)
+				b.Copy(u+2*hd, l.scSlots[id]+(q%a.ratio)*hd, hd)
+			}
+		}
+	}
+	n := s.pos - pos
+	s.compN = slices.Clone(s.hist[len(s.hist)-n])
+	s.hist = s.hist[:len(s.hist)-n]
+	s.pos = pos
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
 )
 
 // GenerateRequest describes a generation.
@@ -31,6 +32,10 @@ type GenerateRequest struct {
 	// Chat wraps the prompt in the model's conversation format, for
 	// chat-tuned models; it is an error for models without one.
 	Chat bool
+	// Draft has the model's draft model (DeepSeek-V4.1's DSpark) propose
+	// tokens, verified a block at a time: fewer passes through the stages,
+	// the same text.
+	Draft bool
 }
 
 // Event is one generated token.
@@ -57,6 +62,10 @@ type Stats struct {
 	// Caught counts stages whose node returned outputs differing from its
 	// witness's; the witness took over each.
 	Caught int
+	// Drafted and Accepted count the draft's tokens proposed and taken.
+	Drafted, Accepted int
+	// Passes counts passes through the stages.
+	Passes int
 }
 
 // coordModel is what a coordinator holds of a model: the parts it runs
@@ -179,10 +188,11 @@ func (cm *coordModel) piece(prev, next int) []byte {
 }
 
 // inputs are the first stage's input for positions from.. of tokens, the
-// prompt being their first prompt.
-func (cm *coordModel) inputs(tokens []int, from, prompt int) ([]byte, error) {
+// prompt being their first prompt; wantMain asks for what a draft model
+// reads (DeepSeek's).
+func (cm *coordModel) inputs(tokens []int, from, prompt int, wantMain bool) ([]byte, error) {
 	if cm.ds != nil {
-		return cm.ds.inputs(tokens, from, prompt)
+		return cm.ds.inputs(tokens, from, prompt, wantMain)
 	}
 	c := cm.manifest.Config
 	xs := make([]float32, 0, (len(tokens)-from)*c.Dim)
@@ -192,18 +202,26 @@ func (cm *coordModel) inputs(tokens []int, from, prompt int) ([]byte, error) {
 	return encodeActs(xs), nil
 }
 
-// logits are the next token's scores, from the last stage's output for
-// count positions.
-func (cm *coordModel) logits(out []byte, count, positions int) ([]float32, error) {
+// outputs reads the last stage's output for count positions: the next
+// token's scores after position j, and what a draft model reads of it.
+func (cm *coordModel) outputs(out []byte, count, positions int) (logits, main func(j int) []float32, err error) {
 	if cm.ds != nil {
-		return cm.ds.logits(out, count, positions)
+		return cm.ds.outputs(out, count, positions)
 	}
 	c := cm.manifest.Config
 	if len(out) != 4*count*c.Dim {
-		return nil, errors.New("stage returned activations of the wrong size")
+		return nil, nil, errors.New("stage returned activations of the wrong size")
 	}
-	last := decodeActs(out[4*(count-1)*c.Dim:])
-	return cm.head.Logits(c, last), nil
+	return func(j int) []float32 { return cm.head.Logits(c, decodeActs(out[4*j*c.Dim:4*(j+1)*c.Dim])) }, func(int) []float32 { return nil }, nil
+}
+
+// logits are the scores after the last of count positions.
+func (cm *coordModel) logits(out []byte, count, positions int) ([]float32, error) {
+	logits, _, err := cm.outputs(out, count, positions)
+	if err != nil {
+		return nil, err
+	}
+	return logits(count - 1), nil
 }
 
 // stageConn runs one stage of a generation, remotely or in this process,
@@ -328,6 +346,7 @@ type planned struct {
 	// its current node; it is not looked for again until the stage moves.
 	unwitnessed bool
 	inputs      []byte // what entered the stage, every position so far
+	ends        []int  // where each position's input ends in inputs
 }
 
 // witness runs a stage placed on an untrusted guest a second time, on a
@@ -442,41 +461,97 @@ func (s *Service) Generate(ctx context.Context, req GenerateRequest, emit func(E
 		stages[i] = st
 	}
 
+	// A draft model proposes the tokens after each, which a pass of the
+	// stages verifies at once: the main model's token after each position is
+	// sampled as without the draft, in the same order, and a drafted token
+	// is taken when it is that token. The text is the same as without the
+	// draft, whatever the temperature; what the draft gets wrong costs only
+	// the stages a rewind. The draft reads the main model's stream at its
+	// target layers, which the stages report (Payload.Main).
+	var draft *dsv41.DraftState
+	if req.Draft {
+		if cm.ds == nil {
+			return nil, errors.New("the model has no draft model")
+		}
+		d, err := s.deepseekDraft(ctx, m, cm.ds, providers)
+		if err != nil {
+			return nil, fmt.Errorf("draft model: %w", err)
+		}
+		draft = d.NewState()
+	}
+
 	// Prefill: the whole prompt through each stage in one request.
 	prompt := len(tokens)
-	in, err := cm.inputs(tokens, 0, prompt)
+	in, err := cm.inputs(tokens, 0, prompt, draft != nil)
 	if err != nil {
 		return nil, err
 	}
 	stop := cm.stop()
 	var pending []byte // bytes of a character split across tokens
 	pos := 0
-	for stats.Tokens < maxTokens {
-		count := len(tokens) - pos
+	var proposal []int // drafted tokens after the last of tokens, in in
+	done := false
+	for !done && stats.Tokens < maxTokens {
+		start, count := pos, len(tokens)+len(proposal)-pos
+		stats.Passes++
 		for _, st := range stages {
 			if in, err = s.runStage(ctx, req.Model, st, in, pos, count, stages, providers, stats); err != nil {
 				return nil, err
 			}
 		}
-		logits, err := cm.logits(in, count, positions)
+		logits, mains, err := cm.outputs(in, count, positions)
 		if err != nil {
 			return nil, err
 		}
-		pos += count
-		next := sampler.Sample(logits)
-		if slices.Contains(stop, next) {
-			break
+		// The tokens after the last known one, then after each drafted one
+		// as long as the draft got it right.
+		last := len(tokens) - 1
+		for i := 0; ; i++ {
+			next := sampler.Sample(logits(last + i - start))
+			if slices.Contains(stop, next) {
+				done = true
+				break
+			}
+			pending = append(pending, cm.piece(tokens[len(tokens)-1], next)...)
+			var text []byte
+			text, pending = validUTF8Prefix(pending)
+			if err := emit(Event{Token: next, Text: string(text)}); err != nil {
+				return nil, err
+			}
+			pending = slices.Clone(pending)
+			tokens = append(tokens, next)
+			stats.Tokens++
+			if i == len(proposal) || next != proposal[i] || stats.Tokens >= maxTokens {
+				break
+			}
+			stats.Accepted++
 		}
-		pending = append(pending, cm.piece(tokens[len(tokens)-1], next)...)
-		var text []byte
-		text, pending = validUTF8Prefix(pending)
-		if err := emit(Event{Token: next, Text: string(text)}); err != nil {
-			return nil, err
+		// Every position run whose input was right, the last token's not yet.
+		pos = len(tokens) - 1
+		if draft != nil {
+			for q := draft.Main(); q < pos; q++ {
+				if err := draft.AddMain(mains(q - start)); err != nil {
+					return nil, err
+				}
+			}
 		}
-		pending = slices.Clone(pending)
-		tokens = append(tokens, next)
-		stats.Tokens++
-		if in, err = cm.inputs(tokens, pos, prompt); err != nil {
+		proposal = nil
+		if draft != nil && !done && stats.Tokens < maxTokens {
+			// As many as fit the generation's positions and its length.
+			k := min(m.ds.DraftBlock, maxTokens-stats.Tokens-1, positions-len(tokens))
+			if k > 0 {
+				p, err := draft.Propose(tokens[len(tokens)-1], cm.ds.head)
+				if err != nil {
+					return nil, err
+				}
+				proposal = p.Tokens[1 : 1+k]
+				if s.redraft != nil {
+					proposal = s.redraft(tokens, proposal)
+				}
+				stats.Drafted += len(proposal)
+			}
+		}
+		if in, err = cm.inputs(append(slices.Clone(tokens), proposal...), pos, prompt, draft != nil); err != nil {
 			return nil, err
 		}
 	}
@@ -517,7 +592,24 @@ func (s *Service) place(ctx context.Context, model blob.ID, st *planned, exclude
 // witness too, and the outputs are compared byte for byte; on a mismatch
 // the witness takes the stage over and the guest is reported as cheating.
 func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, in []byte, pos, count int, all []*planned, providers []peer.ID, stats *Stats) ([]byte, error) {
-	gas := s.manifestShape(model).gas(st.from, st.to, count)
+	sh := s.manifestShape(model)
+	gas := sh.gas(st.from, st.to, count)
+	// A pass from an earlier position rewinds the stage: what it received
+	// for the positions from there on goes.
+	if pos < len(st.ends) {
+		if pos == 0 {
+			st.inputs, st.ends = st.inputs[:0], st.ends[:0]
+		} else {
+			st.inputs, st.ends = st.inputs[:st.ends[pos-1]], st.ends[:pos]
+		}
+	}
+	if pos != len(st.ends) {
+		return nil, fmt.Errorf("layers %d..%d: position %d after %d", st.from, st.to, pos, len(st.ends))
+	}
+	sizes, err := sh.sizes(in, count)
+	if err != nil {
+		return nil, err
+	}
 	for attempt := 0; ; attempt++ {
 		s.ensureWitness(ctx, model, st, pos, providers)
 		var check []byte
@@ -558,7 +650,11 @@ func (s *Service) runStage(ctx context.Context, model blob.ID, st *planned, in [
 			if s.cfg.Trust != nil {
 				s.cfg.Trust.Consumed(st.node, gas)
 			}
-			st.inputs = append(st.inputs, in...)
+			for _, n := range sizes {
+				st.ends = append(st.ends, len(st.inputs)+n)
+				st.inputs = append(st.inputs, in[:n]...)
+				in = in[n:]
+			}
 			return out, nil
 		}
 		if ctx.Err() != nil {

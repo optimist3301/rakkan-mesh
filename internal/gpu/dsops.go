@@ -33,6 +33,7 @@ const (
 	kindSelect
 	kindCompact
 	kindFP8Batch
+	kindHCMean
 	kindAllCount
 )
 
@@ -82,6 +83,8 @@ func dsKernel(k kernelKind, modes floatModes) []uint32 {
 		return compactKernel(modes)
 	case kindFP8Batch:
 		return mxBatchKernel(kindFP8, modes)
+	case kindHCMean:
+		return hcMeanKernel(modes)
 	}
 	panic("gpu: unknown kernel")
 }
@@ -907,6 +910,22 @@ func compactKernel(modes floatModes) []uint32 {
 			k.iput(k.at(out, k.iadd(k.load(k.tU32, running), before)), k.sel(k.uge(i, visible), k.u32(0xffffffff), i))
 		})
 		k.store(running, k.iadd(k.load(k.tU32, running), total))
+	})
+	return k.finish()
+}
+
+// hcMeanKernel is dsv41's hcMean: the mean of the stream's 4 copies,
+// summed in order, in bf16. Push dim, h, out.
+func hcMeanKernel(modes floatModes) []uint32 {
+	k := newKernel(modes, flatGroup, 1)
+	d := k.flat()
+	dim, h, out := k.p(0), k.p(1), k.p(2)
+	k.ifThen(k.ult(d, dim), func() {
+		s := k.f32(0)
+		for c := range uint32(4) {
+			s = k.fadd(s, k.get(k.at(h, k.iadd(k.imul(k.u32(c), dim), d))))
+		}
+		k.put(k.at(out, d), k.roundBF16(k.fmul(s, k.f32(0.25))))
 	})
 	return k.finish()
 }

@@ -633,6 +633,9 @@ type generateRequest struct {
 	Temperature float32 `json:"temperature,omitempty"`
 	Seed        uint64  `json:"seed,omitempty"`
 	Stages      int     `json:"stages,omitempty"`
+	// Draft has DeepSeek-V4.1's draft model propose tokens: the same text,
+	// fewer passes through the stages.
+	Draft bool `json:"draft,omitempty"`
 }
 
 // generate streams a generation's tokens as NDJSON, then its statistics.
@@ -656,7 +659,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
-		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat,
+		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat, Draft: req.Draft,
 	}, func(e llm.Event) error {
 		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {
 			return err
@@ -688,6 +691,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		"elapsed_ms":   stats.Elapsed.Milliseconds(),
 		"tokens_per_s": float64(stats.Tokens) / stats.Elapsed.Seconds(),
 		"stages":       stages, "failovers": stats.Failovers, "caught": stats.Caught,
+		"passes": stats.Passes, "drafted": stats.Drafted, "accepted": stats.Accepted,
 	}})
 }
 
