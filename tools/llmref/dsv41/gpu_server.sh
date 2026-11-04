@@ -7,8 +7,9 @@
 #      on a medium one: this decides whether kernel_cpu needs changes;
 #   2. the Go engine's tests, the Vulkan ones on the NVIDIA GPU if its
 #      driver offers Vulkan: the same bits as the CPU on another vendor;
-#   3. with --real: the published layers 2 and 20 against the reference
-#      (16 GiB downloaded from the Hub), on the CPU and the GPU.
+#   3. with --real: the published layers 2 and 20 and the image encoder
+#      against the reference (17 GiB downloaded from the Hub), on the CPU
+#      and the GPU.
 #
 # usage, from the repository copied to the machine:
 #   tools/llmref/dsv41/gpu_server.sh [--real]
@@ -144,11 +145,12 @@ step go-llm in_repo go test -count=1 -timeout 30m ./internal/num ./internal/llm/
 # 4. The real layers (--real): the reference on them, then the engine.
 if [ $REAL = 1 ]; then
 	CACHE=$(in_here "$PY" -c 'import fetch; print(fetch.default_cache(fetch.pins()["revision"]))')
-	step fetch-shards in_here "$PY" fetch.py tokenizer.json model-00002-of-00048.safetensors \
+	step fetch-shards in_here "$PY" fetch.py tokenizer.json model-00001-of-00048.safetensors model-00002-of-00048.safetensors \
 		model-00005-of-00048.safetensors model-00023-of-00048.safetensors
 	step reference-layer2 in_here "$PY" layer_check.py 2 "$CACHE/layer2.safetensors"
 	step reference-layer20 in_here "$PY" layer_check.py 20 "$CACHE/layer20.safetensors"
-	step go-real-layers in_repo env RAKKAN_DSV41_REAL="$CACHE" go test -count=1 -v -timeout 60m -run 'RealLayers' ./internal/llm/dsv41
+	step reference-vision in_here "$PY" vision_check.py "$CACHE/vision.safetensors"
+	step go-real-layers in_repo env RAKKAN_DSV41_REAL="$CACHE" go test -count=1 -v -timeout 60m -run 'RealLayers|RealVision' ./internal/llm/dsv41
 fi
 
 # What came out of the checks, at a glance.

@@ -155,7 +155,7 @@ func (l *bf16Linear) apply(out, x []float32, n int) {
 			if l.b != nil {
 				o[j] += l.b[j]
 			}
-			o[j] = bf16(o[j])
+			o[j] = bf16c(o[j])
 		}
 	}
 }
@@ -196,7 +196,7 @@ func (vis *Vision) ViT(img *Image) ([]float32, error) {
 		vis.attention(att, qkv, n)
 		b.o.apply(y, att, n)
 		for i := range x {
-			x[i] = bf16(x[i] + y[i])
+			x[i] = bf16c(x[i] + y[i])
 		}
 		for i := range n {
 			rmsNorm(h[i*d:(i+1)*d], x[i*d:(i+1)*d], b.norm2, 1e-6)
@@ -206,12 +206,12 @@ func (vis *Vision) ViT(img *Image) ([]float32, error) {
 		for i := range n {
 			gate, up := g[i*2*in:i*2*in+in], g[i*2*in+in:(i+1)*2*in]
 			for j := range in {
-				a[i*in+j] = bf16(bf16(silu(gate[j])) * up[j])
+				a[i*in+j] = bf16c(bf16c(silu(gate[j])) * up[j])
 			}
 		}
 		b.w2.apply(y, a, n)
 		for i := range x {
-			x[i] = bf16(x[i] + y[i])
+			x[i] = bf16c(x[i] + y[i])
 		}
 		if vis.afterBlock != nil {
 			vis.afterBlock(bi, x)
@@ -256,8 +256,8 @@ func (vis *Vision) rotate(qkv []float32, n int, cos, sin []float32) {
 				x := row[h*hd : (h+1)*hd]
 				for j := range half {
 					x1, x2 := x[j], x[half+j]
-					x[j] = bf16(float32(x1*cs[j]) - float32(x2*sn[j]))
-					x[half+j] = bf16(float32(x2*cs[j]) + float32(x1*sn[j]))
+					x[j] = bf16c(float32(x1*cs[j]) - float32(x2*sn[j]))
+					x[half+j] = bf16c(float32(x2*cs[j]) + float32(x1*sn[j]))
 				}
 			}
 		}
@@ -305,7 +305,7 @@ func (vis *Vision) attention(out, qkv []float32, n int) {
 				for j := range n {
 					e := num.Exp32(s[j] - m)
 					sum += e
-					pe := bf16(e) // multiplied with the values in bf16
+					pe := bf16c(e) // multiplied with the values in bf16
 					for c, x := range vv[j*hd : (j+1)*hd] {
 						acc[c] += float32(pe * x)
 					}
@@ -313,7 +313,7 @@ func (vis *Vision) attention(out, qkv []float32, n int) {
 				o := out[i*d+h*hd:][:hd]
 				inv := 1 / sum
 				for c := range o {
-					o[c] = bf16(acc[c] * inv)
+					o[c] = bf16c(acc[c] * inv)
 				}
 			}
 		})
@@ -326,6 +326,20 @@ func (vis *Vision) attention(out, qkv []float32, n int) {
 // (channel, then row, then column within the block), then
 // bf16(w2·gelu(w1·x)).
 func (vis *Vision) align(x []float32, rows, cols int) []float32 {
+	feat, L := vis.unfold(x, rows, cols)
+	dim := vis.cfg.Dim
+	h := make([]float32, L*dim)
+	vis.align1.apply(h, feat, L)
+	for i, t := range h {
+		h[i] = bf16c(gelu(t))
+	}
+	out := make([]float32, L*dim)
+	vis.align2.apply(out, h, L)
+	return out
+}
+
+// unfold is the aligner's input: L rows of Downsample² encoder rows each.
+func (vis *Vision) unfold(x []float32, rows, cols int) ([]float32, int) {
 	v := &vis.cfg.Vision
 	r, d := v.Downsample, v.Dim
 	br, bc := ceilDiv(rows, r), ceilDiv(cols, r)
@@ -348,16 +362,12 @@ func (vis *Vision) align(x []float32, rows, cols int) []float32 {
 			}
 		}
 	}
-	dim := vis.cfg.Dim
-	h := make([]float32, L*dim)
-	vis.align1.apply(h, feat, L)
-	for i, t := range h {
-		h[i] = bf16(gelu(t))
-	}
-	out := make([]float32, L*dim)
-	vis.align2.apply(out, h, L)
-	return out
+	return feat, L
 }
+
+// bf16c rounds to bf16 after making a NaN canonical: processors and GPUs
+// make NaNs of different bits.
+func bf16c(x float32) float32 { return bf16(num.Canonical(x)) }
 
 // gelu is PyTorch's exact GELU in float32: x·0.5·(1 + erf(x·√½)).
 func gelu(x float32) float32 {

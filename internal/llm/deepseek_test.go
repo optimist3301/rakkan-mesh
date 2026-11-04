@@ -586,3 +586,27 @@ func TestDeepSeekChatImagePlaces(t *testing.T) {
 		t.Error("the placeholder in a chat message's text was taken")
 	}
 }
+
+// A coordinator with a GPU encodes images on it: the same text.
+func TestDeepSeekImageOnGPUCoordinator(t *testing.T) {
+	dev := testDevice(t)
+	c := newCluster(t)
+	coord := c.addOpts(nodeOpts{dev: dev, devBytes: 1 << 30, mem: 1 << 30})
+	c.add(true)
+	model, tok := importTinyDeepSeek(t, coord.blobs.Store())
+	waitServers(t, coord, 1)
+	png := fixtureImage(t)
+	before, after := "Look at", " it"
+	want := localDeepSeekImage(t, tok, before, png, after, 12)
+	got, _ := generate(t, coord, GenerateRequest{Model: model, Prompt: before + dsv41.ImagePlaceholder + after, MaxTokens: 12, Images: [][]byte{png}}, nil)
+	if !equalTokens(got, want) {
+		t.Fatalf("tokens %v, one process %v", got, want)
+	}
+	cm, err := coord.llm.coordinator(t.Context(), model, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cm.ds.visionGPU == nil {
+		t.Fatal("the image encoder is not on the coordinator's GPU")
+	}
+}

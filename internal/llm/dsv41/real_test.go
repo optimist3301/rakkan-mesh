@@ -3,6 +3,7 @@ package dsv41
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -383,5 +384,110 @@ func TestRealLayersGPU(t *testing.T) {
 			runtime.GC()
 			debug.FreeOSMemory()
 		})
+	}
+}
+
+// The image encoder on its published weights (shard 1), against the
+// reference's outputs (tools/llmref/dsv41/vision_check.py): the picture
+// prepared to the bit, the encoder to rounding, and on a GPU the CPU's
+// bits.
+func TestRealVision(t *testing.T) {
+	dir := os.Getenv("RAKKAN_DSV41_REAL")
+	if dir == "" {
+		t.Skip("RAKKAN_DSV41_REAL not set")
+	}
+	needMemory(t, 8)
+	defer debug.SetMemoryLimit(debug.SetMemoryLimit(6 << 30))
+	gpath := filepath.Join(dir, "vision.safetensors")
+	if _, err := os.Stat(gpath); err != nil {
+		t.Skipf("no reference outputs: %v", err)
+	}
+	gt, err := ReadSafetensors(gpath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := golden(gt)
+	cfg, err := LoadConfig("../../../tools/llmref/dsv41/upstream/config.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tensors, err := ReadSafetensors(filepath.Join(dir, "model-00001-of-00048.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The span's embeddings are in shard 2, beside the token embeddings.
+	shard2, err := ReadSafetensors(filepath.Join(dir, "model-00002-of-00048.safetensors"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"image_start", "image_end", "image_newline"} {
+		x := *shard2[name]
+		x.Data = bytes.Clone(x.Data)
+		tensors[name] = &x
+	}
+	shard2 = nil
+	runtime.GC()
+	vis, err := NewVision(cfg, tensors)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tensors = nil
+	runtime.GC()
+
+	img, err := cfg.PrepareImage(g["png"].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grid := []int{img.VitH, img.VitW, img.LLMH, img.LLMW}; !slices.Equal(grid, g.ints(t, "grid")) {
+		t.Fatalf("grid %v, reference %v", grid, g.ints(t, "grid"))
+	}
+	want := g.f32(t, "patches")
+	for i := range want {
+		if img.Patches[i] != want[i] {
+			t.Fatalf("patch value %d: %v, reference %v", i, img.Patches[i], want[i])
+		}
+	}
+	n := img.VitH * img.VitW
+	vis.afterBlock = func(i int, x []float32) {
+		if ref, ok := g[fmt.Sprintf("block%d", i)]; ok {
+			var df diff
+			r, _ := toF32("block", ref)
+			df.add(x, r)
+			t.Logf("block %2d: %s", i, df)
+		}
+	}
+	start := time.Now()
+	cpu, err := vis.Encode(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("CPU: %d patches in %v", n, time.Since(start))
+	vis.afterBlock = nil
+	var de diff
+	de.add(cpu, g.f32(t, "embeds"))
+	t.Logf("aligner:  %s", de)
+	if de.maxL2 > 0.05 {
+		t.Errorf("the encoder disagrees with the reference beyond rounding: %s", de)
+	}
+	for _, dev := range gpuDevices(t) {
+		if strings.HasPrefix(dev.Info().Name, "llvmpipe") && len(gpuDevices(t)) > 1 {
+			continue // slow, and the other device checks the kernels
+		}
+		gv, err := vis.ToGPU(dev)
+		if err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		got, err := gv.Encode(img)
+		gv.Free()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range cpu {
+			if math.Float32bits(got[i]) != math.Float32bits(cpu[i]) {
+				t.Fatalf("%s: value %d: %v, CPU %v", dev.Info().Name, i, got[i], cpu[i])
+			}
+		}
+		t.Logf("%s: the CPU's bits, in %v", dev.Info().Name, time.Since(start))
 	}
 }

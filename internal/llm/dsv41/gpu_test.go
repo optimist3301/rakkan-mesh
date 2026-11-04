@@ -572,3 +572,105 @@ func TestGPUImagePromptMatchesCPU(t *testing.T) {
 		}
 	}
 }
+
+// randomVision is an encoder of random weights: layers blocks of width d,
+// heads of hd, to try the GPU's kernels at other shapes than the fixture's.
+func randomVision(seed uint64, layers, d, hd, inter, patch, r, dim int) *Vision {
+	rng := rand.New(rand.NewPCG(seed, 7))
+	cfg := &Config{Dim: dim, Vision: VisionConfig{Layers: layers, Dim: d, Heads: d / hd, Inter: inter, Patch: patch, RopeTheta: 1e4, Downsample: r}}
+	lin := func(out, in int, bias bool) *bf16Linear {
+		l := &bf16Linear{w: make([]uint16, out*in), out: out, in: in}
+		for i := range l.w {
+			l.w[i] = num.ToBF16(float32(rng.NormFloat64() / math.Sqrt(float64(in))))
+		}
+		if bias {
+			l.b = make([]float32, out)
+			for i := range l.b {
+				l.b[i] = bf16(float32(rng.NormFloat64() * 0.1))
+			}
+		}
+		return l
+	}
+	vec := func(n int) []float32 {
+		v := make([]float32, n)
+		for i := range v {
+			v[i] = bf16(float32(1 + rng.NormFloat64()*0.1))
+		}
+		return v
+	}
+	vis := &Vision{cfg: cfg, patch: lin(d, 3*patch*patch, true), norm: vec(d), align1: lin(dim, d*r*r, true), align2: lin(dim, dim, true)}
+	for range layers {
+		vis.blocks = append(vis.blocks, visionBlock{norm1: vec(d), norm2: vec(d), qkv: lin(3*d, d, true), o: lin(d, d, true), w1: lin(2*inter, d, false), w2: lin(d, inter, false)})
+	}
+	half := hd / 2
+	vis.invFreq = make([]float32, half/2)
+	for i := range vis.invFreq {
+		vis.invFreq[i] = 1 / float32(num.Exp(num.Log(1e4)*float64(float32(2*i)/float32(half))))
+	}
+	return vis
+}
+
+func randomImage(seed uint64, vis *Vision, h, w int) *Image {
+	rng := rand.New(rand.NewPCG(seed, 9))
+	p := vis.cfg.Vision.Patch
+	img := &Image{ImageGrid: ImageGrid{VitH: h, VitW: w}, Patches: make([]float32, h*w*3*p*p)}
+	for i := range img.Patches {
+		img.Patches[i] = bf16(float32(rng.Float64()*2 - 1))
+	}
+	return img
+}
+
+// The encoder on a GPU gives the CPU's bits: the fixture's, and random
+// ones with heads of 64 and 32 over grids of several attention tiles.
+func TestGPUVisionMatchesCPU(t *testing.T) {
+	vis, g := loadVision(t)
+	img, err := vis.cfg.PrepareImage(g["vl.png"].Data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name string
+		vis  *Vision
+		img  *Image
+	}{{"fixture", vis, img}}
+	big := randomVision(1, 2, 128, 64, 96, 4, 3, 64)
+	cases = append(cases, struct {
+		name string
+		vis  *Vision
+		img  *Image
+	}{"heads of 64, 17×23", big, randomImage(2, big, 17, 23)})
+	mid := randomVision(3, 1, 64, 32, 64, 2, 2, 32)
+	cases = append(cases, struct {
+		name string
+		vis  *Vision
+		img  *Image
+	}{"heads of 32, 9×31", mid, randomImage(4, mid, 9, 31)})
+	for _, d := range gpuDevices(t) {
+		for _, c := range cases {
+			t.Run(d.Info().Name+"/"+c.name, func(t *testing.T) {
+				gv, err := c.vis.ToGPU(d)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer gv.Free()
+				want, err := c.vis.Encode(c.img)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, err := gv.Encode(c.img)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i := range want {
+					if math.Float32bits(got[i]) != math.Float32bits(want[i]) {
+						vw, _ := c.vis.ViT(c.img)
+						vg, _ := gv.ViT(c.img)
+						var dv diff
+						dv.add(vg, vw)
+						t.Fatalf("value %d: %v, CPU %v; the ViT's output %s", i, got[i], want[i], dv)
+					}
+				}
+			})
+		}
+	}
+}

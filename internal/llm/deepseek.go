@@ -545,7 +545,8 @@ type deepseekCoord struct {
 	draftErr  error
 
 	visionOnce sync.Once
-	vision     *dsv41.Vision // loaded when first asked for
+	vision     *dsv41.Vision    // loaded when first asked for
+	visionGPU  *dsv41.GPUVision // the same on the node's GPU, if it has one
 	visionErr  error
 }
 
@@ -553,6 +554,15 @@ type deepseekCoord struct {
 func (s *Service) deepseekVision(ctx context.Context, m *Manifest, cm *deepseekCoord, providers []peer.ID) (*dsv41.Vision, error) {
 	cm.visionOnce.Do(func() {
 		cm.vision, cm.visionErr = s.loadVision(ctx, m, providers)
+		if d := s.cfg.Device; d != nil && cm.visionErr == nil {
+			// The same bits as the CPU's, faster; the CPU's copy stays, for
+			// images the GPU cannot take.
+			if gv, err := cm.vision.ToGPU(d); err != nil {
+				s.log.Warn("image encoder stays on the CPU", "err", err)
+			} else {
+				cm.visionGPU = gv
+			}
+		}
 	})
 	return cm.vision, cm.visionErr
 }
@@ -638,9 +648,16 @@ func (s *Service) deepseekImages(ctx context.Context, m *Manifest, cm *deepseekC
 		if err != nil {
 			return nil, nil, fmt.Errorf("image %d: %w", k+1, err)
 		}
-		emb, err := vis.Encode(img)
-		if err != nil {
-			return nil, nil, err
+		var emb []float32
+		if cm.visionGPU != nil {
+			if emb, err = cm.visionGPU.Encode(img); err != nil {
+				s.log.Warn("image encoded on the CPU", "err", err)
+			}
+		}
+		if emb == nil {
+			if emb, err = vis.Encode(img); err != nil {
+				return nil, nil, err
+			}
 		}
 		span, err := vis.Span(img.ImageGrid, emb)
 		if err != nil {

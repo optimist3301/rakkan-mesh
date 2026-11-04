@@ -34,10 +34,21 @@ const (
 	kindCompact
 	kindFP8Batch
 	kindHCMean
+	// The image encoder's (vision.go).
+	kindVMatMul
+	kindVAttn16
+	kindVAttn32
+	kindVAttn64
+	kindVRope
+	kindVAdd
+	kindVSiluMul
 	kindAllCount
 )
 
 func dsKernel(k kernelKind, modes floatModes) []uint32 {
+	if k >= kindVMatMul {
+		return visionKernel(k, modes)
+	}
 	switch k {
 	case kindDSNorm:
 		return dsNormKernel(modes)
