@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/peer"
 	ma "github.com/multiformats/go-multiaddr"
 
@@ -109,4 +110,63 @@ func TestMainlineBootstrapOnline(t *testing.T) {
 	b := tn.member(t, online)
 	eventually(t, 3*time.Minute, "the newcomer to find the announcer through the DHT", func() bool { return connectedMember(b, a.ID()) })
 	t.Logf("joined in %v", time.Since(start))
+}
+
+// A guest that knows only the network finds an announcer through the DHT,
+// takes the policy from it, and joins.
+func TestMainlineGuest(t *testing.T) {
+	tn := newTestNet(t)
+	d, err := mldht.NewTestNetwork(30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	open := tn.policy(t, 1, true, 8)
+	a := tn.member(t, withMainline(d), withPolicy(open))
+	item, err := SignBootstrapRecord(tn.root, tn.net, []peer.ID{a.ID()}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := mldht.Listen("127.0.0.1:0", d.Bootstrap())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Put(t.Context(), item); err != nil {
+		t.Fatal(err)
+	}
+	// The announcer publishes its addresses on its next round.
+	var found []peer.AddrInfo
+	eventually(t, 10*time.Second, "the announcer's addresses in the DHT", func() bool {
+		found, err = FindAnnouncers(t.Context(), tn.net, d.Bootstrap())
+		return err == nil
+	})
+	if len(found) != 1 || found[0].ID != a.ID() || len(found[0].Addrs) == 0 {
+		t.Fatalf("found %v", found)
+	}
+	// What rakkan-node does for a guest: the policy from a throwaway host.
+	h, err := libp2p.New(libp2p.NoListenAddrs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	_, pol, err := FetchPolicy(t.Context(), h, tn.net, found[0])
+	if err != nil || !pol.Open || pol.PowBits != 8 {
+		t.Fatalf("policy %+v, %v", pol, err)
+	}
+	g := tn.guest(t, pol.PowBits, withMainline(d))
+	eventually(t, 20*time.Second, "the guest to join through the DHT", func() bool { return isGuest(a, g) && connectedMember(g, a.ID()) })
+}
+
+// Without the root's record, FindAnnouncers says so.
+func TestFindAnnouncersWithoutRecord(t *testing.T) {
+	tn := newTestNet(t)
+	d, err := mldht.NewTestNetwork(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if found, err := FindAnnouncers(t.Context(), tn.net, d.Bootstrap()); err == nil {
+		t.Fatalf("found %v", found)
+	}
 }

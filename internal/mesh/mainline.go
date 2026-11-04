@@ -260,32 +260,90 @@ func (n *Node) mainlineRound(ctx context.Context, c *mldht.Client, rec *mainline
 		})
 	}
 	if find {
-		for _, id := range announcers {
-			if id == self || n.isMember(id) {
-				continue
+		wg.Go(func() {
+			for _, ai := range findAnnouncers(ctx, c, rec, announcers, func(id peer.ID) bool { return id == self || n.isMember(id) }) {
+				n.log.Info("mainline DHT: found an announcer", "peer", ai.ID.ShortString(), "addrs", len(ai.Addrs))
+				n.addDialTarget(ai)
 			}
-			wg.Go(func() {
-				pub, _ := id.ExtractPublicKey()
-				key, err := edKey(pub)
-				if err != nil {
-					return
-				}
-				it, err := c.Get(ctx, key, rec.addrSalt, 0)
-				if err != nil {
-					return
-				}
-				plain, err := rec.open(rec.addrSalt, it.Value)
-				if err != nil {
-					return
-				}
-				addrs, err := decodeAddrs(plain)
-				if err == nil && len(addrs) > 0 {
-					n.log.Info("mainline DHT: found an announcer", "peer", id.ShortString(), "addrs", len(addrs))
-					n.addDialTarget(peer.AddrInfo{ID: id, Addrs: addrs})
-				}
-			})
-		}
+		})
 	}
 	wg.Wait()
 	return root
+}
+
+// findAnnouncers reads the address records of the announcers but those
+// skipped, at once.
+func findAnnouncers(ctx context.Context, c *mldht.Client, rec *mainlineRecords, announcers []peer.ID, skip func(peer.ID) bool) []peer.AddrInfo {
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var out []peer.AddrInfo
+	for _, id := range announcers {
+		if skip != nil && skip(id) {
+			continue
+		}
+		wg.Go(func() {
+			pub, err := id.ExtractPublicKey()
+			if err != nil {
+				return
+			}
+			key, err := edKey(pub)
+			if err != nil {
+				return
+			}
+			it, err := c.Get(ctx, key, rec.addrSalt, 0)
+			if err != nil {
+				return
+			}
+			plain, err := rec.open(rec.addrSalt, it.Value)
+			if err != nil {
+				return
+			}
+			addrs, err := decodeAddrs(plain)
+			if err == nil && len(addrs) > 0 {
+				mu.Lock()
+				out = append(out, peer.AddrInfo{ID: id, Addrs: addrs})
+				mu.Unlock()
+			}
+		})
+	}
+	wg.Wait()
+	return out
+}
+
+// FindAnnouncers looks up a network's announcers and their addresses in
+// the Mainline DHT, from its entry points (mldht.DefaultBootstrap if
+// none): what a node needs when it knows nothing but the network, a guest
+// asking for the policy, say. The addresses are the announcers' own
+// signed word; whoever answers there still has to prove membership.
+func FindAnnouncers(ctx context.Context, n *membership.Network, dhtBootstrap []string) ([]peer.AddrInfo, error) {
+	if len(dhtBootstrap) == 0 {
+		dhtBootstrap = mldht.DefaultBootstrap
+	}
+	c, err := mldht.Listen(":0", dhtBootstrap)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	rootKey, err := edKey(n.RootKey())
+	if err != nil {
+		return nil, err
+	}
+	rec := newMainlineRecords(n.ID)
+	root, err := c.Get(ctx, rootKey, rec.rootSalt, 0)
+	if err != nil {
+		return nil, fmt.Errorf("mesh: the network's record in the Mainline DHT: %w", err)
+	}
+	plain, err := rec.open(rec.rootSalt, root.Value)
+	if err != nil {
+		return nil, err
+	}
+	announcers, err := parseAnnouncers(plain)
+	if err != nil {
+		return nil, err
+	}
+	found := findAnnouncers(ctx, c, rec, announcers, nil)
+	if len(found) == 0 {
+		return nil, fmt.Errorf("mesh: none of the %d announcers has an address record", len(announcers))
+	}
+	return found, nil
 }

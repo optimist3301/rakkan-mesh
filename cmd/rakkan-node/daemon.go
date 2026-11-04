@@ -145,7 +145,7 @@ func daemonCmd(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *proofPath)
+		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *mainline, *proofPath)
 		if err != nil {
 			return fail(err)
 		}
