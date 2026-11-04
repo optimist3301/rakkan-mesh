@@ -229,7 +229,9 @@ func (c *Client) lookup(ctx context.Context, target [20]byte, q string, args fun
 	// next is the closest candidate not yet asked, if it can still be among
 	// the kClosest: unknown nodes (bootstrap) first.
 	next := func() *contact {
-		cands = slices.DeleteFunc(cands, func(ct *contact) bool { return queried[ct] && (failed[ct] || !ct.known) })
+		// Out go the nodes that did not answer; one asked and not yet
+		// answered stays (a router is unknown until it answers).
+		cands = slices.DeleteFunc(cands, func(ct *contact) bool { return failed[ct] })
 		slices.SortStableFunc(cands, func(a, b *contact) int {
 			switch {
 			case !a.known && b.known:
@@ -267,6 +269,7 @@ func (c *Client) lookup(ctx context.Context, target [20]byte, q string, args fun
 			queried[ct] = true
 			queries++
 			inFlight++
+
 			go func() {
 				// Bootstrap routers keep no items and may answer only
 				// find_node (BEP 5): they are asked that.
@@ -309,7 +312,13 @@ func (c *Client) lookup(ctx context.Context, target [20]byte, q string, args fun
 			failed[res.ct] = true
 			continue
 		}
-		if !res.ct.boot {
+		if res.ct.boot {
+			// A router answered find_node: from now on an ordinary node,
+			// asked q in turn if it is among the closest.
+			res.ct.boot = false
+			delete(queried, res.ct)
+
+		} else {
 			answers = append(answers, answer{contact: *res.ct, r: res.r, token: bytesAt(res.r, "token")})
 		}
 		for _, n := range parseNodes(bytesAt(res.r, "nodes")) {
