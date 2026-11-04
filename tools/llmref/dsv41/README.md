@@ -18,6 +18,7 @@ DeepSeek-V4.1-Flash. Это только инструменты разработ
 | `vectors.py` | Эталонные значения для Go-реализаций того, что эталон берёт из библиотек Python (токенайзер, хеш Engram) |
 | `chat_vectors.py` | Эталонные промпты и разборы ответов формата чата (`encoding.py`) для порта на Go |
 | `num_vectors.py` | Эталонные значения для арифметики FP8/FP4/bf16 движка (`internal/num`) |
+| `image_vectors.py` | Эталонная подготовка картинок: Pillow (`internal/pil`) и `image_processor.py` (`dsv41/image.go`) |
 | `layer_check.py` | Выходы одного настоящего слоя на эмбеддингах настоящего текста, для `internal/llm/dsv41/real_test.go` |
 | `check_kernels.py` | На машине с GPU NVIDIA сверяет `kernel_cpu` с настоящими ядрами |
 
@@ -45,6 +46,7 @@ python test_kernel_cpu.py
 python tiny.py ../../../internal/llm/testdata/dsv41-tiny
 python vectors.py ../../../internal/llm/testdata/dsv41-vectors.json.gz
 python num_vectors.py ../../../internal/num/testdata/dsv41-mx.json.gz
+python image_vectors.py ../../../internal/pil/testdata/pillow.json.gz ../../../internal/llm/dsv41/testdata/images.json.gz
 python chat_vectors.py ../../../internal/llm/testdata/dsv41-chat.json.gz
 git status --short ../../../internal   # должно быть пусто
 ```

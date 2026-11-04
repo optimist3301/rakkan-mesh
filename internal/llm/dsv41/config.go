@@ -65,11 +65,41 @@ type Config struct {
 	BOS, EOS                          int
 	// MaxPositions is the longest context the model was trained for.
 	MaxPositions int
+	// ImageToken is the token every position of an image span carries;
+	// Vision the image encoder's shape, Layers 0 for none.
+	ImageToken int
+	Vision     VisionConfig
+}
+
+// VisionConfig is the shape of the image encoder (vision.py) and of the
+// images' preparation (image_processor.py).
+type VisionConfig struct {
+	Layers, Dim, Heads, Inter int
+	Patch                     int // pixels per side of a patch
+	RopeTheta                 float64
+	Downsample                int // the aligner merges Downsample² patches into a token
+	MaxTokens                 int // of an image span
+	MinPixels                 int // smaller images are scaled up to this many pixels
+	MaxWHRatio                int // 0: none; wider images are cut to this ratio and stretched
 }
 
 type hfConfig struct {
-	BOS          int `json:"bos_token_id"`
-	EOS          int `json:"eos_token_id"`
+	BOS        int `json:"bos_token_id"`
+	EOS        int `json:"eos_token_id"`
+	ImageToken int `json:"image_token_id"`
+	Vision     *struct {
+		ModelType  string  `json:"model_type"`
+		Layers     int     `json:"num_hidden_layers"`
+		Dim        int     `json:"hidden_size"`
+		Heads      int     `json:"num_attention_heads"`
+		Inter      int     `json:"intermediate_size"`
+		Patch      int     `json:"patch_size"`
+		RopeTheta  float64 `json:"rope_theta"`
+		Downsample int     `json:"downsample_ratio"`
+		MaxTokens  int     `json:"max_image_tokens"`
+		MinPixels  int     `json:"min_pixels"`
+		MaxWHRatio *int    `json:"max_wh_ratio"`
+	} `json:"vision_config"`
 	Quantization struct {
 		QuantMethod     string `json:"quant_method"`
 		WeightBlockSize []int  `json:"weight_block_size"`
@@ -201,6 +231,29 @@ func ParseConfig(b []byte) (*Config, error) {
 	}
 	if t.CandidateSource != nil {
 		c.CandidateSource = *t.CandidateSource
+	}
+	c.ImageToken = h.ImageToken
+	if v := h.Vision; v != nil && v.Layers > 0 {
+		switch {
+		case v.ModelType != "deepseek_v41_vision":
+			return nil, fmt.Errorf("dsv41 config: vision model type %q", v.ModelType)
+		case v.Patch <= 0 || v.Downsample <= 0 || v.Heads <= 0 || v.Dim%v.Heads != 0 || (v.Dim/v.Heads)%4 != 0:
+			return nil, errors.New("dsv41 config: vision patch, downsample or heads")
+		case v.MaxTokens < 4 || v.MinPixels < 0 || v.MinPixels > 1<<26:
+			return nil, errors.New("dsv41 config: vision token or pixel bounds")
+		case c.ImageToken < 0 || c.ImageToken >= c.Vocab:
+			return nil, fmt.Errorf("dsv41 config: image token %d", c.ImageToken)
+		}
+		c.Vision = VisionConfig{
+			Layers: v.Layers, Dim: v.Dim, Heads: v.Heads, Inter: v.Inter, Patch: v.Patch,
+			RopeTheta: v.RopeTheta, Downsample: v.Downsample, MaxTokens: v.MaxTokens, MinPixels: v.MinPixels,
+		}
+		if v.MaxWHRatio != nil {
+			if *v.MaxWHRatio <= 0 {
+				return nil, errors.New("dsv41 config: vision max_wh_ratio")
+			}
+			c.Vision.MaxWHRatio = *v.MaxWHRatio
+		}
 	}
 	return c, nil
 }
