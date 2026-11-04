@@ -330,6 +330,9 @@ func FindAnnouncers(ctx context.Context, n *membership.Network, dhtBootstrap []s
 	}
 	rec := newMainlineRecords(n.ID)
 	root, err := c.Get(ctx, rootKey, rec.rootSalt, 0)
+	if errors.Is(err, mldht.ErrNotFound) {
+		return nil, errors.New("mesh: the network is not in the Mainline DHT: its admin has not run rakkan-node network announce, or nobody has kept the record there")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("mesh: the network's record in the Mainline DHT: %w", err)
 	}

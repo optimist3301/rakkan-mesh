@@ -19,7 +19,7 @@
 # which also makes the script usable unattended with --yes:
 #   RAKKAN_LANG=en|ru  RAKKAN_NETWORK=public|<network ID>  RAKKAN_CERT=<file>
 #   RAKKAN_NODE_TYPE=worker|client|relay|llm  RAKKAN_WORKERS=<n>
-#   RAKKAN_STORE_GB=<n>  RAKKAN_BOOTSTRAP=<multiaddr,...>
+#   RAKKAN_STORE_GB=<n>  RAKKAN_MAINLINE=yes|no  RAKKAN_BOOTSTRAP=<multiaddr,...>
 #   RAKKAN_AUTOSTART=yes|no
 
 set -euo pipefail
@@ -425,12 +425,24 @@ main() {
 
   # ------------------------------------------------------- 5: connectivity
   step "5/6" "Finding the network" "Поиск сети"
+  local MAINLINE="${RAKKAN_MAINLINE:-}"
+  if [ -z "$MAINLINE" ]; then
+    info "The node finds the network by its ID alone, in the BitTorrent DHT: the network's admin lists a few public members there. The records are encrypted, but DHT nodes see this machine's IP, as with any torrent client." \
+         "Узел находит сеть по одному её ID — в DHT BitTorrent: администратор сети перечисляет там несколько публичных участников. Записи зашифрованы, но узлы DHT видят IP этой машины, как у любого торрент-клиента."
+    ask_yn MAINLINE "Look for the network in the BitTorrent DHT?" "Искать сеть в DHT BitTorrent?" y
+  fi
+  case "$MAINLINE" in y|yes|true|1|on) MAINLINE=y ;; *) MAINLINE=n ;; esac
   local BOOT="${RAKKAN_BOOTSTRAP:-}"
   if [ -z "$BOOT" ]; then
-    info "A known node lets you find the rest of the network. Format: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo..." \
-         "Известный узел помогает найти остальную сеть. Формат: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo..."
-    ask_text BOOT "Address(es) of known nodes, comma-separated (empty: only the local network)" \
-      "Адрес(а) известных узлов через запятую (пусто: только локальная сеть)" ""
+    info "Known nodes are optional; they help when the DHT is blocked or the admin listed no one. Format: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo..." \
+         "Известные узлы не обязательны: они выручают, если DHT заблокирована или администратор никого не перечислил. Формат: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo..."
+    if [ "$MAINLINE" = y ]; then
+      ask_text BOOT "Address(es) of known nodes, comma-separated (empty: the DHT is enough)" \
+        "Адрес(а) известных узлов через запятую (пусто: хватит DHT)" ""
+    else
+      ask_text BOOT "Address(es) of known nodes, comma-separated (empty: only the local network)" \
+        "Адрес(а) известных узлов через запятую (пусто: только локальная сеть)" ""
+    fi
   fi
   if [ -n "$BOOT" ]; then
     local a
@@ -438,9 +450,14 @@ main() {
     for a in "${_addrs[@]}"; do
       [[ $a == */p2p/* ]] || die "Address must end in /p2p/<peer ID>: $a"
     done
-  elif [ "$PUBLIC" = 1 ] && [ -z "$CERT_JSON" ]; then
-    warn "A guest needs a known node to learn the network policy; without one the node cannot start." \
-         "Гостю нужен известный узел, чтобы узнать политику сети; без него узел не запустится."
+  elif [ "$MAINLINE" = n ]; then
+    if [ -z "$CERT_JSON" ]; then
+      warn "A guest needs a known node or the DHT to learn the network policy; without either the node cannot start." \
+           "Гостю нужен известный узел или DHT, чтобы узнать политику сети; без них узел не запустится."
+    else
+      warn "Without known nodes and the DHT, the node finds members only on the local network." \
+           "Без известных узлов и DHT узел найдёт участников только в локальной сети."
+    fi
   fi
 
   # ------------------------------------------------------------- 6: start
@@ -477,6 +494,7 @@ main() {
   F+=("  \"peers\": \"$(jesc "$DATA_DIR/peers.json")\"")
   F+=("  \"proof\": \"$(jesc "$DATA_DIR/node.proof")\"")
   [ -z "$BOOT" ] || F+=("  \"bootstrap\": \"$(jesc "$BOOT")\"")
+  if [ "$MAINLINE" = y ]; then F+=("  \"mainline\": true"); else F+=("  \"mainline\": false"); fi
   if [ "$TYPE" = relay ]; then
     F+=("  \"relay\": true")
     F+=("  \"reachability\": \"public\"")
@@ -578,6 +596,12 @@ EOF
     else
       say "  Logs:  tail -f \"$LOG_FILE\"" "  Журнал:  tail -f \"$LOG_FILE\""
     fi
+  fi
+  if [ "$TYPE" = relay ] && [ "$MAINLINE" = y ]; then
+    printf '\n'
+    say "  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:" \
+        "  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:"
+    printf '    rakkan-node network announce -key root.key -announcers %s\n' "$PEER"
   fi
   say "  Remove: install.sh --uninstall" "  Удалить: install.sh --uninstall"
   printf '%s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$BOLD" "$(c 99)" "$RESET"

@@ -19,7 +19,7 @@
   which also makes the script usable unattended with -Yes:
     RAKKAN_LANG=en|ru  RAKKAN_NETWORK=public|<network ID>  RAKKAN_CERT=<file>
     RAKKAN_NODE_TYPE=worker|client|relay|llm  RAKKAN_WORKERS=<n>
-    RAKKAN_STORE_GB=<n>  RAKKAN_BOOTSTRAP=<multiaddr,...>
+    RAKKAN_STORE_GB=<n>  RAKKAN_MAINLINE=yes|no  RAKKAN_BOOTSTRAP=<multiaddr,...>
     RAKKAN_AUTOSTART=yes|no  RAKKAN_ADD_TO_PATH=yes|no
 #>
 [CmdletBinding()]
@@ -349,18 +349,33 @@ Info 'Strict task isolation exists only on Linux; using process isolation.' 'С�
 
 # ------------------------------------------------------- 5: connectivity
 Step '5/6' 'Finding the network' 'Поиск сети'
+if ($env:RAKKAN_MAINLINE) { $Mainline = $env:RAKKAN_MAINLINE -in @('y', 'yes', 'true', '1', 'on') }
+else {
+    Info "The node finds the network by its ID alone, in the BitTorrent DHT: the network's admin lists a few public members there. The records are encrypted, but DHT nodes see this machine's IP, as with any torrent client." 'Узел находит сеть по одному её ID — в DHT BitTorrent: администратор сети перечисляет там несколько публичных участников. Записи зашифрованы, но узлы DHT видят IP этой машины, как у любого торрент-клиента.'
+    $Mainline = Ask-YN 'Look for the network in the BitTorrent DHT?' 'Искать сеть в DHT BitTorrent?' $true
+}
 $Boot = $env:RAKKAN_BOOTSTRAP
 if (-not $Boot) {
-    Info 'A known node lets you find the rest of the network. Format: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo...' 'Известный узел помогает найти остальную сеть. Формат: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo...'
-    $Boot = Ask-Text 'Address(es) of known nodes, comma-separated (empty: only the local network)' 'Адрес(а) известных узлов через запятую (пусто: только локальная сеть)' ''
+    Info 'Known nodes are optional; they help when the DHT is blocked or the admin listed no one. Format: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo...' 'Известные узлы не обязательны: они выручают, если DHT заблокирована или администратор никого не перечислил. Формат: /ip4/203.0.113.7/udp/4001/quic-v1/p2p/12D3Koo...'
+    if ($Mainline) {
+        $Boot = Ask-Text 'Address(es) of known nodes, comma-separated (empty: the DHT is enough)' 'Адрес(а) известных узлов через запятую (пусто: хватит DHT)' ''
+    }
+    else {
+        $Boot = Ask-Text 'Address(es) of known nodes, comma-separated (empty: only the local network)' 'Адрес(а) известных узлов через запятую (пусто: только локальная сеть)' ''
+    }
 }
 if ($Boot) {
     foreach ($a in ($Boot -split ',')) {
         if ($a.Trim() -notmatch '/p2p/') { Die "Address must end in /p2p/<peer ID>: $a" }
     }
 }
-elseif ($IsPublic -and -not $CertObj) {
-    Warn 'A guest needs a known node to learn the network policy; without one the node cannot start.' 'Гостю нужен известный узел, чтобы узнать политику сети; без него узел не запустится.'
+elseif (-not $Mainline) {
+    if (-not $CertObj) {
+        Warn 'A guest needs a known node or the DHT to learn the network policy; without either the node cannot start.' 'Гостю нужен известный узел или DHT, чтобы узнать политику сети; без них узел не запустится.'
+    }
+    else {
+        Warn 'Without known nodes and the DHT, the node finds members only on the local network.' 'Без известных узлов и DHT узел найдёт участников только в локальной сети.'
+    }
 }
 
 # -------------------------------------------------------------- 6: start
@@ -387,6 +402,7 @@ $cfg['api'] = Join-Path $DataDir 'rakkan.sock'
 $cfg['peers'] = Join-Path $DataDir 'peers.json'
 $cfg['proof'] = Join-Path $DataDir 'node.proof'
 if ($Boot) { $cfg['bootstrap'] = (($Boot -split ',') | ForEach-Object { $_.Trim() }) -join ',' }
+$cfg['mainline'] = [bool]$Mainline
 if ($Type -eq 'relay') {
     $cfg['relay'] = $true
     $cfg['reachability'] = 'public'
@@ -443,6 +459,11 @@ Write-Host ''
 Say '  Run by hand:' '  Запуск вручную:'
 Write-Host "    & '$Bin' daemon -config '$Conf'"
 if ($Auto) { Say "  Log:  Get-Content -Wait '$LogFile'" "  Журнал:  Get-Content -Wait '$LogFile'" }
+if ($Type -eq 'relay' -and $Mainline) {
+    Write-Host ''
+    Say '  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:' '  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:'
+    Write-Host "    rakkan-node network announce -key root.key -announcers $Peer"
+}
 Say '  Remove: .\install.ps1 -Uninstall' '  Удалить: .\install.ps1 -Uninstall'
 Write-Host $rule -ForegroundColor Magenta
 Write-Host ''
