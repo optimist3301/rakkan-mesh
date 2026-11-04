@@ -17,7 +17,7 @@ import (
 // before it sends the result. Worker frames start with their kind. The
 // node treats everything from a worker as untrusted: it may be compromised.
 
-const protoVersion = 2
+const protoVersion = 3
 
 // Kinds of worker frames during a task.
 const (
@@ -225,6 +225,14 @@ func encodeResponse(res *sandbox.Result, err error) []byte {
 		}
 		e.u8(errorCode(err))
 		e.bytes([]byte(msg))
+		// The gas a task burned before failing, or none if it never ran.
+		if gas, ok := sandbox.GasUsed(err); ok {
+			e.u8(1)
+			e.u64(uint64(gas))
+		} else {
+			e.u8(0)
+			e.u64(0)
+		}
 		return e.b
 	}
 	e.u8(0)
@@ -251,6 +259,8 @@ func decodeResponse(b []byte, lim sandbox.Limits) (*sandbox.Result, error, error
 	code := d.u8()
 	if code != 0 {
 		msg := string(d.bytes(maxErrorMessage))
+		ran := d.u8()
+		gas := int64(d.u64())
 		if err := d.finish(); err != nil {
 			return nil, nil, err
 		}
@@ -260,7 +270,14 @@ func decodeResponse(b []byte, lim sandbox.Limits) (*sandbox.Result, error, error
 		} else if code != codeInternal {
 			return nil, nil, fmt.Errorf("unknown error code %d", code)
 		}
-		return nil, &remoteError{kind: kind, msg: msg}, nil
+		var taskErr error = &remoteError{kind: kind, msg: msg}
+		switch {
+		case ran > 1 || gas < 0 || gas > lim.MaxGas:
+			return nil, nil, fmt.Errorf("reported gas %d outside budget %d", gas, lim.MaxGas)
+		case ran == 1:
+			taskErr = sandbox.WithGasUsed(taskErr, gas)
+		}
+		return nil, taskErr, nil
 	}
 
 	res := &sandbox.Result{

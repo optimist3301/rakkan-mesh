@@ -25,15 +25,23 @@ type Source interface {
 // actually read, from providers, verifying each. A task reading a little of
 // a large blob downloads only that much. Closing the reader records the
 // blob as complete if every chunk has arrived; otherwise the chunks fetched
-// stay for later reads (see partial chunks in Store).
-func (s *Service) OpenRemote(ctx context.Context, id ID, providers []peer.ID) (Source, error) {
+// stay for later reads (see partial chunks in Store). Blobs larger than
+// maxSize are refused: even unread, a blob's manifest and chunk list cost
+// memory in proportion to its size.
+func (s *Service) OpenRemote(ctx context.Context, id ID, providers []peer.ID, maxSize int64) (Source, error) {
 	if r, err := s.store.Open(id); err == nil {
+		if r.Size() > maxSize {
+			r.Close()
+			return nil, fmt.Errorf("%w: blob %s of %d bytes, limit %d", ErrTooLarge, id, r.Size(), maxSize)
+		}
 		return r, nil
 	}
 	var m *Manifest
 	var lastErr error
 	for _, p := range providers {
-		if m, lastErr = s.fetchManifest(ctx, p, id); lastErr == nil {
+		// Any provider's refusal, an oversized manifest included, is only
+		// its claim: ask the next.
+		if m, lastErr = s.fetchManifest(ctx, p, id, maxSize); lastErr == nil {
 			break
 		}
 	}
@@ -41,7 +49,7 @@ func (s *Service) OpenRemote(ctx context.Context, id ID, providers []peer.ID) (S
 		if lastErr == nil {
 			lastErr = errors.New("no providers")
 		}
-		return nil, fmt.Errorf("%w: blob %s: %v", ErrNotFound, id, lastErr)
+		return nil, fmt.Errorf("%w: blob %s: %w", ErrNotFound, id, lastErr)
 	}
 	s.store.hold(m.Chunks...)
 	return &remoteReader{svc: s, ctx: ctx, m: m, providers: providers, cached: -1}, nil

@@ -166,6 +166,14 @@ type placement struct {
 
 func newPlacement() *placement { return &placement{used: map[peer.ID]bool{}} }
 
+// distrust sends the task's remaining attempts to trusted executors, when
+// any can run it, after a guest failed it.
+func (pl *placement) distrust() {
+	pl.mu.Lock()
+	pl.trusted = true
+	pl.mu.Unlock()
+}
+
 // runOnce runs a task on one executor, retrying on others when the
 // executor fails. Busy executors are waited out without counting as an
 // attempt; the context bounds the wait.
@@ -196,19 +204,31 @@ func (s *Service) runOnce(ctx context.Context, req Request, pl *placement) (*Res
 		}
 		res, err := s.execOn(ctx, target, hash, req)
 		if err == nil {
+			s.forgive(target)
 			res.Attempts = attempt
 			return res, nil
 		}
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
+		guest := target != s.node.ID() && !s.node.IsCertified(target)
 		switch {
+		case errors.Is(err, ErrBusy) && guest:
+			// Its load said it had room. Not an attempt, but it gets no
+			// more of this task, and the rest goes to trusted executors.
+			s.penalize(target)
+			pl.distrust()
+			continue
 		case errors.Is(err, ErrBusy):
 			s.markFull(target)
 			s.release1(pl, target) // it may have room again later
 			continue
 		case !retryable(err):
 			return nil, err
+		}
+		if guest {
+			s.penalize(target)
+			pl.distrust()
 		}
 		s.log.Info("executor failed, retrying elsewhere", "peer", target.ShortString(), "err", err)
 		if s.cfg.Trust != nil && !errors.Is(err, ErrRejected) {
@@ -332,7 +352,7 @@ func (s *Service) pick(hash Hash, lim sandbox.Limits, caps []string, pl *placeme
 	s.mu.Lock()
 	for _, m := range members {
 		l, ok := s.loads[m.ID]
-		if !m.Connected || !ok || !s.fresh(l) || l.Slots == 0 || pl.used[m.ID] {
+		if !m.Connected || !ok || !s.fresh(l) || l.Slots == 0 || pl.used[m.ID] || s.penalized(m.ID) {
 			continue
 		}
 		if err := refuse(l); err != nil {

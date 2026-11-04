@@ -69,6 +69,10 @@ type Config struct {
 	// this node by their credit, and has results from guests checked
 	// against independent runs. Without it every peer is trusted.
 	Trust *trust.Service
+	// MaxBlobBytes bounds each blob attached to a task this node runs.
+	// Attached blobs are read on demand, but their manifests are held whole.
+	// Default 64 GiB, a manifest of 2 MiB.
+	MaxBlobBytes int64
 	// MaxAttempts bounds executors tried per task. Default 3.
 	MaxAttempts int
 	// LoadInterval is how often load is gossiped. Default 3s.
@@ -102,15 +106,20 @@ type Service struct {
 	inflight atomic.Int64 // tasks admitted for local execution
 	changed  chan struct{}
 
-	// For tests: modules received, and a hook that tampers with results.
+	// For tests: modules received, a hook that tampers with results, and
+	// an offer status to answer every task with.
 	modulesReceived atomic.Int64
 	tamper          func(*sandbox.Result)
+	testOffer       atomic.Value // string
+	testRefused     atomic.Int64
 
 	mu      sync.Mutex
 	loads   map[peer.ID]Load
 	pending map[peer.ID]int           // our tasks in flight at each executor
 	placed  map[peer.ID]map[Hash]bool // modules an executor is known to hold
 	caps    map[Hash][]string         // capabilities each module needs
+	// penalties exclude guests that failed tasks from scheduling.
+	penalties map[peer.ID]*penalty
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -130,6 +139,9 @@ func New(cfg Config) (*Service, error) {
 	}
 	if cfg.ModuleCacheBytes <= 0 {
 		cfg.ModuleCacheBytes = 256 << 20
+	}
+	if cfg.MaxBlobBytes <= 0 {
+		cfg.MaxBlobBytes = 64 << 30
 	}
 	if cfg.MaxAttempts <= 0 {
 		cfg.MaxAttempts = 3
@@ -156,6 +168,8 @@ func New(cfg Config) (*Service, error) {
 		pending: map[peer.ID]int{},
 		placed:  map[peer.ID]map[Hash]bool{},
 		caps:    map[Hash][]string{},
+
+		penalties: map[peer.ID]*penalty{},
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
@@ -253,13 +267,87 @@ func (s *Service) receiveLoads(sub *pubsub.Subscription) {
 			continue
 		}
 		var l Load
-		if json.Unmarshal(m.Data, &l) != nil {
+		if json.Unmarshal(m.Data, &l) != nil || !l.plausible() {
 			continue
 		}
 		l.received = time.Now()
 		s.mu.Lock()
 		s.loads[from] = l
 		s.mu.Unlock()
+	}
+}
+
+// maxSlots bounds the slots a gossiped load may claim.
+const maxSlots = 1024
+
+// plausible rejects loads no node could have. A load is a claim: within
+// these bounds it is believed until the node fails to honour it (see
+// penalize).
+func (l *Load) plausible() bool {
+	return l.Slots >= 0 && l.Slots <= maxSlots && l.Busy >= 0 && l.Queued >= 0 && l.CPUs >= 0
+}
+
+// Guests that refuse or fail tasks their gossiped load invited are left
+// out of scheduling for a while, doubling each time, so that a guest
+// claiming capacity it does not give cannot keep drawing tasks away from
+// executors that would run them. Members, whom the root vouched for, are
+// not penalized: a busy or failing member is handled as before.
+const (
+	minPenalty = time.Second
+	maxPenalty = 5 * time.Minute
+)
+
+type penalty struct {
+	until   time.Time
+	backoff time.Duration
+}
+
+// penalize excludes p from scheduling if it is a guest.
+func (s *Service) penalize(p peer.ID) {
+	if p == s.node.ID() || s.node.IsCertified(p) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pen := s.penalties[p]
+	if pen == nil {
+		if len(s.penalties) >= 4096 {
+			s.prunePenalties()
+		}
+		pen = &penalty{}
+		s.penalties[p] = pen
+	}
+	pen.backoff = min(max(2*pen.backoff, minPenalty), maxPenalty)
+	pen.until = time.Now().Add(pen.backoff)
+	s.log.Info("guest failed a task; not scheduling on it", "peer", p.ShortString(), "for", pen.backoff)
+}
+
+// forgive clears p's penalty once it has returned a result. A task error
+// does not count: claimed by a guest, it is a verdict that may go unchecked
+// (see runChecked).
+func (s *Service) forgive(p peer.ID) {
+	s.mu.Lock()
+	delete(s.penalties, p)
+	s.mu.Unlock()
+}
+
+// penalized reports whether p is excluded from scheduling; s.mu is held.
+func (s *Service) penalized(p peer.ID) bool {
+	pen, ok := s.penalties[p]
+	return ok && time.Now().Before(pen.until)
+}
+
+// prunePenalties drops expired penalties, or all of them if none has
+// expired, to bound memory against many identities; s.mu is held.
+func (s *Service) prunePenalties() {
+	now := time.Now()
+	for p, pen := range s.penalties {
+		if now.After(pen.until) {
+			delete(s.penalties, p)
+		}
+	}
+	if len(s.penalties) >= 4096 {
+		clear(s.penalties)
 	}
 }
 
@@ -285,6 +373,11 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 	var h header
 	if err := readJSON(st, &h); err != nil {
 		st.Reset()
+		return
+	}
+	if o, _ := s.testOffer.Load().(string); o != "" {
+		s.testRefused.Add(1)
+		writeJSON(st, offer{Status: o, Reason: "test"})
 		return
 	}
 	hash, ok := ParseHash(h.ModuleHash)
@@ -390,22 +483,42 @@ func (s *Service) handle(st network.Stream, c *membership.Cert) {
 		cancel()
 	}()
 	res, err := s.cfg.Pool.Run(ctx, c.Subject.String(), sandbox.Task{Module: module, Entry: h.Entry, Input: input, Blobs: sources, Limits: h.Limits})
+	gasUsed = billedGas(res, err, h.Limits)
 	if ctx.Err() != nil {
 		// Cancelled by the requester, or this node is shutting down: no
 		// verdict on the task. Resetting tells the requester to go elsewhere.
+		// The requester pays for the slot it held, unless the node is to
+		// blame; otherwise running a task and cancelling it just before it
+		// ends would be free.
+		if s.ctx.Err() != nil {
+			gasUsed = 0
+		} else {
+			gasUsed = h.Limits.MaxGas
+		}
 		st.Reset()
 		return
-	}
-	switch {
-	case err == nil:
-		gasUsed = res.GasUsed
-	case errors.Is(err, sandbox.ErrOutOfGas):
-		gasUsed = h.Limits.MaxGas
 	}
 	if err == nil && s.tamper != nil {
 		s.tamper(res)
 	}
 	writeResult(st, res, err, s.cfg.Blobs.Store())
+}
+
+// billedGas is what a task run for another peer costs it: the gas it used,
+// whether it succeeded or failed. A task that stopped at a limit, or whose
+// worker was killed, held the slot for its whole budget and pays all of
+// it; otherwise a task could work until just before a trap, a timeout or
+// an exhausted memory and pay nothing. Failures before the task ran, and
+// those of the executor itself (a worker crash), cost nothing.
+func billedGas(res *sandbox.Result, err error, lim sandbox.Limits) int64 {
+	switch {
+	case err == nil:
+		return res.GasUsed
+	case errors.Is(err, sandbox.ErrOutOfGas), errors.Is(err, sandbox.ErrTimeout), errors.Is(err, isolate.ErrWorkerOOM):
+		return lim.MaxGas
+	}
+	gas, _ := sandbox.GasUsed(err)
+	return gas
 }
 
 // openBlobs opens a task's attached blobs for reading on demand.
@@ -418,7 +531,7 @@ func (s *Service) openBlobs(ctx context.Context, ids []blob.ID, providers []peer
 	}
 	var sources []sandbox.BlobSource
 	for _, id := range ids {
-		src, err := s.cfg.Blobs.OpenRemote(ctx, id, providers)
+		src, err := s.cfg.Blobs.OpenRemote(ctx, id, providers, s.cfg.MaxBlobBytes)
 		if err != nil {
 			closeAll()
 			return nil, nil, fmt.Errorf("%w: %v", sandbox.ErrBlobUnavailable, err)
