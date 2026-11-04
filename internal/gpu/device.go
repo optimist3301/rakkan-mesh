@@ -32,6 +32,11 @@ type Info struct {
 	// kernels need to match the CPU bit for bit: denormals preserved and
 	// round-to-nearest-even (or a CPU implementation, which has them).
 	Exact bool `json:"exact"`
+	// Denormals reports whether the device promises to keep denormal
+	// floats. Without, float32 arithmetic whose operands or results are
+	// denormal may differ from the CPU's (llvmpipe says it does not keep
+	// them); DeepSeek-V4.1's kernels meet them only with extreme values.
+	Denormals bool `json:"denormals"`
 
 	pd       uintptr
 	apiMajor uint32
@@ -154,6 +159,7 @@ func Devices() ([]Info, error) {
 			info.modes = floatModes{signedZeroInfNan: fc.flags[1] != 0, denormPreserve: fc.flags[4] != 0, roundRTE: fc.flags[10] != 0}
 		}
 		info.Exact = info.Type == "cpu" || info.modes.denormPreserve && info.modes.roundRTE
+		info.Denormals = info.modes.denormPreserve
 		var mem [520]byte
 		vk.GetPhysicalDeviceMemoryProperties(pd, &mem)
 		heaps := binary.LittleEndian.Uint32(mem[260:])
@@ -196,6 +202,7 @@ const (
 // Device is an opened GPU. Its methods are safe for concurrent use; the
 // submissions run one at a time.
 type Device struct {
+	prof   *profile // timing kernels, if set (profile.go)
 	info   Info
 	dev    uintptr
 	queue  uintptr
@@ -208,8 +215,8 @@ type Device struct {
 
 	setLayouts [2]uint64 // set 0: weights or vectors; set 1: an arena
 	layout     uint64
-	kernels    [kindCount]*pipeline
-	setPool    uint64 // descriptor sets of arenas and vectors
+	kernels    [kindAllCount]*pipeline // DeepSeek's built on first use
+	setPool    uint64                  // descriptor sets of arenas and vectors
 
 	host *Arena // for MulVecs: input, output and quantized input
 
@@ -315,11 +322,11 @@ func (d *Device) init() error {
 		d.kernels[k] = p
 	}
 	var err error
-	d.host, err = d.NewArena(maxCols+maxRows+maxCols/4+maxCols/num.QBlock, maxCols+maxRows)
+	d.host, err = d.NewArena(maxCols+maxRows+maxCols+maxCols/num.QBlock, maxCols+maxRows)
 	if err != nil {
 		return err
 	}
-	d.host.SetQuantScratch(maxCols+maxRows, maxCols+maxRows+maxCols/4)
+	d.host.SetQuantScratch(maxCols+maxRows, maxCols+maxRows+maxCols)
 	return nil
 }
 
@@ -538,9 +545,11 @@ type Matrix struct {
 	d          *Device
 	kind       kernelKind
 	rows, cols int
-	pool       uint64
-	parts      []part
-	bytes      int64
+	// unrounded leaves FP8 and FP4 products in float32 (for tests).
+	unrounded bool
+	pool      uint64
+	parts     []part
+	bytes     int64
 }
 
 // part is a run of rows small enough for one storage buffer binding.
@@ -557,6 +566,19 @@ type Format struct {
 	Q8     []int8
 	Q4     []byte
 	Scales []float32
+	// DeepSeek-V4.1's formats (package num): E4M3 codes with one E8M0
+	// scale per 32×32 block ([ceil(rows/32)][cols/32]), or E2M1 codes,
+	// two to a byte, with one per 32 of a row ([rows][cols/32]); the
+	// scales' bytes in E8M0. The products are rounded to bfloat16.
+	FP8, FP4 []byte
+	E8M0     []byte
+	// FP4Chunks and E8M0Chunks are FP4 and E8M0 given in pieces, read as
+	// one: stacked experts, which are uploaded part by part and so never
+	// gathered on the host whole.
+	FP4Chunks, E8M0Chunks [][]byte
+	// AlignRows, if set, keeps runs of that many rows (an expert's) in one
+	// part when the matrix is split.
+	AlignRows int
 }
 
 // Upload copies a rows×cols matrix to the device.
@@ -580,20 +602,56 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	case f.Q4 != nil:
 		m.kind, rowBytes, scaleBytes = kindQ4, cols/2, 4*cols/num.QBlock
 		data = f.Q4
+	case f.FP8 != nil:
+		m.kind, rowBytes = kindFP8, cols
+		data = f.FP8
+	case f.FP4 != nil:
+		m.kind, rowBytes = kindFP4, cols/2
+		data = f.FP4
+	case f.FP4Chunks != nil:
+		m.kind, rowBytes = kindFP4, cols/2
 	default:
 		return nil, errors.New("gpu: empty matrix")
 	}
-	if cols > maxCols || rows > maxRows || len(data) != rows*rowBytes {
+	// Rows beyond maxRows are for products into an arena (stacked experts);
+	// MulVecs, through the host's arena, checks its own outputs.
+	read, dataLen := gatherer(data, f.FP4Chunks)
+	if cols > maxCols || rows > 1<<24 || dataLen != rows*rowBytes {
 		return nil, fmt.Errorf("gpu: matrix %d×%d out of range", rows, cols)
 	}
 	if (m.kind == kindQ8 || m.kind == kindQ4) && (cols%num.QBlock != 0 || len(f.Scales) != rows*cols/num.QBlock) {
 		return nil, errors.New("gpu: quantized matrix of the wrong shape")
 	}
 	scales := floatBytes(f.Scales)
+	mx := m.kind == kindFP8 || m.kind == kindFP4
+	if mx {
+		blocks := rows * cols / num.QBlock // one scale per 32 of a row
+		if m.kind == kindFP8 {
+			blocks = (rows + 31) / 32 * (cols / num.QBlock)
+		}
+		if _, n := gatherer(f.E8M0, f.E8M0Chunks); cols%num.QBlock != 0 || n != blocks {
+			return nil, errors.New("gpu: block-scaled matrix of the wrong shape")
+		}
+		if m.kind == kindFP8 && !num.ValidE4M3(f.FP8) {
+			return nil, errors.New("gpu: NaN in E4M3 weights")
+		}
+		scales = f.E8M0
+	}
+	readScales, _ := gatherer(scales, f.E8M0Chunks)
 
-	// Split rows so each part fits a binding, and a gigabyte at most.
+	// Split rows so each part fits a binding, and a gigabyte at most: for
+	// E4M3 weights, whole blocks of 32 rows sharing scales.
 	limit := min(d.info.maxRange, 1<<30)
 	per := max(int(limit)/rowBytes, 1)
+	if m.kind == kindFP8 {
+		per = max(per/32*32, 32)
+	}
+	if a := f.AlignRows; a > 0 {
+		if rows%a != 0 || m.kind == kindFP8 && a%32 != 0 {
+			return nil, errors.New("gpu: rows not a whole number of aligned runs")
+		}
+		per = max(per/a*a, a)
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	size := vkDescriptorPoolSize{typ: descriptorStorageBuffer, count: uint32(2 * ((rows + per - 1) / per))}
@@ -605,8 +663,17 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 		n := min(per, rows-r)
 		p := part{row0: r, rows: n}
 		var err error
-		if p.w, err = d.upload(data[r*rowBytes : (r+n)*rowBytes]); err == nil && scaleBytes > 0 {
-			p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
+		if p.w, err = d.upload(read(r*rowBytes, (r+n)*rowBytes)); err == nil {
+			// Byte scales are padded to whole words, which kernels read.
+			nb := cols / num.QBlock
+			switch {
+			case m.kind == kindFP8:
+				p.s, err = d.upload(padWords(readScales(r/32*nb, (r+n+31)/32*nb)))
+			case m.kind == kindFP4:
+				p.s, err = d.upload(padWords(readScales(r*nb, (r+n)*nb)))
+			case scaleBytes > 0:
+				p.s, err = d.upload(scales[r*scaleBytes : (r+n)*scaleBytes])
+			}
 		}
 		if err == nil {
 			bufs := []*buffer{p.w}
@@ -630,6 +697,37 @@ func (d *Device) Upload(rows, cols int, f Format) (*Matrix, error) {
 	d.used += m.bytes
 	runtime.KeepAlive(f)
 	return m, nil
+}
+
+// gatherer reads bytes [lo, hi) of data, or of chunks read as one (only
+// that range is gathered), and reports their whole length.
+func gatherer(data []byte, chunks [][]byte) (func(lo, hi int) []byte, int) {
+	if chunks == nil {
+		return func(lo, hi int) []byte { return data[lo:hi] }, len(data)
+	}
+	n := 0
+	for _, c := range chunks {
+		n += len(c)
+	}
+	return func(lo, hi int) []byte {
+		out := make([]byte, 0, hi-lo)
+		at := 0
+		for _, c := range chunks {
+			if end := at + len(c); end > lo && at < hi {
+				out = append(out, c[max(lo-at, 0):min(hi-at, len(c))]...)
+			}
+			at += len(c)
+		}
+		return out
+	}, n
+}
+
+// padWords pads bytes to whole words.
+func padWords(b []byte) []byte {
+	if len(b)%4 == 0 {
+		return b
+	}
+	return append(append([]byte(nil), b...), make([]byte, 4-len(b)%4)...)
 }
 
 // SameDevice reports whether two matrices are on the same device.

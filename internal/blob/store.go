@@ -476,6 +476,20 @@ func (s *Store) evict() {
 	}
 }
 
+// Room is the budget left for new blobs once every unpinned blob is
+// evicted: what can still be fetched and kept.
+func (s *Store) Room() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := s.maxBytes
+	for e := s.lru.Front(); e != nil; e = e.Next() {
+		if ent := e.Value.(*entry); ent.pins > 0 {
+			n -= ent.m.Size
+		}
+	}
+	return max(n, 0)
+}
+
 // Size is the bytes of chunks on disk.
 func (s *Store) Size() int64 {
 	s.mu.Lock()

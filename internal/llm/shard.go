@@ -8,6 +8,7 @@ import (
 	"math"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
 	"github.com/optimist3301/rakkan-mesh/internal/num"
 )
 
@@ -15,11 +16,13 @@ import (
 // and the tokenizer, listed by a manifest whose blob ID is the model's ID.
 // A pipeline stage fetches only its layers.
 
-// Manifest lists a model's parts.
+// Manifest lists a model's parts. Version 1 is a llama-like model,
+// described by Config; version 2 a model of another architecture (Arch),
+// described by its own config.
 type Manifest struct {
 	Version   int      `json:"v"`
 	Name      string   `json:"name,omitempty"`
-	Config    Config   `json:"config"`
+	Config    Config   `json:"config,omitzero"`
 	Embed     string   `json:"embed"`
 	Layers    []string `json:"layers"`
 	Head      string   `json:"head"`
@@ -36,6 +39,25 @@ type Manifest struct {
 	// Chat, for chat-tuned models, wraps a prompt in their conversation
 	// format when a generation asks for it.
 	Chat *ChatTemplate `json:"chat,omitempty"`
+
+	// Version 2. Arch "dsv41" is DeepSeek-V4.1 (package dsv41): ModelConfig
+	// is its config.json, Layers its blocks (safetensors), Head the
+	// embedding, final norm and classifier (safetensors), Tokenizer its
+	// tokenizer.json, and Engram, by layer, the Engram tables kept apart
+	// ("" for layers without).
+	Arch        string          `json:"arch,omitempty"`
+	ModelConfig json.RawMessage `json:"model_config,omitempty"`
+	Engram      []string        `json:"engram,omitempty"`
+	// Hub, instead of Layers, Head, Tokenizer and Engram, names the files of
+	// a Hugging Face repository the parts come from (hub.go).
+	Hub *HubOrigin `json:"hub,omitempty"`
+	// Draft is the DSpark draft model's blob (safetensors, mtp.*), if any.
+	Draft string `json:"draft,omitempty"`
+	// Vision is the image encoder's blob (safetensors: vision.*, aligner.*,
+	// image_*), if any.
+	Vision string `json:"vision,omitempty"`
+
+	ds *dsv41.Config
 }
 
 // ChatTemplate turns a user message into a prompt: Prefix, the message,
@@ -70,6 +92,9 @@ func ParseManifest(data []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("model manifest: %w", err)
+	}
+	if m.Version == 2 {
+		return parseManifestV2(&m)
 	}
 	if m.Version != 1 {
 		return nil, fmt.Errorf("model manifest version %d", m.Version)

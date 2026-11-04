@@ -22,6 +22,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
@@ -78,6 +80,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/trust", s.trust)
 	mux.HandleFunc("POST /v1/llm/models", s.importModel)
 	mux.HandleFunc("POST /v1/llm/generate", s.generate)
+	mux.HandleFunc("POST /v1/llm/prefetch", s.prefetch)
 	return mux
 }
 
@@ -480,7 +483,7 @@ func (s *Server) trust(w http.ResponseWriter, _ *http.Request) {
 // importRequest names uploaded blobs: a llama2.c checkpoint and tokenizer,
 // or, with format "hf", a Hugging Face model's files.
 type importRequest struct {
-	Format string `json:"format,omitempty"` // "llama2c" (default) or "hf"
+	Format string `json:"format,omitempty"` // "llama2c" (default), "hf" or "hub"
 	// Quant stores the matrices as "bf16", "q8_0", "q4_m" or "q4_0".
 	Quant      string `json:"quant,omitempty"`
 	Checkpoint string `json:"checkpoint,omitempty"`
@@ -493,6 +496,11 @@ type importRequest struct {
 	GenerationConfig string   `json:"generation_config,omitempty"`
 	TokenizerConfig  string   `json:"tokenizer_config,omitempty"`
 	Weights          []string `json:"weights,omitempty"`
+	// Hub: a DeepSeek-V4.1 repository on the Hugging Face Hub, at a
+	// revision (a commit, or a branch or tag resolved to one; default
+	// main). Nodes download the weights they serve.
+	Repo     string `json:"repo,omitempty"`
+	Revision string `json:"revision,omitempty"`
 }
 
 // importModel splits a llama2.c checkpoint into a model's blobs.
@@ -515,6 +523,16 @@ func (s *Server) importModel(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Format == "hf" {
 		s.importHF(w, req, read)
+		return
+	}
+	if req.Format == "hub" {
+		id, m, err := s.LLM.ImportHub(r.Context(), req.Repo, req.Revision, req.Name)
+		if err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.ModelConfig, "chat": true,
+			"repo": m.Hub.Repo, "revision": m.Hub.Revision})
 		return
 	}
 	ckData, err := read(req.Checkpoint)
@@ -588,6 +606,19 @@ func (s *Server) importHF(w http.ResponseWriter, req importRequest, read func(st
 		defer r.Close()
 		src.Weights = append(src.Weights, r)
 	}
+	if llm.IsDeepSeek(src.Config) {
+		if req.Quant != "" {
+			badRequest(w, "DeepSeek-V4.1 keeps its own quantization")
+			return
+		}
+		id, m, err := llm.ImportDeepSeek(s.Blobs, src, req.Name)
+		if err != nil {
+			badRequest(w, "%v", err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.ModelConfig, "chat": true})
+		return
+	}
 	id, m, err := llm.ImportHF(s.Blobs, src, req.Name)
 	if err != nil {
 		badRequest(w, "%v", err)
@@ -604,6 +635,29 @@ type generateRequest struct {
 	Temperature float32 `json:"temperature,omitempty"`
 	Seed        uint64  `json:"seed,omitempty"`
 	Stages      int     `json:"stages,omitempty"`
+	// Draft has DeepSeek-V4.1's draft model propose tokens: the same text,
+	// fewer passes through the stages.
+	Draft bool `json:"draft,omitempty"`
+	// Images are PNG files, base64 or data: URLs, for a model with an image
+	// encoder; a node fetches nothing by URL.
+	Images []string `json:"images,omitempty"`
+}
+
+// maxGenerateBody bounds a generation request: its prompt and images.
+const maxGenerateBody = 64 << 20
+
+// decodeImage reads an image of a request: base64, or a base64 data: URL.
+func decodeImage(s string) ([]byte, error) {
+	if rest, ok := strings.CutPrefix(s, "data:"); ok {
+		header, payload, found := strings.Cut(rest, ",")
+		if !found || !strings.HasSuffix(header, ";base64") {
+			return nil, errors.New("image: a data: URL must be base64")
+		}
+		s = payload
+	} else if strings.Contains(s, "://") {
+		return nil, errors.New("image: give the bytes, not a URL")
+	}
+	return base64.StdEncoding.DecodeString(s)
 }
 
 // generate streams a generation's tokens as NDJSON, then its statistics.
@@ -613,7 +667,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req generateRequest
-	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxGenerateBody)).Decode(&req); err != nil {
 		badRequest(w, "%v", err)
 		return
 	}
@@ -622,12 +676,26 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "%v", err)
 		return
 	}
+	if len(req.Images) > llm.MaxImages {
+		badRequest(w, "%d images, at most %d", len(req.Images), llm.MaxImages)
+		return
+	}
+	var images [][]byte
+	for i, s := range req.Images {
+		b, err := decodeImage(s)
+		if err != nil {
+			badRequest(w, "image %d: %v", i+1, err)
+			return
+		}
+		images = append(images, b)
+	}
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
-		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat,
+		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat, Draft: req.Draft,
+		Images: images,
 	}, func(e llm.Event) error {
 		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {
 			return err
@@ -659,6 +727,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 		"elapsed_ms":   stats.Elapsed.Milliseconds(),
 		"tokens_per_s": float64(stats.Tokens) / stats.Elapsed.Seconds(),
 		"stages":       stages, "failovers": stats.Failovers, "caught": stats.Caught,
+		"passes": stats.Passes, "drafted": stats.Drafted, "accepted": stats.Accepted,
 	}})
 }
 
@@ -675,4 +744,36 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 		return err
 	}
 	return nil
+}
+
+type prefetchRequest struct {
+	Model string `json:"model"`
+	From  int    `json:"from,omitempty"`
+	To    int    `json:"to,omitempty"`
+}
+
+// prefetch gets this node the files of a Hub model's layers [from, to)
+// (all by default) ahead of serving them; it answers when they are here,
+// and the downloads go on if the request ends first.
+func (s *Server) prefetch(w http.ResponseWriter, r *http.Request) {
+	if s.LLM == nil {
+		badRequest(w, "language models are not enabled on this node")
+		return
+	}
+	var req prefetchRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	id, err := blob.ParseID(req.Model)
+	if err != nil {
+		badRequest(w, "model: %v", err)
+		return
+	}
+	n, err := s.LLM.Prefetch(r.Context(), id, req.From, req.To)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"model": req.Model, "bytes": n})
 }

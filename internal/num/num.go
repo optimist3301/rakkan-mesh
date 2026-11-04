@@ -122,6 +122,114 @@ func Exp(x float64) float64 {
 	return math.Ldexp(p, int(n))
 }
 
+// Log is the natural logarithm, accurate to about 1 ulp: fdlibm's method,
+// as in Go's math package, with every product rounded (math.Log is
+// assembly on amd64 and fusable compiled code elsewhere).
+func Log(x float64) float64 {
+	const (
+		ln2Hi = 6.93147180369123816490e-01
+		ln2Lo = 1.90821492927058770002e-10
+		l1    = 6.666666666666735130e-01
+		l2    = 3.999999999940941908e-01
+		l3    = 2.857142874366239149e-01
+		l4    = 2.222219843214978396e-01
+		l5    = 1.818357216161805012e-01
+		l6    = 1.531383769920937332e-01
+		l7    = 1.479819860511658591e-01
+	)
+	switch {
+	case x != x || math.IsInf(x, 1):
+		return x
+	case x < 0:
+		return math.NaN()
+	case x == 0:
+		return math.Inf(-1)
+	}
+	f1, ki := math.Frexp(x)
+	if f1 < math.Sqrt2/2 {
+		f1 *= 2
+		ki--
+	}
+	f := f1 - 1
+	k := float64(ki)
+	s := f / (2 + f)
+	s2 := float64(s * s)
+	s4 := float64(s2 * s2)
+	t1 := float64(s2 * (l1 + float64(s4*(l3+float64(s4*(l5+float64(s4*l7)))))))
+	t2 := float64(s4 * (l2 + float64(s4*(l4+float64(s4*l6)))))
+	r := t1 + t2
+	hfsq := float64(float64(0.5*f) * f)
+	return float64(k*ln2Hi) - ((hfsq - (float64(s*(hfsq+r)) + float64(k*ln2Lo))) - f)
+}
+
+// Log32 is log(x) in float32 for positive finite x, accurate to about 1
+// ulp: fdlibm's logf, every product rounded, with only operations a GPU
+// reproduces exactly (correctly rounded additions, multiplications and
+// division, and exponent arithmetic).
+func Log32(x float32) float32 {
+	const (
+		ln2Hi = 6.9313812256e-01 // ln2 to 16 bits, so k*ln2Hi is exact
+		ln2Lo = 9.0580006145e-06
+		lg1   = 6.6666662693e-01
+		lg2   = 4.0000972152e-01
+		lg3   = 2.8498786688e-01
+		lg4   = 2.4279078841e-01
+	)
+	switch {
+	case x != x || math.IsInf(float64(x), 1):
+		return x
+	case x < 0:
+		return CanonicalNaN32
+	case x == 0:
+		return float32(math.Inf(-1))
+	}
+	b := math.Float32bits(x)
+	ki := int32(b>>23) - 127
+	if b>>23 == 0 { // denormal: scale to normal
+		b = math.Float32bits(x * (1 << 24))
+		ki = int32(b>>23) - 127 - 24
+	}
+	f1 := math.Float32frombits(b&0x7fffff | 127<<23) // in [1, 2)
+	if f1 > math.Sqrt2 {
+		f1 = float32(f1 * 0.5)
+		ki++
+	}
+	f := f1 - 1
+	k := float32(ki)
+	s := f / (2 + f)
+	z := float32(s * s)
+	w := float32(z * z)
+	t1 := float32(w * (lg2 + float32(w*lg4)))
+	t2 := float32(z * (lg1 + float32(w*lg3)))
+	r := t2 + t1
+	hfsq := float32(float32(0.5*f) * f)
+	return float32(k*ln2Hi) - ((hfsq - (float32(s*(hfsq+r)) + float32(k*ln2Lo))) - f)
+}
+
+// Log1p32 is log(1+x) in float32 for x >= 0: Log32(1+x), plus the
+// rounding error of 1+x divided by it (fdlibm's log1pf correction).
+func Log1p32(x float32) float32 {
+	u := 1 + x
+	if u == 1 {
+		return x
+	}
+	if math.IsInf(float64(u), 1) {
+		return u
+	}
+	c := (x - (u - 1)) / u // exact numerator: the rounding error of 1+x
+	return Log32(u) + c
+}
+
+// Log1p is log(1+x), accurate to about 1 ulp.
+func Log1p(x float64) float64 {
+	u := 1 + x
+	if u == 1 {
+		return x
+	}
+	// log(u) corrected for the rounding of 1+x (Goldberg's trick).
+	return float64(Log(u)*x) / (u - 1)
+}
+
 func factorial(k int) float64 {
 	f := 1.0
 	for i := 2; i <= k; i++ {

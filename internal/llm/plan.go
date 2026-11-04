@@ -19,10 +19,20 @@ import (
 
 // stageNode is a node able to serve stages, as the planner sees it.
 type stageNode struct {
-	id     peer.ID
-	speed  float64 // GB/s of weights
-	layers int     // how many of the model's layers fit, for this generation
-	free   int64   // memory, to break ties
+	id    peer.ID
+	speed float64 // GB/s of weights
+	// fit reports whether layers [from, to) fit the node for this
+	// generation; without it, layers is how many do.
+	fit    func(from, to int) bool
+	layers int
+	free   int64 // memory, to break ties
+}
+
+func (n stageNode) fits(from, to int) bool {
+	if n.fit != nil {
+		return n.fit(from, to)
+	}
+	return to-from <= n.layers
 }
 
 // span is a range of layers assigned to a node.
@@ -31,25 +41,63 @@ type span struct {
 	node     peer.ID
 }
 
-// fits returns how many layers of a model a node can hold for a
-// generation of positions: weights and caches share its memory (its GPU's,
-// if it has one) unless it advertises memory for caches apart. Layers of
-// the model it has loaded already cost only caches.
-func fits(a advert, model string, c Config, positions int) int {
-	lb, cb := LayerBytes(c), CacheBytes(c, 1, positions)
-	loaded := 0
-	for _, sh := range a.Shards {
-		if sh.Model == model {
-			loaded += sh.To - sh.From
+// shape is what planning and accounting need to know of a model's layers,
+// which need not be alike: DeepSeek-V4.1's differ in their attention and
+// Engram, and a token reads only some of their experts.
+type shape interface {
+	numLayers() int
+	// layerBytes is the memory layer i takes loaded, diskBytes what of it
+	// stays on disk, readBytes what a token reads of it: what a node's
+	// speed is measured against.
+	layerBytes(i int) int64
+	diskBytes(i int) int64
+	readBytes(i int) int64
+	// hostBytes is what of layer i a GPU node may keep in RAM, run on its
+	// CPU (DeepSeek's routed experts); 0 if the layer runs whole.
+	hostBytes(i int) int64
+	// cacheBytes is the memory of a stage's caches for positions.
+	cacheBytes(from, to, positions int) int64
+	// gas prices a forward of tokens through layers [from, to).
+	gas(from, to, tokens int) int64
+	// payloadBytes bounds what passes between stages for tokens.
+	payloadBytes(tokens int) int
+	// sizes splits what passes between stages for n positions into theirs.
+	sizes(b []byte, n int) ([]int, error)
+}
+
+// nodeFit tells which layer ranges of a model a node can hold for a
+// generation of positions: weights and caches share its memory (its
+// GPU's, if it has one) unless it advertises memory for caches apart.
+// Layers of the model it has loaded already cost only caches.
+func nodeFit(a advert, model string, sh shape, positions int) func(from, to int) bool {
+	var loaded []Shard
+	for _, s := range a.Shards {
+		if s.Model == model {
+			loaded = append(loaded, s)
 		}
 	}
-	var n int64
-	if a.FreeCache > 0 {
-		n = min(a.FreeMem/lb+int64(loaded), a.FreeCache/max(cb, 1))
-	} else {
-		n = (a.FreeMem + int64(loaded)*lb) / (lb + cb)
+	return func(from, to int) bool {
+		var weights, disk, host int64
+		for i := from; i < to; i++ {
+			if !slices.ContainsFunc(loaded, func(s Shard) bool { return s.From <= i && i < s.To }) {
+				weights += sh.layerBytes(i)
+				disk += sh.diskBytes(i)
+				host += sh.hostBytes(i)
+			}
+		}
+		cache := sh.cacheBytes(from, to, positions)
+		if disk > 0 && disk > a.FreeDisk {
+			return false
+		}
+		if a.FreeCache > 0 {
+			return weights <= a.FreeMem && cache <= a.FreeCache
+		}
+		if weights+cache <= a.FreeMem {
+			return true
+		}
+		// On a GPU node, the experts in RAM beside the rest on the GPU.
+		return a.Device != "" && host > 0 && weights-host+cache <= a.FreeMem && host <= a.FreeHost
 	}
-	return int(max(min(n, int64(c.Layers)), 0))
 }
 
 func sortNodes(nodes []stageNode) {
@@ -64,82 +112,110 @@ func sortNodes(nodes []stageNode) {
 	})
 }
 
-// planStages assigns a model's layers to nodes. With stages <= 0 the
-// fastest nodes take as many layers as fit, which minimizes both compute
-// time and hops. With stages > 0 the layers are spread over that many of
-// the fastest nodes (fewer if there are fewer nodes or layers): a layer
-// each, then the rest in proportion to their speed within what each holds,
-// each layer going to the node whose stage would then finish soonest.
-func planStages(layers int, nodes []stageNode, stages int) ([]span, error) {
-	nodes = slices.DeleteFunc(slices.Clone(nodes), func(n stageNode) bool { return n.layers <= 0 })
+// planStages assigns a model's layers, which cost[i] bytes each of reading
+// per token, to nodes. With stages <= 0 the fastest nodes take as many
+// layers as fit, which minimizes both compute time and hops. With stages >
+// 0 the layers are spread over that many of the fastest nodes (fewer if
+// there are fewer nodes or layers), a layer at least each, so that the
+// slowest stage is as quick as can be: the stages of a token run one
+// after another, but those of a prompt's tokens overlap.
+func planStages(cost []int64, nodes []stageNode, stages int) ([]span, error) {
+	layers := len(cost)
+	nodes = slices.DeleteFunc(slices.Clone(nodes), func(n stageNode) bool {
+		for i := range layers {
+			if n.fits(i, i+1) {
+				return false
+			}
+		}
+		return true
+	})
 	sortNodes(nodes)
-	total := 0
-	for _, n := range nodes {
-		total += n.layers
-	}
-	var counts []int
-	if stages <= 0 {
-		left := layers
-		for _, n := range nodes {
-			k := min(n.layers, left)
-			counts = append(counts, k)
-			left -= k
+	// longest is how many layers from at a node takes, at most most.
+	longest := func(n stageNode, at, most int) int {
+		k := 0
+		for k < most && n.fits(at, at+k+1) {
+			k++
 		}
-		if left > 0 {
-			return nil, fmt.Errorf("%w: the model has %d layers, nodes serving stages hold %d", ErrNoStages, layers, total)
-		}
-	} else {
-		nodes = nodes[:min(stages, len(nodes), layers)]
-		counts = make([]int, len(nodes))
-		// Each stage asked for gets a layer; the rest go by speed.
-		for i := range counts {
-			counts[i] = 1
-		}
-		for range layers - len(nodes) {
-			best := -1
-			var bestT float64
-			for i, n := range nodes {
-				if counts[i] >= n.layers {
-					continue
-				}
-				t := float64(counts[i]+1) / max(n.speed, 1e-9)
-				if best < 0 || t < bestT {
-					best, bestT = i, t
-				}
-			}
-			if best < 0 {
-				held := 0
-				for _, n := range nodes {
-					held += n.layers
-				}
-				return nil, fmt.Errorf("%w: the model has %d layers, the %d fastest nodes hold %d", ErrNoStages, layers, len(nodes), held)
-			}
-			counts[best]++
-		}
+		return k
 	}
 	var out []span
-	at := 0
-	for i, k := range counts {
-		if k > 0 {
-			out = append(out, span{at, at + k, nodes[i].id})
-			at += k
+	if stages <= 0 {
+		at := 0
+		for _, n := range nodes {
+			if at == layers {
+				break
+			}
+			if k := longest(n, at, layers-at); k > 0 {
+				out = append(out, span{at, at + k, n.id})
+				at += k
+			}
 		}
+		if at < layers || len(out) == 0 {
+			return nil, fmt.Errorf("%w: the model has %d layers, nodes serving stages hold %d", ErrNoStages, layers, at)
+		}
+		return out, nil
 	}
-	if len(out) == 0 {
+	nodes = nodes[:min(stages, len(nodes), layers)]
+	if len(nodes) == 0 {
 		return nil, ErrNoStages
 	}
-	return out, nil
+	// The quickest bound on a stage's time for which the layers can be
+	// cut, in node order, into stages within it.
+	sum := make([]int64, layers+1)
+	for i, c := range cost {
+		sum[i+1] = sum[i] + c
+	}
+	cut := func(bound float64) []span {
+		var out []span
+		at := 0
+		for j, n := range nodes {
+			left := len(nodes) - j - 1 // each later node needs a layer
+			k := 0
+			for at+k < layers-left && n.fits(at, at+k+1) && float64(sum[at+k+1]-sum[at])/max(n.speed, 1e-9) <= bound {
+				k++
+			}
+			if k == 0 {
+				return nil
+			}
+			out = append(out, span{at, at + k, n.id})
+			at += k
+		}
+		if at < layers {
+			return nil
+		}
+		return out
+	}
+	var bounds []float64
+	for _, n := range nodes {
+		for i := range layers {
+			for j := i + 1; j <= layers; j++ {
+				bounds = append(bounds, float64(sum[j]-sum[i])/max(n.speed, 1e-9))
+			}
+		}
+	}
+	slices.Sort(bounds)
+	bounds = slices.Compact(bounds)
+	i, _ := slices.BinarySearchFunc(bounds, true, func(b float64, _ bool) int {
+		if cut(b) != nil {
+			return 1
+		}
+		return -1
+	})
+	if i == len(bounds) {
+		return nil, fmt.Errorf("%w: the model's %d layers do not fit the %d fastest nodes", ErrNoStages, layers, len(nodes))
+	}
+	return cut(bounds[i]), nil
 }
 
 // stageNodes lists the nodes able to serve a model's stages: members
 // advertising so, and this node if it serves.
-func (s *Service) stageNodes(model string, c Config, positions int, exclude map[peer.ID]bool) []stageNode {
+func (s *Service) stageNodes(model string, sh shape, positions int, exclude map[peer.ID]bool) []stageNode {
 	var out []stageNode
 	add := func(p peer.ID, a advert) {
 		if exclude[p] || s.cfg.Trust != nil && s.cfg.Trust.Suspect(p) {
 			return
 		}
-		out = append(out, stageNode{id: p, speed: a.Speed, layers: fits(a, model, c, positions), free: a.FreeMem})
+		out = append(out, stageNode{id: p, speed: a.Speed, fit: nodeFit(a, model, sh, positions), free: a.FreeMem})
 	}
 	for p, a := range s.servers() {
 		add(p, a)

@@ -82,6 +82,7 @@ type nodeOpts struct {
 	dev          *gpu.Device
 	devBytes     int64
 	speed        float64
+	hub          *Hub
 }
 
 func (c *cluster) addOpts(o nodeOpts) *llmNode {
@@ -117,7 +118,7 @@ func (c *cluster) addOpts(o nodeOpts) *llmNode {
 		}
 	}
 	if n.llm, err = NewService(ServiceConfig{Node: node, Blobs: n.blobs, Serve: serve, MemoryBytes: mem, Trust: n.trust,
-		Device: o.dev, DeviceBytes: o.devBytes, Speed: o.speed}); err != nil {
+		Device: o.dev, DeviceBytes: o.devBytes, Speed: o.speed, Hub: o.hub, DataDir: t.TempDir()}); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { n.close() })
@@ -357,9 +358,9 @@ func TestGuestStageIsWitnessed(t *testing.T) {
 	// Once cheating, the guest corrupts one activation on its 6th forward.
 	var cheating atomic.Bool
 	var forwards atomic.Int64
-	guest.llm.tamper = func(_ Shard, xs []float32) {
+	guest.llm.tamper = func(_ Shard, out []byte) {
 		if cheating.Load() && forwards.Add(1) == 6 {
-			xs[0] += 1e-6
+			out[0] ^= 1 // the lowest bit of the first activation
 		}
 	}
 

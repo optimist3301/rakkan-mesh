@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -63,6 +64,7 @@ func daemonCmd(args []string) int {
 	llmMemGB := flags.Float64("llm-mem-gb", 4, "memory for model weights and caches served to the network, in GiB; with a GPU, for caches only")
 	gpuFlag := flags.String("gpu", "auto", `GPU for language models: "auto" (the best exact one), "off", a device index, or "list" to show them`)
 	gpuMemGB := flags.Float64("gpu-mem-gb", 0, "GPU memory for model weights, in GiB (default: 85% of the device's)")
+	hubURL := flags.String("hub", "https://huggingface.co", `Hugging Face Hub for models imported from it ("hub" format); empty: only from members (HF_TOKEN authorizes gated repositories)`)
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
@@ -209,8 +211,20 @@ func daemonCmd(args []string) int {
 	if dev != nil {
 		defer dev.Close()
 	}
+	if *serveLLM && os.Getenv("GOMEMLIMIT") == "" {
+		// Model layers are large (DeepSeek-V4.1's are 7 GiB a blob), and by
+		// default Go lets the heap grow to twice what is live before it
+		// collects: one layer let go and the next loaded could hold both.
+		// The budget plus room for the rest bounds it.
+		debug.SetMemoryLimit(int64(*llmMemGB*(1<<30)) + 2<<30)
+	}
+	var hub *llm.Hub
+	if *hubURL != "" {
+		hub = &llm.Hub{Endpoint: *hubURL, Token: os.Getenv("HF_TOKEN")}
+	}
 	lm, err := llm.NewService(llm.ServiceConfig{Node: node, Blobs: blobs, Serve: *serveLLM,
-		MemoryBytes: int64(*llmMemGB * (1 << 30)), Device: dev, DeviceBytes: int64(*gpuMemGB * (1 << 30)), Trust: tr, Logger: cfg.Logger})
+		MemoryBytes: int64(*llmMemGB * (1 << 30)), Device: dev, DeviceBytes: int64(*gpuMemGB * (1 << 30)), Trust: tr, Logger: cfg.Logger,
+		Hub: hub, DataDir: *dataDir})
 	if err != nil {
 		return fail(err)
 	}
