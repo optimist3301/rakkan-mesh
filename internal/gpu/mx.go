@@ -1,5 +1,7 @@
 package gpu
 
+import "math"
+
 // Kernels of DeepSeek-V4.1's block-scaled products (package num, mx.go):
 // the input quantized to E4M3 with a power-of-two scale per 32 values
 // (num.QuantizeActFP8), and products with E4M3 weights scaled per 32×32
@@ -196,6 +198,7 @@ func mxKernelIndexed(modes floatModes) []uint32 { return mxKernelGen(kindFP4, mo
 func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 	k := newKernel(modes, laneCount, 2)
 	w, ws := k.storageBuffer(0, true), k.storageBuffer(1, true)
+	lut := k.mxTable(kind, 2*laneCount)
 	terms := k.workgroupFloats(laneCount * 2 * mxRows)
 	acc, chunk := k.local(k.tF32), k.local(k.tU32)
 	var term [mxRows]id
@@ -244,7 +247,7 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 				for q := range uint32(mxRows) {
 					row := k.iadd(base, k.u32(q))
 					k.ifThen(k.ult(row, rows), func() {
-						k.store(term[q], k.mxBlock(kind, w, ws, k.iadd(rowOff, row), cols, nb, blk, xs, xsc))
+						k.store(term[q], k.mxBlock(kind, w, ws, k.iadd(rowOff, row), cols, nb, blk, xs, xsc, lut))
 					})
 				}
 			})
@@ -277,21 +280,82 @@ func mxKernelGen(kind kernelKind, modes floatModes, indexed bool) []uint32 {
 
 // mxBlock is block blk's term of a row: its exact sum rounded to
 // float32, times the input's scale xsc, times the weight's.
-func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []id, xsc id) id {
-	var sum id
+// mxTable fills a table in shared memory of every code's value (E4M3 for
+// FP8, E2M1 for FP4), the values e4m3F and e2m1F compute, by a
+// workgroup's threads threads.
+func (k *kbuilder) mxTable(kind kernelKind, threads uint32) id {
+	n := uint32(256)
+	if kind != kindFP8 {
+		n = 16
+	}
+	lut := k.workgroupFloats(n)
+	lid, _ := k.ids()
+	tid := k.iadd(k.imul(k.component(lid, 1), k.u32(laneCount)), k.component(lid, 0))
+	k.forRange(tid, k.u32(n), k.u32(threads), func(c id) {
+		if kind == kindFP8 {
+			k.store(k.shared(lut, c), k.e4m3F(c))
+		} else {
+			k.store(k.shared(lut, c), k.e2m1F(c))
+		}
+	})
+	k.barrier()
+	return lut
+}
+
+func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []id, xsc, lut id) id {
+	wv, wsc := k.mxWeights(kind, w, ws, row, cols, nb, blk, lut)
+	return k.mxSum(kind, wv, wsc, xv, xsc)
+}
+
+// mxWeights decodes a block of 32 of a row's weights, and its scale.
+func (k *kbuilder) mxWeights(kind kernelKind, w, ws, row, cols, nb, blk, lut id) ([]id, id) {
+	wv := make([]id, 32)
 	if kind == kindFP8 {
-		b0, b1, b2 := k.f32(0), k.f32(0), k.f32(0)
 		wbase := k.shr(k.iadd(k.imul(row, cols), k.imul(blk, k.u32(32))), k.u32(2))
 		for i := range uint32(8) {
 			ww := k.word(w, k.iadd(wbase, k.u32(i)))
 			for j := range uint32(4) {
-				p := k.fmul(k.e4m3F(k.and(k.shr(ww, k.u32(8*j)), k.u32(0xff))), xv[4*i+j])
-				a := k.toF(k.and(k.toU(p), k.u32(0x7fffffff)))
-				small, large := k.flt(a, k.f32(1.0/64)), k.lor(k.flt(k.f32(64), a), k.feq(a, k.f32(64)))
-				b0 = k.fadd(b0, k.selF(small, p, k.f32(0)))
-				b2 = k.fadd(b2, k.selF(large, p, k.f32(0)))
-				b1 = k.fadd(b1, k.selF(k.lor(small, large), k.f32(0), p))
+				wv[4*i+j] = k.load(k.tF32, k.shared(lut, k.and(k.shr(ww, k.u32(8*j)), k.u32(0xff))))
 			}
+		}
+	} else {
+		wbase := k.shr(k.iadd(k.imul(row, k.shr(cols, k.u32(1))), k.imul(blk, k.u32(16))), k.u32(2))
+		for i := range uint32(4) {
+			ww := k.word(w, k.iadd(wbase, k.u32(i)))
+			for j := range uint32(4) {
+				e := 2 * (4*i + j) // the low nibble's element; the high one's is e+1
+				for h := range uint32(2) {
+					wv[e+h] = k.load(k.tF32, k.shared(lut, k.and(k.shr(ww, k.u32(8*j+4*h)), k.u32(15))))
+				}
+			}
+		}
+	}
+	var sidx id
+	if kind == kindFP8 {
+		sidx = k.iadd(k.imul(k.shr(row, k.u32(5)), nb), blk)
+	} else {
+		sidx = k.iadd(k.imul(row, nb), blk)
+	}
+	sbyte := k.and(k.shr(k.word(ws, k.shr(sidx, k.u32(2))), k.imul(k.and(sidx, k.u32(3)), k.u32(8))), k.u32(0xff))
+	return wv, k.e8m0(sbyte)
+}
+
+// mxSum is a block's term: the exact sum of its 32 products in float32
+// buckets and integers, times the input's scale and the weights'.
+func (k *kbuilder) mxSum(kind kernelKind, wv []id, wsc id, xv []id, xsc id) id {
+	var sum id
+	// Magnitudes compare as their bits do: |p| < 2^-6, |p| < 64.
+	below := func(p id, limit float32) id {
+		return k.ult(k.and(k.toU(p), k.u32(0x7fffffff)), k.u32(math.Float32bits(limit)))
+	}
+	if kind == kindFP8 {
+		b0, b1, b2 := k.f32(0), k.f32(0), k.f32(0)
+		for e := range 32 {
+			p := k.fmul(wv[e], xv[e])
+			small, mid := below(p, 1.0/64), below(p, 64)
+			b0 = k.fadd(b0, k.selF(small, p, k.f32(0)))
+			b2 = k.fadd(b2, k.selF(mid, k.f32(0), p))
+			b1 = k.fadd(b1, k.selF(small, k.f32(0), k.selF(mid, p, k.f32(0))))
 		}
 		// In units of 2^-18: i0 + i1·2^5 + i2·2^17.
 		i0 := k.fToI(k.fmul(b0, k.f32(1<<18)))
@@ -302,19 +366,11 @@ func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []i
 		sum = k.intToF(hi, lo, 18)
 	} else {
 		b0, b1 := k.f32(0), k.f32(0)
-		wbase := k.shr(k.iadd(k.imul(row, k.shr(cols, k.u32(1))), k.imul(blk, k.u32(16))), k.u32(2))
-		for i := range uint32(4) {
-			ww := k.word(w, k.iadd(wbase, k.u32(i)))
-			for j := range uint32(4) {
-				e := 2 * (4*i + j) // the low nibble's element; the high one's is e+1
-				for h := range uint32(2) {
-					p := k.fmul(k.e2m1F(k.and(k.shr(ww, k.u32(8*j+4*h)), k.u32(15))), xv[e+h])
-					a := k.toF(k.and(k.toU(p), k.u32(0x7fffffff)))
-					large := k.lor(k.flt(k.f32(4), a), k.feq(a, k.f32(4)))
-					b0 = k.fadd(b0, k.selF(large, k.f32(0), p))
-					b1 = k.fadd(b1, k.selF(large, p, k.f32(0)))
-				}
-			}
+		for e := range 32 {
+			p := k.fmul(wv[e], xv[e])
+			small := below(p, 4)
+			b0 = k.fadd(b0, k.selF(small, p, k.f32(0)))
+			b1 = k.fadd(b1, k.selF(small, k.f32(0), p))
 		}
 		// In units of 2^-10: i0 + i1·2^7.
 		i0 := k.fToI(k.fmul(b0, k.f32(1<<10)))
@@ -323,14 +379,7 @@ func (k *kbuilder) mxBlock(kind kernelKind, w, ws, row, cols, nb, blk id, xv []i
 		lo := k.iaddS(i0, k.toI(k.shl(k.and(k.toU(i1), k.u32(0x1ff)), k.u32(7))))
 		sum = k.intToF(hi, lo, 10)
 	}
-	var sidx id
-	if kind == kindFP8 {
-		sidx = k.iadd(k.imul(k.shr(row, k.u32(5)), nb), blk)
-	} else {
-		sidx = k.iadd(k.imul(row, nb), blk)
-	}
-	sbyte := k.and(k.shr(k.word(ws, k.shr(sidx, k.u32(2))), k.imul(k.and(sidx, k.u32(3)), k.u32(8))), k.u32(0xff))
-	return k.fmul(k.fmul(sum, xsc), k.e8m0(sbyte))
+	return k.fmul(k.fmul(sum, xsc), wsc)
 }
 
 // mxBatchMax is how many inputs mxBatchKernel multiplies at once: its
@@ -346,6 +395,7 @@ const mxBatchMax = laneCount / mxRows
 func mxBatchKernel(kind kernelKind, modes floatModes) []uint32 {
 	k := newKernel(modes, laneCount, 2)
 	w, ws := k.storageBuffer(0, true), k.storageBuffer(1, true)
+	lut := k.mxTable(kind, 2*laneCount)
 	terms := k.workgroupFloats(laneCount * 2 * mxRows * mxBatchMax)
 	acc, chunk := k.local(k.tF32), k.local(k.tU32)
 	lid, wid := k.ids()
@@ -367,30 +417,28 @@ func mxBatchKernel(kind kernelKind, modes floatModes) []uint32 {
 	k.loop(func() id { return k.ult(k.load(k.tU32, chunk), chunks) }, func() {
 		c := k.load(k.tU32, chunk)
 		blk := k.iadd(k.imul(c, k.u32(laneCount)), lane)
-		k.forRange(k.u32(0), nIn, k.u32(1), func(j id) {
-			term := make([]id, mxRows)
-			for q := range term {
-				term[q] = k.local(k.tF32)
-				k.store(term[q], k.f32(0))
-			}
-			k.ifThen(k.land(k.ult(base, rows), k.ult(blk, nb)), func() {
-				xbase := k.iadd(k.iadd(qxOff, k.imul(j, qxStride)), k.imul(blk, k.u32(32)))
-				xs := make([]id, 32)
-				for e := range xs {
-					xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
-				}
-				xsc := k.get(k.at(k.iadd(xsOff, k.imul(j, xsStride)), blk))
-				for q := range uint32(mxRows) {
-					row := k.iadd(base, k.u32(q))
-					k.ifThen(k.ult(row, rows), func() {
-						k.store(term[q], k.mxBlock(kind, w, ws, row, cols, nb, blk, xs, xsc))
-					})
-				}
+		// Each row's block of weights decoded once, for all the inputs.
+		for q := range uint32(mxRows) {
+			row := k.iadd(base, k.u32(q))
+			ok := k.land(k.ult(row, rows), k.ult(blk, nb))
+			k.ifThen(ok, func() {
+				wv, wsc := k.mxWeights(kind, w, ws, row, cols, nb, blk, lut)
+				k.forRange(k.u32(0), nIn, k.u32(1), func(j id) {
+					xbase := k.iadd(k.iadd(qxOff, k.imul(j, qxStride)), k.imul(blk, k.u32(32)))
+					xs := make([]id, 32)
+					for e := range xs {
+						xs[e] = k.get(k.iadd(xbase, k.u32(uint32(e))))
+					}
+					xsc := k.get(k.at(k.iadd(xsOff, k.imul(j, xsStride)), blk))
+					k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.mxSum(kind, wv, wsc, xs, xsc))
+				})
 			})
-			for q := range uint32(mxRows) {
-				k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.load(k.tF32, term[q]))
-			}
-		})
+			k.ifThen(k.op(opLogicalNot, k.tBool, ok), func() {
+				k.forRange(k.u32(0), nIn, k.u32(1), func(j id) {
+					k.store(k.shared(terms, slot(j, k.u32(q), lane)), k.f32(0))
+				})
+			})
+		}
 		k.barrier()
 		k.ifThen(k.ult(myIn, nIn), func() {
 			first := k.imul(c, k.u32(laneCount))

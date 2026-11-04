@@ -195,9 +195,14 @@ const opConvertUToF = 112
 // splitSinkhorn. One workgroup of 32. Push mix, h, n (hc·dim), base,
 // scale, iters, eps, normEps, pre, post, comb.
 func hcSplitKernel(modes floatModes) []uint32 {
+	// Lane 0 reduces the norm; then lanes 0..15 own one element of the
+	// 4×4 comb each, every sum of a row or column computed by each of its
+	// lanes in the same order, so the matrix is the serial loop's.
 	const hc = 4
 	k := newKernel(modes, laneCount, 1)
 	sums32, sums8 := k.workgroupFloats(laneCount), k.workgroupFloats(8)
+	rs := k.workgroupFloats(1)
+	cs := k.workgroupFloats(hc * hc)
 	lid, _ := k.ids()
 	lane := k.component(lid, 0)
 	mixOff, h, n, base, scale, iters := k.p(0), k.p(1), k.p(2), k.p(3), k.p(4), k.p(5)
@@ -206,67 +211,70 @@ func hcSplitKernel(modes floatModes) []uint32 {
 	x := func(i id) id { return k.get(k.at(h, i)) }
 	k.store(k.shared(sums32, lane), k.laneDot(lane, n, x, x))
 	k.reduce32(lane, k.u32(0), sums32, sums8, func(v id) {
-		r := k.rsqrtDS(k.fadd(k.fdiv(v, k.op(opConvertUToF, k.tF32, n)), normEps))
-		mix := func(i int) id { return k.fmul(k.get(k.at(mixOff, k.u32(uint32(i)))), r) }
-		sc := func(i int) id { return k.get(k.at(scale, k.u32(uint32(i)))) }
-		bs := func(i int) id { return k.get(k.at(base, k.u32(uint32(i)))) }
-		for j := range hc {
-			pre := k.fadd(k.sigmoid(k.fadd(k.fmul(mix(j), sc(0)), bs(j))), eps)
-			post := k.fmul(k.f32(2), k.sigmoid(k.fadd(k.fmul(mix(hc+j), sc(1)), bs(hc+j))))
-			k.put(k.at(preOff, k.u32(uint32(j))), pre)
-			k.put(k.at(postOff, k.u32(uint32(j))), post)
-		}
-		var comb [hc * hc]id
-		for i := range comb {
-			comb[i] = k.local(k.tF32)
-			k.store(comb[i], k.fadd(k.fmul(mix(2*hc+i), sc(2)), bs(2*hc+i)))
-		}
-		at := func(j, c int) id { return comb[j*hc+c] }
-		ld := func(p id) id { return k.load(k.tF32, p) }
-		for j := range hc {
-			m := ld(at(j, 0))
-			for c := 1; c < hc; c++ {
-				m = k.gomax(m, ld(at(j, c)))
-			}
-			s := k.f32(0)
-			for c := range hc {
-				k.store(at(j, c), k.exp32(k.fsub(ld(at(j, c)), m)))
-				s = k.fadd(s, ld(at(j, c)))
-			}
-			for c := range hc {
-				k.store(at(j, c), k.fadd(k.fdiv(ld(at(j, c)), s), eps))
-			}
-		}
-		colNorm := func() {
-			for c := range hc {
-				s := k.f32(0)
-				for j := range hc {
-					s = k.fadd(s, ld(at(j, c)))
-				}
-				d := k.fadd(s, eps)
-				for j := range hc {
-					k.store(at(j, c), k.fdiv(ld(at(j, c)), d))
-				}
-			}
-		}
-		colNorm()
-		k.forRange(k.u32(1), iters, k.u32(1), func(id) {
-			for j := range hc {
-				s := k.f32(0)
-				for c := range hc {
-					s = k.fadd(s, ld(at(j, c)))
-				}
-				d := k.fadd(s, eps)
-				for c := range hc {
-					k.store(at(j, c), k.fdiv(ld(at(j, c)), d))
-				}
-			}
-			colNorm()
-		})
-		for i := range comb {
-			k.put(k.at(combOff, k.u32(uint32(i))), ld(comb[i]))
-		}
+		k.store(k.shared(rs, k.u32(0)), k.rsqrtDS(k.fadd(k.fdiv(v, k.op(opConvertUToF, k.tF32, n)), normEps)))
 	})
+	k.barrier()
+	r := k.load(k.tF32, k.shared(rs, k.u32(0)))
+	mix := func(i id) id { return k.fmul(k.get(k.at(mixOff, i)), r) }
+	sc := func(i int) id { return k.get(k.at(scale, k.u32(uint32(i)))) }
+	bs := func(i id) id { return k.get(k.at(base, i)) }
+	k.ifThen(k.ult(lane, k.u32(hc)), func() {
+		pre := k.fadd(k.sigmoid(k.fadd(k.fmul(mix(lane), sc(0)), bs(lane))), eps)
+		j := k.iadd(lane, k.u32(hc))
+		post := k.fmul(k.f32(2), k.sigmoid(k.fadd(k.fmul(mix(j), sc(1)), bs(j))))
+		k.put(k.at(preOff, lane), pre)
+		k.put(k.at(postOff, lane), post)
+	})
+	mine := k.ult(lane, k.u32(hc*hc))
+	row, col := k.floorDiv(lane, k.u32(hc)), k.umod(lane, k.u32(hc))
+	at := func(j, c id) id { return k.load(k.tF32, k.shared(cs, k.iadd(k.imul(j, k.u32(hc)), c))) }
+	set := func(v id) {
+		k.barrier()
+		k.ifThen(mine, func() { k.store(k.shared(cs, lane), v) })
+		k.barrier()
+	}
+	own := k.local(k.tF32)
+	k.ifThen(mine, func() {
+		i := k.iadd(lane, k.u32(2*hc))
+		k.store(own, k.fadd(k.fmul(mix(i), sc(2)), bs(i)))
+	})
+	set(k.load(k.tF32, own))
+	// The rows' softmax.
+	k.ifThen(mine, func() {
+		m := at(row, k.u32(0))
+		for c := 1; c < hc; c++ {
+			m = k.gomax(m, at(row, k.u32(uint32(c))))
+		}
+		var e [hc]id
+		s := k.f32(0)
+		for c := range e {
+			e[c] = k.exp32(k.fsub(at(row, k.u32(uint32(c))), m))
+			s = k.fadd(s, e[c])
+		}
+		mineE := k.exp32(k.fsub(at(row, col), m))
+		k.store(own, k.fadd(k.fdiv(mineE, s), eps))
+	})
+	set(k.load(k.tF32, own))
+	norm := func(byRow bool) {
+		k.ifThen(mine, func() {
+			s := k.f32(0)
+			for i := range uint32(hc) {
+				if byRow {
+					s = k.fadd(s, at(row, k.u32(i)))
+				} else {
+					s = k.fadd(s, at(k.u32(i), col))
+				}
+			}
+			k.store(own, k.fdiv(at(row, col), k.fadd(s, eps)))
+		})
+		set(k.load(k.tF32, own))
+	}
+	norm(false)
+	k.forRange(k.u32(1), iters, k.u32(1), func(id) {
+		norm(true)
+		norm(false)
+	})
+	k.ifThen(mine, func() { k.put(k.at(combOff, lane), at(row, col)) })
 	return k.finish()
 }
 

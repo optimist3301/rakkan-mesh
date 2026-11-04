@@ -186,6 +186,16 @@ func (b *Batch) MatVecsBatch(m *Matrix, out, outStride, in, inStride, n, qx, xs 
 		b.dispatch(kindActFP8, 0, groups(c/32, flatGroup), 1, uint32(c), uint32(in+j*inStride), uint32(qx+j*c), uint32(xs+j*c/32))
 	}
 	raw := b2w(m.unrounded)
+	if n == 1 {
+		// One input: the single-vector kernel, faster, the same sums.
+		for _, pt := range m.parts {
+			g := groups(pt.rows, groupRows(m.kind))
+			gx := min(g, 65535)
+			gy := groups(g, gx)
+			b.dispatch(m.kind, pt.set, gx, gy, uint32(pt.rows), uint32(c), uint32(gx), uint32(out+pt.row0), uint32(qx), uint32(xs), raw)
+		}
+		return
+	}
 	for j0 := 0; j0 < n; j0 += mxBatchMax {
 		nj := min(mxBatchMax, n-j0)
 		for _, pt := range m.parts {
