@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +15,8 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
+	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	"github.com/optimist3301/rakkan-mesh/internal/mldht"
 )
 
 func fail(err error) int {
@@ -55,6 +58,8 @@ func networkCmd(args []string) int {
 		return networkPolicy(args[1:], true)
 	case "close":
 		return networkPolicy(args[1:], false)
+	case "announce":
+		return networkAnnounce(args[1:])
 	}
 	fmt.Fprint(os.Stderr, usage)
 	return 2
@@ -274,5 +279,56 @@ func networkShow(args []string) int {
 		return fail(fmt.Errorf("%s: not a certificate, revocation list or policy", args[0]))
 	}
 	fmt.Printf("%s\n", body.Body)
+	return 0
+}
+
+// networkAnnounce signs the root's Mainline DHT record naming the
+// announcers, members whose addresses newcomers look up there, and stores
+// it. Members store it again from then on: run it again only to change
+// the announcers.
+func networkAnnounce(args []string) int {
+	flags := flag.NewFlagSet("network announce", flag.ExitOnError)
+	keyPath := flags.String("key", "root.key", "root key")
+	list := flags.String("announcers", "", "comma-separated peer IDs of members with public addresses, running with -mainline")
+	flags.Parse(args)
+	sk, err := membership.LoadKey(*keyPath)
+	if err != nil {
+		return fail(err)
+	}
+	rootID, err := peer.IDFromPrivateKey(sk)
+	if err != nil {
+		return fail(err)
+	}
+	n, err := membership.ParseNetwork(rootID.String())
+	if err != nil {
+		return fail(err)
+	}
+	var ids []peer.ID
+	for _, s := range strings.Split(*list, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		id, err := peer.Decode(s)
+		if err != nil {
+			return fail(fmt.Errorf("announcer %q: %w", s, err))
+		}
+		ids = append(ids, id)
+	}
+	item, err := mesh.SignBootstrapRecord(sk, n, ids, time.Now().Unix())
+	if err != nil {
+		return fail(err)
+	}
+	c, err := mldht.Listen(":0", mldht.DefaultBootstrap)
+	if err != nil {
+		return fail(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	stored, err := c.Put(ctx, item)
+	if err != nil {
+		return fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "the record naming %d announcers is on %d DHT nodes\n", len(ids), stored)
 	return 0
 }

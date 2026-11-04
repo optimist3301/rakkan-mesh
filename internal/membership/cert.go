@@ -77,6 +77,9 @@ func ParseNetwork(id string) (*Network, error) {
 	return &Network{ID: id, root: pub}, nil
 }
 
+// RootKey is the network's root public key.
+func (n *Network) RootKey() crypto.PubKey { return n.root }
+
 // NewRootKey creates the root key of a new network.
 func NewRootKey() (crypto.PrivKey, *Network, error) {
 	sk, _, err := crypto.GenerateEd25519Key(rand.Reader)

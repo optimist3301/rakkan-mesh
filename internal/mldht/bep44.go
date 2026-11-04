@@ -61,8 +61,7 @@ func (it *Item) Verify() error {
 }
 
 // Get finds the newest item of a key and salt that the nodes closest to
-// its target hold, verified, with at least minSeq. It returns the nodes'
-// answers too, for a Put after it.
+// its target hold, verified, with at least minSeq.
 func (c *Client) Get(ctx context.Context, key ed25519.PublicKey, salt []byte, minSeq int64) (*Item, error) {
 	it, _, err := c.get(ctx, key, salt, minSeq)
 	return it, err
@@ -106,6 +105,16 @@ func (c *Client) Put(ctx context.Context, it *Item) (int, error) {
 	if err := it.Verify(); err != nil {
 		return 0, err
 	}
+	// Nodes answer a lookup and then drop a put now and then: a second
+	// try, with a new lookup.
+	n, err := c.put(ctx, it)
+	if err != nil && ctx.Err() == nil {
+		n, err = c.put(ctx, it)
+	}
+	return n, err
+}
+
+func (c *Client) put(ctx context.Context, it *Item) (int, error) {
 	_, answers, err := c.get(ctx, it.Key, it.Salt, 0)
 	if err != nil && !errors.Is(err, ErrNotFound) {
 		return 0, err
