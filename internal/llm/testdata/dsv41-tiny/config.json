@@ -8,6 +8,19 @@
   "eos_token_id": 1,
   "pad_token_id": 2,
   "image_token_id": 511,
+  "vision_config": {
+    "model_type": "deepseek_v41_vision",
+    "num_hidden_layers": 2,
+    "hidden_size": 64,
+    "num_attention_heads": 4,
+    "intermediate_size": 96,
+    "patch_size": 4,
+    "rope_theta": 10000.0,
+    "downsample_ratio": 2,
+    "max_image_tokens": 24,
+    "min_pixels": 4096,
+    "max_wh_ratio": null
+  },
   "quantization_config": {
     "quant_method": "fp8",
     "activation_scheme": "dynamic",

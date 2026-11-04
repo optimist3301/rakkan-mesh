@@ -93,7 +93,16 @@ ARGS = dict(
     engram_n_heads=2,
     engram_head_dim=32,
     engram_pad_id=2,
-    vision_n_layers=0,
+    # vision: two blocks, 4-pixel patches merged 2x2, spans of at most 24
+    vision_n_layers=2,
+    vision_dim=64,
+    vision_n_heads=4,
+    vision_inter_dim=96,
+    vision_patch_size=4,
+    vision_rope_theta=10000.0,
+    vision_downsample_ratio=2,
+    vision_max_n_token=24,
+    vision_min_pixels=64 * 64,
     image_token_id=511,
     dspark_block_size=3,
     dspark_noise_token_id=500,
@@ -141,8 +150,8 @@ def quant_fp4_rows(w):
 
 
 class Gen:
-    def __init__(self):
-        self.g = torch.Generator().manual_seed(SEED)
+    def __init__(self, seed=SEED):
+        self.g = torch.Generator().manual_seed(seed)
 
     def normal(self, shape, std=1.0, mean=0.0):
         return torch.randn(shape, generator=self.g, dtype=torch.float32) * std + mean
@@ -155,13 +164,22 @@ def bf16(x):
     return x.to(torch.bfloat16)
 
 
+def is_vl(name):
+    """The image path's tensors: the vision tower, the aligner, the span
+    embeddings and the gates' image routing biases."""
+    return name.startswith(("vision.", "aligner.", "image_")) or name.endswith(".bias_vl")
+
+
 def build_checkpoint(model):
     """Random weights for every tensor of the published checkpoint, keyed
-    and typed as it stores them."""
+    and typed as it stores them. The image path's come last, from their own
+    generator, so the others are those of the text-only fixture."""
     gen = Gen()
     ckpt = {}
     params = dict(model.named_parameters(remove_duplicate=False))
     for name, p in params.items():
+        if is_vl(name):
+            continue
         if name.endswith(".scale") and name.replace(".scale", ".weight") in params:
             continue  # made with its weight
         if name.startswith("mtp.") and name.split(".", 2)[-1] in ("embed.weight", "head.weight"):
@@ -197,6 +215,23 @@ def build_checkpoint(model):
             ckpt[name] = bf16(gen.normal(shape, shape[1] ** -0.5))
         else:
             raise SystemExit(f"no initializer for {name} {p.dtype} {shape}")
+    gen = Gen(SEED + 2)
+    for name, p in params.items():
+        if not is_vl(name):
+            continue
+        shape = tuple(p.shape)
+        if name.endswith(".bias_vl"):
+            ckpt[name] = gen.normal(shape, 0.1)
+        elif "norm" in name:
+            ckpt[name] = bf16(gen.normal(shape, 0.1, 1.0))
+        elif name.startswith("image_"):
+            ckpt[name] = bf16(gen.normal(shape, 1.0))
+        elif name.endswith(".bias"):
+            ckpt[name] = bf16(gen.normal(shape, 0.1))
+        elif p.dim() == 2:
+            ckpt[name] = bf16(gen.normal(shape, shape[1] ** -0.5))
+        else:
+            raise SystemExit(f"no initializer for {name} {p.dtype} {shape}")
     return ckpt
 
 
@@ -211,6 +246,19 @@ def hf_config(args, engram_num_embeddings, compressed_vocab):
         "eos_token_id": 1,
         "pad_token_id": 2,
         "image_token_id": a.image_token_id,
+        "vision_config": {
+            "model_type": "deepseek_v41_vision",
+            "num_hidden_layers": a.vision_n_layers,
+            "hidden_size": a.vision_dim,
+            "num_attention_heads": a.vision_n_heads,
+            "intermediate_size": a.vision_inter_dim,
+            "patch_size": a.vision_patch_size,
+            "rope_theta": a.vision_rope_theta,
+            "downsample_ratio": a.vision_downsample_ratio,
+            "max_image_tokens": a.vision_max_n_token,
+            "min_pixels": a.vision_min_pixels,
+            "max_wh_ratio": a.vision_max_wh_ratio,
+        },
         "quantization_config": {
             "quant_method": "fp8",
             "activation_scheme": "dynamic",
@@ -430,8 +478,74 @@ def main():
     # The dump comes from the files just written, loaded as a user would.
     model, args = load(m, out_dir)
     golden = dump(model, m, args, fixture_tokens())
+    model, args = load(m, out_dir)  # caches anew
+    golden.update(dump_vl(model, m, args))
     save_file(golden, os.path.join(out_dir, "golden.safetensors"), metadata={"seed": str(SEED)})
     print(f"{len(ckpt)} checkpoint tensors, {len(golden)} golden tensors in {out_dir}")
+
+
+VL_DECODE_STEPS = 6
+
+
+def fixture_image():
+    """A seeded 30x17 PNG: scaled up to the minimum pixels, then down to
+    the span limit, so both of the planner's branches run."""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    g = torch.Generator().manual_seed(SEED + 3)
+    a = torch.randint(0, 256, (17, 30, 3), generator=g, dtype=torch.uint8).numpy()
+    y, x = np.mgrid[0:17, 0:30]
+    a[..., 0] = (x * 8).astype(np.uint8)  # some structure besides the noise
+    buf = io.BytesIO()
+    Image.fromarray(a, "RGB").save(buf, "PNG")
+    return buf.getvalue()
+
+
+def dump_vl(model, m, args):
+    """A prompt with an image, teacher-forced as dump(): text, the image's
+    span, text; prefilled, then VL_DECODE_STEPS decode steps. Recorded under
+    "vl.": png (the file), tokens and types (the expanded prompt and the
+    steps), patches (load_image's), vit.block{i} and vit (the encoder's
+    outputs), embeds (the aligner's), and per step as dump() does."""
+    import image_processor as IP
+
+    png = fixture_image()
+    patches, n_vit_h, n_vit_w, n_llm_h, n_llm_w = IP.load_image({"data": png}, args)
+    types = IP.image_token_types(n_llm_h, n_llm_w)
+    g = torch.Generator().manual_seed(SEED + 4)
+    words = torch.randint(3, args.vocab_size - 1, (5 + 4 + VL_DECODE_STEPS,), generator=g, device="cpu").tolist()
+    tokens = words[:5] + [args.image_token_id] * types.numel() + words[5:]
+    token_types = [IP.TEXT] * 5 + types.tolist() + [IP.TEXT] * (len(words) - 5)
+    image = IP.ImageInput(5, patches, n_vit_h, n_vit_w, types)
+    prompt_len = len(tokens) - VL_DECODE_STEPS
+
+    out = {}
+    for i, block in enumerate(model.vision.blocks):
+        block.register_forward_hook(lambda mod, a, o, i=i: out.__setitem__(f"vl.vit.block{i}", o.detach().clone()))
+    out["vl.vit"] = model.vision(patches, n_vit_h, n_vit_w).clone()
+    out["vl.embeds"] = model.encode_image(patches, n_vit_h, n_vit_w).clone()
+    rec = Recorder(model, m)
+    rec.m_args = args
+    rec.out = out
+    x = torch.tensor([tokens])
+    tt = torch.tensor([token_types])
+    rec.step = "vl.prefill"
+    _, logits, main_hidden = model(x[:, :prompt_len], 0, [[image]], tt[:, :prompt_len])
+    out["vl.prefill.logits"] = logits.clone()
+    out["vl.prefill.main_hidden"] = main_hidden.clone()
+    for step, pos in enumerate(range(prompt_len, len(tokens))):
+        rec.step = f"vl.decode{step}"
+        _, logits, main_hidden = model(x[:, pos : pos + 1], pos)
+        out[f"vl.decode{step}.logits"] = logits.clone()
+        out[f"vl.decode{step}.main_hidden"] = main_hidden.clone()
+    out["vl.png"] = torch.frombuffer(bytearray(png), dtype=torch.uint8)
+    out["vl.tokens"] = torch.tensor(tokens, dtype=torch.int64)
+    out["vl.types"] = torch.tensor(token_types, dtype=torch.int64)
+    out["vl.patches"] = patches
+    return {k: v.contiguous() for k, v in out.items()}
 
 
 def fixture_tokens():

@@ -121,3 +121,27 @@ func MatVecBF16(out []float32, w []uint16, x []float32) {
 		}
 	})
 }
+
+// MatMulBF16 multiplies n rows of x (each len(w)/m values) by the m rows of
+// w: out[i·m+j] = DotBF16(row j of w, row i of x), exactly what MatVecBF16
+// gives each row of x. Tiles of rows of both keep the weights in cache.
+func MatMulBF16(out []float32, w []uint16, x []float32, n, m int) {
+	k := len(w) / m
+	const tile = 64
+	tiles := (n + tile - 1) / tile
+	rows(tiles, min(n, tile)*m*k, func(lo, hi int) {
+		for t := lo; t < hi; t++ {
+			i0, i1 := t*tile, min((t+1)*tile, n)
+			for j0 := 0; j0 < m; j0 += tile {
+				j1 := min(j0+tile, m)
+				for i := i0; i < i1; i++ {
+					xi := x[i*k : (i+1)*k]
+					o := out[i*m:]
+					for j := j0; j < j1; j++ {
+						o[j] = DotBF16(w[j*k:(j+1)*k], xi)
+					}
+				}
+			}
+		}
+	})
+}
