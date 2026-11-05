@@ -31,6 +31,19 @@ func (tn *testNet) guest(t *testing.T, bits int, opts ...nodeOpt) *Node {
 	return start(t, tn.config(t, key, nil, append([]nodeOpt{func(c *Config) { c.Proof = &pr }}, opts...)...))
 }
 
+// guestWorking starts a node without a certificate whose proof does from
+// lo to hi-1 bits of work. Solve(bits) takes the first nonce good enough,
+// whose work is often more: once in sixteen, four bits more.
+func (tn *testNet) guestWorking(t *testing.T, lo, hi int, opts ...nodeOpt) *Node {
+	t.Helper()
+	key, id := newKey(t)
+	pr := membership.Proof{}
+	for w := tn.net.Work(id, pr); w < lo || w >= hi; w = tn.net.Work(id, pr) {
+		pr.Nonce++
+	}
+	return start(t, tn.config(t, key, nil, append([]nodeOpt{func(c *Config) { c.Proof = &pr }}, opts...)...))
+}
+
 func isGuest(n *Node, other *Node) bool {
 	for _, m := range n.Members() {
 		if m.ID == other.ID() {
@@ -58,8 +71,9 @@ func TestGuestsJoinOnlyAnOpenNetwork(t *testing.T) {
 	b := tn.member(t, withBootstrap(a))
 	eventually(t, 5*time.Second, "policy reaches a new member", func() bool { return b.Policy().Open })
 
-	weak := tn.guest(t, 0, withBootstrap(a))
-	g = tn.guest(t, 10, withBootstrap(a))
+	weak := tn.guestWorking(t, 0, 10, withBootstrap(a))
+	// Below 14 bits, so that raising the policy to 14 drops it below.
+	g = tn.guestWorking(t, 10, 14, withBootstrap(a))
 	eventually(t, 5*time.Second, "guest admitted", func() bool { return isGuest(a, g) && connectedMember(g, a.ID()) })
 	if !a.IsMember(g.ID()) || a.IsCertified(g.ID()) || !a.IsCertified(b.ID()) {
 		t.Fatal("guest and member are not told apart")
@@ -69,9 +83,13 @@ func TestGuestsJoinOnlyAnOpenNetwork(t *testing.T) {
 	}
 	// It finds the other member through the DHT, like a member would.
 	eventually(t, 10*time.Second, "guest discovers the other member", func() bool { return isGuest(b, g) })
-	time.Sleep(500 * time.Millisecond)
-	if connectedMember(a, weak.ID()) || connectedMember(weak, a.ID()) {
-		t.Fatal("a guest without enough work was admitted")
+	// The member never counts it in. (The weak guest itself sees the
+	// member, whose certificate is good, until the member hangs up.)
+	for range 25 {
+		if connectedMember(a, weak.ID()) {
+			t.Fatal("a guest without enough work was admitted")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 
 	// Raising the difficulty drops the guest, which solves a new proof and
