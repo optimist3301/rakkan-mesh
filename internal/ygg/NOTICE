@@ -1,0 +1,12 @@
+rakkan-node embeds a Yggdrasil node (package internal/ygg). The binary links:
+
+  yggdrasil-go v0.5.15   https://github.com/yggdrasil-network/yggdrasil-go
+      LGPL-3.0 with a static-linking exception (licenses/LGPL-3.0-yggdrasil-go.txt;
+      the LGPL builds on the GPL, licenses/GPL-3.0.txt)
+  ironwood               https://github.com/Arceliar/ironwood
+      (v0.0.0-20261023231900-0712eccbb962), MPL-2.0 (licenses/MPL-2.0.txt)
+  phony                  https://github.com/Arceliar/phony
+      (v0.0.0-20220903101357-530938a4b13d), MPL-2.0 (licenses/MPL-2.0.txt)
+
+None of them is modified. Their source code is at the addresses above, at the
+versions given, and in the Go module proxy (https://proxy.golang.org).

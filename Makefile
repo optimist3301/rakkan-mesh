@@ -33,6 +33,8 @@ dist: clean
 	  mkdir -p dist/$$name; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o dist/$$name/$$bin ./cmd/rakkan-node; \
 	  cp README.md dist/$$name/; \
+	  mkdir -p dist/$$name/licenses/yggdrasil; \
+	  cp internal/ygg/NOTICE internal/ygg/licenses/* dist/$$name/licenses/yggdrasil/; \
 	  if [ $$os = windows ]; then \
 	    (cd dist && zip -qr $$name.zip $$name); \
 	  else \

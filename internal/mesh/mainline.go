@@ -250,6 +250,11 @@ func (n *Node) mainlineRound(ctx context.Context, c *mldht.Client, rec *mainline
 				return
 			}
 			addrs := n.advertisedAddrs(n.host.Addrs())
+			if y := n.YggdrasilAddr(); y != nil {
+				// First, before what may not fit: behind NAT it is the
+				// address others can dial.
+				addrs = append([]ma.Multiaddr{y}, slices.DeleteFunc(addrs, y.Equal)...)
+			}
 			it, err := mldht.Sign(sk, rec.addrSalt, time.Now().Unix(), rec.seal(rec.addrSalt, encodeAddrs(addrs)))
 			if err == nil {
 				_, err = c.Put(ctx, it)

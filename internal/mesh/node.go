@@ -52,6 +52,7 @@ import (
 	manet "github.com/multiformats/go-multiaddr/net"
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
+	"github.com/optimist3301/rakkan-mesh/internal/ygg"
 )
 
 // Config configures a Node.
@@ -73,7 +74,9 @@ type Config struct {
 	// MaxGuests bounds guests connected at once. Default 256.
 	MaxGuests int
 
-	// ListenAddrs default to QUIC and TCP on all interfaces, random ports.
+	// ListenAddrs default (nil) to QUIC and TCP on all interfaces, random
+	// ports. Empty, the node listens on no IP address: with Yggdrasil, only
+	// at /ygg.
 	ListenAddrs []string
 	Bootstrap   []peer.AddrInfo
 	// PeerCache is a file remembering members' addresses across restarts,
@@ -89,6 +92,16 @@ type Config struct {
 	Mainline          bool
 	MainlineInterval  time.Duration
 	MainlineBootstrap []string
+	// Yggdrasil embeds a Yggdrasil node (package ygg) and listens on it at
+	// /ygg/<key>: members behind NAT, which cannot dial each other, reach
+	// each other through the Yggdrasil overlay instead, with no relay of
+	// ours. Other addresses are dialled first; /ygg is the fallback.
+	// YggdrasilPeers are its peer URIs (nil: a few public Yggdrasil nodes,
+	// ygg.DefaultPeers); YggdrasilListen accepts peerings, e.g. on a node
+	// other members peer with directly.
+	Yggdrasil       bool
+	YggdrasilPeers  []string
+	YggdrasilListen []string
 	// NAT enables UPnP port mapping, hole punching and AutoNAT.
 	NAT bool
 	// RelayService lets this node relay traffic between members that cannot
@@ -106,7 +119,7 @@ type Config struct {
 }
 
 func (c *Config) setDefaults() {
-	if len(c.ListenAddrs) == 0 {
+	if c.ListenAddrs == nil {
 		c.ListenAddrs = []string{
 			"/ip4/0.0.0.0/udp/0/quic-v1", "/ip6/::/udp/0/quic-v1",
 			"/ip4/0.0.0.0/tcp/0", "/ip6/::/tcp/0",
@@ -170,6 +183,7 @@ type Node struct {
 	policy   *pubsub.Topic
 	mdns     mdns.Service
 	relay    *relayv2.Relay
+	ygg      *ygg.Node
 	revs     *membership.Revocations
 	policies *membership.Policies
 	self     *membership.Cert
@@ -255,6 +269,16 @@ func New(cfg Config) (*Node, error) {
 		// libp2p.EnableRelayService would wait for AutoNAT to confirm the
 		// node is public; the relay is started directly below instead.
 	}
+	if cfg.Yggdrasil {
+		n.ygg, err = ygg.Start(cfg.Key, ygg.Config{Peers: cfg.YggdrasilPeers, Listen: cfg.YggdrasilListen, Logger: n.log})
+		if err != nil {
+			n.cancel()
+			return nil, fmt.Errorf("mesh: %w", err)
+		}
+		// Naming a transport drops libp2p's defaults; keep them.
+		opts = append(opts, libp2p.DefaultTransports, libp2p.Transport(ygg.NewTransport(n.ygg)),
+			libp2p.ListenAddrs(n.ygg.Multiaddr()))
+	}
 	if cfg.NAT {
 		opts = append(opts, libp2p.NATPortMap(), libp2p.EnableHolePunching(), libp2p.EnableNATService())
 	}
@@ -265,6 +289,9 @@ func New(cfg Config) (*Node, error) {
 		opts = append(opts, libp2p.ForceReachabilityPrivate())
 	}
 	if n.host, err = libp2p.New(opts...); err != nil {
+		if n.ygg != nil {
+			n.ygg.Close()
+		}
 		n.cancel()
 		return nil, fmt.Errorf("mesh: %w", err)
 	}
@@ -273,6 +300,9 @@ func New(cfg Config) (*Node, error) {
 		// a small network may never gather enough observations.
 		if n.relay, err = relayv2.New(n.host, relayv2.WithACL(relayACL{n}), relayv2.WithInfiniteLimits()); err != nil {
 			n.host.Close()
+			if n.ygg != nil {
+				n.ygg.Close()
+			}
 			n.cancel()
 			return nil, fmt.Errorf("mesh: relay: %w", err)
 		}
@@ -355,6 +385,9 @@ func (n *Node) Close() error {
 	if n.host != nil {
 		err = n.host.Close()
 	}
+	if n.ygg != nil {
+		n.ygg.Close()
+	}
 	n.wg.Wait()
 	return err
 }
@@ -402,6 +435,24 @@ func (n *Node) Certified() bool { return n.cfg.Cert != nil }
 // part, and messages are signed by their authors.
 func (n *Node) JoinTopic(name string) (*pubsub.Topic, error) {
 	return n.ps.Join("/rakkan/" + n.tag() + "/" + name)
+}
+
+// YggdrasilAddr is the node's /ygg/<key> address, or nil without
+// Config.Yggdrasil.
+func (n *Node) YggdrasilAddr() ma.Multiaddr {
+	if n.ygg == nil {
+		return nil
+	}
+	return n.ygg.Multiaddr()
+}
+
+// YggdrasilPeers counts the embedded Yggdrasil node's peerings that are up:
+// with none, no member can reach this one over Yggdrasil.
+func (n *Node) YggdrasilPeers() int {
+	if n.ygg == nil {
+		return 0
+	}
+	return n.ygg.PeersUp()
 }
 
 // Connect dials a peer; it becomes usable once it authenticates.
