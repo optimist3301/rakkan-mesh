@@ -7,6 +7,11 @@
 # checks its checksum, writes a JSON config holding the node's settings,
 # private key and certificate, and optionally starts it at login.
 #
+# Run as root, it installs for the whole system instead, after saying so:
+# /usr/local/bin, the config in /etc/rakkan (Linux) or /Library/Application
+# Support/Rakkan (macOS), and a service started at boot that runs the node
+# as its own unprivileged user (rakkan, or _rakkan on macOS), not as root.
+#
 # Options:
 #   --yes           accept the defaults without asking
 #   --version V     release to install (default: see VERSION below)
@@ -30,6 +35,9 @@ VERSION="${RAKKAN_VERSION:-0.004-alpha}"
 PUBLIC_NETWORK="12D3KooWJRPbdQ6Q8TXSctKQ8B4ZYHtKArqbKKReeQdx4iojLx7s"
 SERVICE="rakkan-node"
 LABEL="network.rakkan.node"
+# The system install's user: the node never runs as root.
+SYS_USER="rakkan"
+SYSTEM=0 # set when run as root
 
 YES=0
 UNINSTALL=0
@@ -174,6 +182,24 @@ detect_platform() {
     aarch64|arm64) ARCH=arm64 ;;
     *) die "Unsupported architecture: $(uname -m)" ;;
   esac
+  [ "$(id -u)" = 0 ] && SYSTEM=1
+  if [ "$SYSTEM" = 1 ]; then
+    BIN_DIR="${RAKKAN_BIN_DIR:-/usr/local/bin}"
+    if [ "$OS" = linux ]; then
+      CONF_DIR=/etc/rakkan
+      DATA_DIR=/var/lib/rakkan
+      UNIT_DIR=/etc/systemd/system
+    else
+      SYS_USER="_rakkan"
+      CONF_DIR="/Library/Application Support/Rakkan"
+      DATA_DIR="$CONF_DIR/data"
+      PLIST="/Library/LaunchDaemons/$LABEL.plist"
+      LOG_FILE="/Library/Logs/rakkan-node.log"
+    fi
+    BIN="$BIN_DIR/rakkan-node"
+    CONF="$CONF_DIR/node.json"
+    return
+  fi
   BIN_DIR="${RAKKAN_BIN_DIR:-$HOME/.local/bin}"
   if [ "$OS" = linux ]; then
     CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rakkan"
@@ -194,7 +220,20 @@ detect_platform() {
 do_uninstall() {
   detect_platform
   step "-" "Removing Rakkan node" "Удаление узла Rakkan"
-  if [ "$OS" = linux ]; then
+  if [ "$SYSTEM" = 1 ]; then
+    warn "Running as root: removing the system-wide install ($BIN, the boot service)." \
+         "Запуск от root: удаляю общесистемную установку ($BIN, служба при загрузке)."
+    if [ "$OS" = linux ]; then
+      if have systemctl; then
+        systemctl disable --now "$SERVICE.service" >/dev/null 2>&1 || true
+      fi
+      rm -f "$UNIT_DIR/$SERVICE.service"
+      if have systemctl; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+    else
+      launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+      rm -f "$PLIST"
+    fi
+  elif [ "$OS" = linux ]; then
     if have systemctl; then
       systemctl --user disable --now "$SERVICE.service" >/dev/null 2>&1 || true
     fi
@@ -212,10 +251,146 @@ do_uninstall() {
     if [ "$sure" = y ]; then
       rm -rf "$CONF_DIR" "$DATA_DIR"
       ok "Config, key and data deleted." "Конфиг, ключ и данные удалены."
+      if [ "$SYSTEM" = 1 ]; then remove_system_user; fi
+    else
+      info "Config and key kept in $CONF_DIR." "Конфиг и ключ сохранены в $CONF_DIR."
     fi
   else
     info "Config and key kept in $CONF_DIR (use --purge to delete them)." \
          "Конфиг и ключ сохранены в $CONF_DIR (--purge удалит и их)."
+  fi
+}
+
+# ---------------------------------------------------------- system install --
+
+# confirm_system says, before anything is written, what installing as root
+# does, and asks to go on.
+confirm_system() {
+  [ "$SYSTEM" = 1 ] || return 0
+  warn "You are running this as root: Rakkan will be installed for the WHOLE SYSTEM, not for one user." \
+       "Скрипт запущен от root: Rakkan будет установлен для ВСЕЙ СИСТЕМЫ, а не для одного пользователя."
+  info "Program: $BIN" "Программа: $BIN"
+  info "Config and node key: $CONF" "Конфиг и ключ узла: $CONF"
+  info "Data: $DATA_DIR" "Данные: $DATA_DIR"
+  info "Service: started at boot, running as the unprivileged user $SYS_USER (created if missing), not as root." \
+       "Служба: стартует при загрузке, работает от непривилегированного пользователя $SYS_USER (будет создан, если его нет), а не от root."
+  info "To install for yourself only, run the script as a normal user, without sudo." \
+       "Чтобы установить только для себя, запустите скрипт обычным пользователем, без sudo."
+  local go
+  ask_yn go "Install for the whole system?" "Установить для всей системы?" y
+  [ "$go" = y ] || die "Cancelled."
+}
+
+# ensure_system_user creates the user the node runs as.
+ensure_system_user() {
+  if id "$SYS_USER" >/dev/null 2>&1; then return; fi
+  if [ "$OS" = linux ]; then
+    local nologin=/usr/sbin/nologin
+    [ -x "$nologin" ] || nologin=/sbin/nologin
+    [ -x "$nologin" ] || nologin=/bin/false
+    if have useradd; then
+      useradd --system --user-group --home-dir "$DATA_DIR" --no-create-home --shell "$nologin" "$SYS_USER"
+    elif have adduser; then # BusyBox, Alpine
+      adduser -S -D -H -h "$DATA_DIR" -s "$nologin" "$SYS_USER"
+    else
+      die "Cannot create the user $SYS_USER: no useradd or adduser."
+    fi
+  else
+    # A hidden system account with a free ID below 500, as macOS daemons have.
+    local id=300
+    while dscl . -list /Users UniqueID | awk '{print $2}' | grep -qx "$id" ||
+      dscl . -list /Groups PrimaryGroupID | awk '{print $2}' | grep -qx "$id"; do
+      id=$((id + 1))
+      [ "$id" -lt 500 ] || die "No free system user ID for $SYS_USER."
+    done
+    dscl . -create "/Groups/$SYS_USER" PrimaryGroupID "$id"
+    dscl . -create "/Users/$SYS_USER" UniqueID "$id"
+    dscl . -create "/Users/$SYS_USER" PrimaryGroupID "$id"
+    dscl . -create "/Users/$SYS_USER" UserShell /usr/bin/false
+    dscl . -create "/Users/$SYS_USER" NFSHomeDirectory /var/empty
+    dscl . -create "/Users/$SYS_USER" RealName "Rakkan node"
+    dscl . -create "/Users/$SYS_USER" IsHidden 1
+  fi
+  ok "Created the user $SYS_USER the node runs as." "Создан пользователь $SYS_USER, от которого работает узел."
+}
+
+remove_system_user() {
+  id "$SYS_USER" >/dev/null 2>&1 || return 0
+  if [ "$OS" = linux ]; then
+    userdel "$SYS_USER" >/dev/null 2>&1 || deluser "$SYS_USER" >/dev/null 2>&1 || true
+  else
+    dscl . -delete "/Users/$SYS_USER" >/dev/null 2>&1 || true
+    dscl . -delete "/Groups/$SYS_USER" >/dev/null 2>&1 || true
+  fi
+  ok "Removed the user $SYS_USER." "Пользователь $SYS_USER удалён."
+}
+
+# install_system_service starts the node at boot as SYS_USER.
+install_system_service() {
+  if [ "$OS" = linux ]; then
+    if ! have systemctl; then
+      warn "No systemd: start the node by hand (command below)." "Нет systemd: запустите узел вручную (команда ниже)."
+      return
+    fi
+    cat >"$UNIT_DIR/$SERVICE.service" <<UNIT
+[Unit]
+Description=Rakkan Mesh node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$SYS_USER
+ExecStart="$BIN" daemon -config "$CONF"
+WorkingDirectory=$DATA_DIR
+Restart=on-failure
+RestartSec=5
+# The node needs nothing of root's: no new privileges, the system read-only
+# but for its data.
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=$DATA_DIR
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable --now "$SERVICE.service"
+    sleep 2
+    if systemctl is-active --quiet "$SERVICE.service"; then
+      ok "The node is running and will start at boot." "Узел запущен и будет стартовать при загрузке."
+    else
+      warn "The service did not stay up. See: journalctl -u $SERVICE -e" \
+           "Служба не удержалась. Смотрите: journalctl -u $SERVICE -e"
+    fi
+  else
+    touch "$LOG_FILE"
+    chown "$SYS_USER:" "$LOG_FILE"
+    cat >"$PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>UserName</key><string>$SYS_USER</string>
+  <key>ProgramArguments</key>
+  <array><string>$BIN</string><string>daemon</string><string>-config</string><string>$CONF</string></array>
+  <key>WorkingDirectory</key><string>$DATA_DIR</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>$LOG_FILE</string>
+  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+PLIST_EOF
+    chown root:wheel "$PLIST"
+    chmod 644 "$PLIST"
+    launchctl bootout "system/$LABEL" >/dev/null 2>&1 || true
+    if launchctl bootstrap system "$PLIST" 2>/dev/null || launchctl load -w "$PLIST"; then
+      ok "The node is running and will start at boot." "Узел запущен и будет стартовать при загрузке."
+    else
+      warn "Could not load $PLIST" "Не удалось загрузить $PLIST"
+    fi
   fi
 }
 
@@ -247,6 +422,7 @@ install_binary() {
   fi
   install -m 0755 "$TMP/rakkan-node" "$BIN"
   ok "Installed $BIN" "Установлено: $BIN"
+  [ "$SYSTEM" = 1 ] && return
   case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *) warn "$BIN_DIR is not in your PATH; add it to your shell profile." \
@@ -259,7 +435,19 @@ install_binary() {
 strict_isolation_works() {
   [ "$OS" = linux ] || return 1
   have unshare || return 0
-  unshare -Urm sh -c 'mount --make-rprivate / 2>/dev/null' >/dev/null 2>&1
+  local probe=(unshare -Urm sh -c 'mount --make-rprivate / 2>/dev/null')
+  if [ "$SYSTEM" = 1 ]; then
+    # Root may always; the service's unprivileged user is what counts.
+    if have setpriv; then
+      setpriv --reuid=65534 --regid=65534 --clear-groups "${probe[@]}" >/dev/null 2>&1
+    elif have runuser; then
+      runuser -u nobody -- "${probe[@]}" >/dev/null 2>&1
+    else
+      return 1
+    fi
+    return
+  fi
+  "${probe[@]}" >/dev/null 2>&1
 }
 
 main() {
@@ -290,6 +478,7 @@ main() {
   if [ "$UNINSTALL" = 1 ]; then do_uninstall; exit 0; fi
   detect_platform
   info "System: $OS/$ARCH" "Система: $OS/$ARCH"
+  confirm_system
 
   # ------------------------------------------------------------ 1: network
   step "1/6" "Network" "Сеть"
@@ -465,11 +654,16 @@ main() {
   local AUTO="${RAKKAN_AUTOSTART:-}" LINGER=n
   if [ -z "$AUTO" ]; then
     local what
-    what=$([ "$OS" = linux ] && echo "systemd user service" || echo "launchd agent")
-    ask_yn AUTO "Start the node automatically at login ($what)?" "Запускать узел автоматически при входе ($what)?" y
+    if [ "$SYSTEM" = 1 ]; then
+      what=$([ "$OS" = linux ] && echo "systemd system service" || echo "launchd daemon")
+      ask_yn AUTO "Start the node automatically at boot ($what, as $SYS_USER)?" "Запускать узел автоматически при загрузке ($what, от $SYS_USER)?" y
+    else
+      what=$([ "$OS" = linux ] && echo "systemd user service" || echo "launchd agent")
+      ask_yn AUTO "Start the node automatically at login ($what)?" "Запускать узел автоматически при входе ($what)?" y
+    fi
   fi
   case "$AUTO" in y|yes) AUTO=y ;; *) AUTO=n ;; esac
-  if [ "$AUTO" = y ] && [ "$OS" = linux ] && have loginctl; then
+  if [ "$AUTO" = y ] && [ "$SYSTEM" = 0 ] && [ "$OS" = linux ] && have loginctl; then
     ask_yn LINGER "Keep it running from boot, even when you are not logged in?" \
       "Держать запущенным с загрузки системы, даже без вашего входа?" n
   fi
@@ -517,11 +711,28 @@ main() {
     } >"$CONF"
   )
   chmod 600 "$CONF"
+  if [ "$SYSTEM" = 1 ]; then
+    # The node's own user owns its key, config and data; only it reads them.
+    ensure_system_user
+    chown "$SYS_USER:" "$CONF"
+    chown -R "$SYS_USER:" "$DATA_DIR"
+    chmod 700 "$DATA_DIR"
+    chmod 755 "$CONF_DIR"
+    if [ "$OS" = linux ] && [ "$TYPE" = llm ]; then
+      # GPUs: /dev/dri and /dev/kfd belong to these groups.
+      local g
+      for g in video render; do
+        if getent group "$g" >/dev/null 2>&1; then usermod -aG "$g" "$SYS_USER" 2>/dev/null || true; fi
+      done
+    fi
+  fi
   ok "Config written: $CONF (owner-only: it holds the node's private key)" \
      "Конфиг записан: $CONF (доступ только владельцу: внутри приватный ключ узла)"
 
   # --------------------------------------------------------------- service
-  if [ "$AUTO" = y ]; then
+  if [ "$AUTO" = y ] && [ "$SYSTEM" = 1 ]; then
+    install_system_service
+  elif [ "$AUTO" = y ]; then
     if [ "$OS" = linux ]; then
       if have systemctl && systemctl --user show-environment >/dev/null 2>&1; then
         mkdir -p "$UNIT_DIR"
@@ -589,8 +800,18 @@ EOF
   printf '  %s%s%s %s\n' "$DIM" "config: " "$RESET" "$CONF"
   printf '\n'
   say "  Run by hand:" "  Запуск вручную:"
-  printf '    %s daemon -config "%s"\n' "$BIN" "$CONF"
-  if [ "$AUTO" = y ]; then
+  if [ "$SYSTEM" = 1 ]; then
+    printf '    sudo -u %s "%s" daemon -config "%s"\n' "$SYS_USER" "$BIN" "$CONF"
+  else
+    printf '    %s daemon -config "%s"\n' "$BIN" "$CONF"
+  fi
+  if [ "$AUTO" = y ] && [ "$SYSTEM" = 1 ]; then
+    if [ "$OS" = linux ]; then
+      say "  Logs:  journalctl -u $SERVICE -f" "  Журнал:  journalctl -u $SERVICE -f"
+    else
+      say "  Logs:  tail -f \"$LOG_FILE\"" "  Журнал:  tail -f \"$LOG_FILE\""
+    fi
+  elif [ "$AUTO" = y ]; then
     if [ "$OS" = linux ]; then
       say "  Logs:  journalctl --user -u $SERVICE -f" "  Журнал:  journalctl --user -u $SERVICE -f"
     else
@@ -603,7 +824,11 @@ EOF
         "  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:"
     printf '    rakkan-node network announce -key root.key -announcers %s\n' "$PEER"
   fi
-  say "  Remove: install.sh --uninstall" "  Удалить: install.sh --uninstall"
+  if [ "$SYSTEM" = 1 ]; then
+    say "  Remove: sudo install.sh --uninstall" "  Удалить: sudo install.sh --uninstall"
+  else
+    say "  Remove: install.sh --uninstall" "  Удалить: install.sh --uninstall"
+  fi
   printf '%s%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\n\n' "$BOLD" "$(c 99)" "$RESET"
 }
 

@@ -8,6 +8,11 @@
   settings, private key and certificate, and optionally starts the node at
   logon through a scheduled task.
 
+  Run as administrator, it installs for the whole computer instead, after
+  saying so: the program in Program Files\Rakkan, the config and data in
+  ProgramData\Rakkan, and a task started at boot that runs the node as the
+  built-in LOCAL SERVICE account, not as an administrator.
+
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/optimist3301/rakkan-mesh/main/scripts/install.ps1).TrimStart([char]0xFEFF)))
 
   (A plain "irm ... | iex" does not work with scripts that take parameters.)
@@ -41,12 +46,29 @@ $Repo = 'optimist3301/rakkan-mesh'
 $PublicNetwork = '12D3KooWJRPbdQ6Q8TXSctKQ8B4ZYHtKArqbKKReeQdx4iojLx7s'
 $TaskName = 'RakkanNode'
 
-$ConfDir = Join-Path $env:LOCALAPPDATA 'Rakkan'
-$BinDir = Join-Path $ConfDir 'bin'
-$DataDir = Join-Path $ConfDir 'data'
+# Run as administrator: a system-wide install (the node runs as LOCAL SERVICE).
+$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Well-known SIDs: account names are translated on non-English Windows.
+$SidSystem = '*S-1-5-18'
+$SidAdmins = '*S-1-5-32-544'
+$SidLocalService = '*S-1-5-19'
+
+if ($IsAdmin) {
+    $ConfDir = Join-Path $env:ProgramData 'Rakkan'
+    $BinDir = Join-Path $env:ProgramFiles 'Rakkan'
+    $DataDir = Join-Path $ConfDir 'data'
+    $LogFile = Join-Path $DataDir 'rakkan-node.log'
+    $PathScope = 'Machine'
+}
+else {
+    $ConfDir = Join-Path $env:LOCALAPPDATA 'Rakkan'
+    $BinDir = Join-Path $ConfDir 'bin'
+    $DataDir = Join-Path $ConfDir 'data'
+    $LogFile = Join-Path $ConfDir 'rakkan-node.log'
+    $PathScope = 'User'
+}
 $Bin = Join-Path $BinDir 'rakkan-node.exe'
 $Conf = Join-Path $ConfDir 'node.json'
-$LogFile = Join-Path $ConfDir 'rakkan-node.log'
 
 $Lang = $env:RAKKAN_LANG
 
@@ -150,13 +172,17 @@ function Stop-Node {
 
 function Remove-Node {
     Step '-' 'Removing Rakkan node' 'Удаление узла Rakkan'
+    if ($IsAdmin) {
+        Warn "Running as administrator: removing the system-wide install ($Bin, the boot task)." "Запуск от администратора: удаляю общесистемную установку ($Bin, задача при загрузке)."
+    }
     Stop-Node
     try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch { }
     Remove-Item -Force -ErrorAction SilentlyContinue $Bin
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ($IsAdmin) { Remove-Item -Force -ErrorAction SilentlyContinue $BinDir }
+    $userPath = [Environment]::GetEnvironmentVariable('Path', $PathScope)
     if ($userPath) {
         $kept = ($userPath -split ';' | Where-Object { $_ -and $_ -ne $BinDir }) -join ';'
-        [Environment]::SetEnvironmentVariable('Path', $kept, 'User')
+        [Environment]::SetEnvironmentVariable('Path', $kept, $PathScope)
     }
     Ok 'Task and binary removed.' 'Задача и программа удалены.'
     if ($Purge) {
@@ -186,6 +212,16 @@ if (-not $Lang) {
 }
 
 if ($Uninstall) { Remove-Node; return }
+
+if ($IsAdmin) {
+    Warn 'You are running this as administrator: Rakkan will be installed for the WHOLE COMPUTER, not for one user.' 'Скрипт запущен от администратора: Rakkan будет установлен для ВСЕГО КОМПЬЮТЕРА, а не для одного пользователя.'
+    Info "Program: $Bin" "Программа: $Bin"
+    Info "Config and node key: $Conf" "Конфиг и ключ узла: $Conf"
+    Info "Data and log: $DataDir" "Данные и журнал: $DataDir"
+    Info 'Autostart: a task at boot, running as the built-in LOCAL SERVICE account, not as an administrator.' 'Автозапуск: задача при загрузке системы от встроенной учётной записи LOCAL SERVICE, а не от администратора.'
+    Info 'To install for yourself only, run the script in a PowerShell that is not elevated.' 'Чтобы установить только для себя, запустите скрипт в PowerShell без прав администратора.'
+    if (-not (Ask-YN 'Install for the whole computer?' 'Установить для всего компьютера?' $true)) { Die 'Cancelled.' }
+}
 
 $osArch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($osArch) {
@@ -230,6 +266,12 @@ if (Test-Path $Conf) {
 Step '2/6' 'Program and node identity' 'Программа и личность узла'
 Stop-Node
 New-Item -ItemType Directory -Force -Path $BinDir, $DataDir | Out-Null
+if ($IsAdmin) {
+    # ProgramData lets every user read: the config's folder lets only the
+    # system and administrators, and the node's account read (backups of
+    # the config inherit it).
+    & icacls $ConfDir /inheritance:r /grant:r "$($SidSystem):(OI)(CI)(F)" "$($SidAdmins):(OI)(CI)(F)" "$($SidLocalService):(OI)(CI)(RX)" | Out-Null
+}
 $Tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('rakkan-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $Tmp | Out-Null
 try {
@@ -381,8 +423,10 @@ elseif (-not $Mainline) {
 # -------------------------------------------------------------- 6: start
 Step '6/6' 'Autostart' 'Автозапуск'
 if ($env:RAKKAN_AUTOSTART) { $Auto = $env:RAKKAN_AUTOSTART -in @('y', 'yes', 'true', '1') }
+elseif ($IsAdmin) { $Auto = Ask-YN 'Start the node automatically at boot (scheduled task, as LOCAL SERVICE)?' 'Запускать узел автоматически при загрузке системы (задача планировщика, от LOCAL SERVICE)?' $true }
 else { $Auto = Ask-YN 'Start the node automatically at logon (scheduled task)?' 'Запускать узел автоматически при входе в систему (задача планировщика)?' $true }
 if ($env:RAKKAN_ADD_TO_PATH) { $AddPath = $env:RAKKAN_ADD_TO_PATH -in @('y', 'yes', 'true', '1') }
+elseif ($IsAdmin) { $AddPath = Ask-YN "Add rakkan-node to every user's PATH?" 'Добавить rakkan-node в PATH всех пользователей?' $true }
 else { $AddPath = Ask-YN 'Add rakkan-node to your PATH?' 'Добавить rakkan-node в PATH?' $true }
 
 # ---------------------------------------------------------- write config
@@ -413,17 +457,25 @@ if ($Type -eq 'llm') {
     $cfg['llm-mem-gb'] = $LlmMem
     $cfg['gpu'] = $Gpu
 }
-# Keep the file private to this user before the key goes into it.
+# Keep the file private before the key goes into it: to this user, or for
+# a system install to the system, administrators and the node's account,
+# which may only read it. The node's account writes only its data.
 Write-Utf8NoBom $Conf ''
-& icacls $Conf /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+if ($IsAdmin) {
+    & icacls $Conf /inheritance:r /grant:r "$($SidSystem):(F)" "$($SidAdmins):(F)" "$($SidLocalService):(R)" | Out-Null
+    & icacls $DataDir /inheritance:r /grant:r "$($SidSystem):(OI)(CI)(F)" "$($SidAdmins):(OI)(CI)(F)" "$($SidLocalService):(OI)(CI)(M)" | Out-Null
+}
+else {
+    & icacls $Conf /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null
+}
 Write-Utf8NoBom $Conf (($cfg | ConvertTo-Json -Depth 20) + "`n")
 Ok "Config written: $Conf (owner-only: it holds the node's private key)" "Конфиг записан: $Conf (доступ только владельцу: внутри приватный ключ узла)"
 
 if ($AddPath) {
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $userPath = [Environment]::GetEnvironmentVariable('Path', $PathScope)
     if (-not $userPath) { $userPath = '' }
     if (($userPath -split ';') -notcontains $BinDir) {
-        [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $BinDir).TrimStart(';')), 'User')
+        [Environment]::SetEnvironmentVariable('Path', (($userPath.TrimEnd(';') + ';' + $BinDir).TrimStart(';')), $PathScope)
         Ok 'Added to PATH (open a new terminal to use it).' 'Добавлено в PATH (откройте новый терминал).'
     }
 }
@@ -434,16 +486,23 @@ if ($Auto) {
     $cmd = "& '$(& $q $Bin)' daemon -config '$(& $q $Conf)' *>> '$(& $q $LogFile)'"
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
         -Argument ('-NoProfile -WindowStyle Hidden -Command "' + $cmd + '"') -WorkingDirectory $DataDir
-    $who = "$($env:USERDOMAIN)\$($env:USERNAME)"
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $who
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
-    $principal = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Limited
+    if ($IsAdmin) {
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId 'NT AUTHORITY\LOCAL SERVICE' -LogonType ServiceAccount -RunLevel Limited
+    }
+    else {
+        $who = "$($env:USERDOMAIN)\$($env:USERNAME)"
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $who
+        $principal = New-ScheduledTaskPrincipal -UserId $who -LogonType Interactive -RunLevel Limited
+    }
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 2
     $state = (Get-ScheduledTask -TaskName $TaskName).State
-    if ($state -eq 'Running') { Ok 'The node is running and will start at logon.' 'Узел запущен и будет стартовать при входе.' }
+    if ($state -eq 'Running' -and $IsAdmin) { Ok 'The node is running and will start at boot.' 'Узел запущен и будет стартовать при загрузке системы.' }
+    elseif ($state -eq 'Running') { Ok 'The node is running and will start at logon.' 'Узел запущен и будет стартовать при входе.' }
     else { Warn "The task is $state. See the log: $LogFile" "Задача в состоянии $state. Смотрите журнал: $LogFile" }
 }
 
@@ -464,6 +523,7 @@ if ($Type -eq 'relay' -and $Mainline) {
     Say '  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:' '  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:'
     Write-Host "    rakkan-node network announce -key root.key -announcers $Peer"
 }
-Say '  Remove: .\install.ps1 -Uninstall' '  Удалить: .\install.ps1 -Uninstall'
+if ($IsAdmin) { Say '  Remove (as administrator): .\install.ps1 -Uninstall' '  Удалить (от администратора): .\install.ps1 -Uninstall' }
+else { Say '  Remove: .\install.ps1 -Uninstall' '  Удалить: .\install.ps1 -Uninstall' }
 Write-Host $rule -ForegroundColor Magenta
 Write-Host ''
