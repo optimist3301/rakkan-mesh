@@ -31,6 +31,7 @@ import (
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	"github.com/optimist3301/rakkan-mesh/internal/ygg"
 )
 
 func daemonCmd(args []string) int {
@@ -44,11 +45,14 @@ func daemonCmd(args []string) int {
 	trustPath := flags.String("trust", "", "ledger of peers' credit and reputation (default <data>/trust.json)")
 	freeCredit := flags.Float64("free-credit", 50, "work a guest may ask of this node beyond what it did for it, in billions of gas")
 	crlPath := flags.String("crl", "", "revocation list; reloaded and published to the network when it changes")
-	listen := flags.String("listen", "", "comma-separated listen multiaddrs (default: QUIC and TCP on all interfaces)")
+	listen := flags.String("listen", "", "comma-separated listen multiaddrs (default: QUIC and TCP on all interfaces); none: no IP address, only Yggdrasil")
 	bootstrap := flags.String("bootstrap", "", "comma-separated multiaddrs of known members, ending in /p2p/<peer ID>")
 	peerCache := flags.String("peers", "peers.json", "file remembering members' addresses across restarts; empty disables")
 	mdnsOn := flags.Bool("mdns", true, "discover members on the local network")
 	mainline := flags.Bool("mainline", true, "find members through the BitTorrent Mainline DHT, and keep the network's records there (network announce)")
+	yggOn := flags.Bool("yggdrasil", true, "reach members behind NAT through an embedded Yggdrasil node (no root, no TUN device)")
+	yggPeers := flags.String("ygg-peers", "", `comma-separated Yggdrasil peer URIs (tls://host:port, ...); default: a few public ones; "none" for no peers`)
+	yggListen := flags.String("ygg-listen", "", "comma-separated URIs to accept Yggdrasil peerings on, e.g. tls://0.0.0.0:7743")
 	nat := flags.Bool("nat", true, "UPnP port mapping, hole punching and AutoNAT")
 	relay := flags.Bool("relay", false, "relay traffic for members; enable on publicly reachable nodes")
 	reach := flags.String("reachability", "auto", "auto (from interface addresses), public, or private (behind NAT)")
@@ -129,8 +133,27 @@ func daemonCmd(args []string) int {
 			return fail(err)
 		}
 	}
-	if *listen != "" {
+	switch *listen {
+	case "":
+	case "none":
+		cfg.ListenAddrs = []string{}
+	default:
 		cfg.ListenAddrs = strings.Split(*listen, ",")
+	}
+	var yggCfg *ygg.Config
+	if *yggOn {
+		cfg.Yggdrasil = true
+		switch *yggPeers {
+		case "":
+		case "none":
+			cfg.YggdrasilPeers = []string{}
+		default:
+			cfg.YggdrasilPeers = strings.Split(*yggPeers, ",")
+		}
+		if *yggListen != "" {
+			cfg.YggdrasilListen = strings.Split(*yggListen, ",")
+		}
+		yggCfg = &ygg.Config{Peers: cfg.YggdrasilPeers}
 	}
 	for _, s := range strings.Split(*bootstrap, ",") {
 		if s == "" {
@@ -147,7 +170,7 @@ func daemonCmd(args []string) int {
 		if err != nil {
 			return fail(err)
 		}
-		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, cfg.Bootstrap, *mainline, *proofPath)
+		pr, policy, err := guestProof(context.Background(), n, id, cfg.Policy, policySource{bootstrap: cfg.Bootstrap, mainline: *mainline, ygg: yggCfg}, *proofPath)
 		if err != nil {
 			return fail(err)
 		}
@@ -387,7 +410,11 @@ func printMembers(node *mesh.Node, tr *trust.Service) {
 			connected++
 		}
 	}
-	fmt.Printf("%s members: %d connected, %d known\n", time.Now().Format(time.TimeOnly), connected, len(ms))
+	yggInfo := ""
+	if node.YggdrasilAddr() != nil {
+		yggInfo = fmt.Sprintf("; yggdrasil: %d peerings up", node.YggdrasilPeers())
+	}
+	fmt.Printf("%s members: %d connected, %d known%s\n", time.Now().Format(time.TimeOnly), connected, len(ms), yggInfo)
 	for _, m := range ms {
 		state := "disconnected"
 		if m.Connected {
