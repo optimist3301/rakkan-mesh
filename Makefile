@@ -3,7 +3,7 @@
 #   make              build ./rakkan-node for this machine
 #   make test         run the tests
 #   make dist         cross-compile archives and SHA256SUMS into dist/
-#   make dist VERSION=0.004-alpha
+#   make dist VERSION=0.005-alpha
 #
 # The node has no cgo, so every platform builds from any machine.
 
