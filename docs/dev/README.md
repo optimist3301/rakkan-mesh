@@ -137,11 +137,11 @@ rakkan-node daemon -config node.json
 ```sh
 make                          # ./rakkan-node и ./rakkan-web (веб-страница для узла) для этой машины
 make test                     # go vet + go test
-make dist VERSION=0.006-alpha # архивы и SHA256SUMS в dist/ для linux, macOS и Windows (amd64, arm64)
+make dist VERSION=0.007-alpha # архивы и SHA256SUMS в dist/ для linux, macOS и Windows (amd64, arm64)
 rakkan-node version
 ```
 
-cgo не нужен, поэтому все платформы собираются с любой машины. Релиз делает GitHub Actions: тег `v*` (например `v0.006-alpha`) запускает `.github/workflows/release.yml`, который прогоняет тесты, собирает архивы и публикует релиз; теги с `alpha`, `beta` или `rc` помечаются как пре-релиз. Изоляция воркеров (seccomp, namespaces, cgroup) работает только на Linux.
+cgo не нужен, поэтому все платформы собираются с любой машины. Релиз делает GitHub Actions: тег `v*` (например `v0.007-alpha`) запускает `.github/workflows/release.yml`, который прогоняет тесты, собирает архивы и публикует релиз; теги с `alpha`, `beta` или `rc` помечаются как пре-релиз. Изоляция воркеров (seccomp, namespaces, cgroup) работает только на Linux.
 
 ## Установщики
 
