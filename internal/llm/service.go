@@ -372,6 +372,42 @@ func (s *Service) servers() map[peer.ID]advert {
 	return out
 }
 
+// ModelInfo describes a model for people choosing one.
+type ModelInfo struct {
+	Model string `json:"model"`
+	Name  string `json:"name,omitempty"`
+	// Arch is "llama" for llama-like models, or the architecture.
+	Arch   string `json:"arch"`
+	Layers int    `json:"layers,omitempty"`
+	Chat   bool   `json:"chat"`
+	Images bool   `json:"images,omitempty"`
+	Draft  bool   `json:"draft,omitempty"`
+}
+
+// ModelInfo reads a model's manifest, from the nodes serving stages if
+// this node lacks it, as a generation would.
+func (s *Service) ModelInfo(ctx context.Context, model blob.ID) (*ModelInfo, error) {
+	providers := []peer.ID{s.node.ID()}
+	for p := range s.servers() {
+		providers = append(providers, p)
+	}
+	m, err := s.fetchManifest(ctx, model, providers)
+	if err != nil {
+		return nil, err
+	}
+	info := &ModelInfo{Model: model.String(), Name: m.Name, Arch: m.Arch, Layers: len(m.Layers),
+		Chat: m.Chat != nil, Images: m.Vision != "", Draft: m.Draft != ""}
+	if m.Arch == "" {
+		info.Arch = "llama"
+		info.Layers = m.Config.Layers
+	}
+	if m.ds != nil {
+		info.Chat = true // DeepSeek-V4.1 has its own chat encoder
+		info.Layers = m.ds.Layers
+	}
+	return info, nil
+}
+
 // fetchManifest makes a model's manifest available and parses it.
 func (s *Service) fetchManifest(ctx context.Context, model blob.ID, providers []peer.ID) (*Manifest, error) {
 	if err := s.blobs.Fetch(ctx, model, providers, maxManifest); err != nil {

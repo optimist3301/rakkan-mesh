@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/optimist3301/rakkan-mesh/internal/blob"
 	"github.com/optimist3301/rakkan-mesh/internal/llm/dsv41"
@@ -65,6 +66,36 @@ type Manifest struct {
 type ChatTemplate struct {
 	Prefix string `json:"prefix"`
 	Suffix string `json:"suffix"`
+}
+
+// render is the prompt of a conversation: its earlier turns, then the
+// message. The templates hold the first user turn's opening, with any
+// system message; later turns open with its last header alone, and each
+// answer ends as the format ends a turn.
+func (c *ChatTemplate) render(history []Turn, msg string) (string, error) {
+	if len(history) == 0 {
+		return c.Prefix + msg + c.Suffix, nil
+	}
+	var header, end string
+	for _, f := range []struct{ header, end string }{
+		{"<|im_start|>user\n", "<|im_end|>\n"},
+		{"<|start_header_id|>user<|end_header_id|>\n\n", "<|eot_id|>"},
+	} {
+		if strings.HasSuffix(c.Prefix, f.header) {
+			header, end = f.header, f.end
+		}
+	}
+	if header == "" {
+		return "", errors.New("the model's chat format takes no history")
+	}
+	var b strings.Builder
+	open := c.Prefix
+	for _, t := range history {
+		b.WriteString(open + t.User + c.Suffix + t.Assistant + end)
+		open = header
+	}
+	b.WriteString(open + msg + c.Suffix)
+	return b.String(), nil
 }
 
 func (m *Manifest) bos() int {

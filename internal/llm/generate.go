@@ -32,6 +32,9 @@ type GenerateRequest struct {
 	// Chat wraps the prompt in the model's conversation format, for
 	// chat-tuned models; it is an error for models without one.
 	Chat bool
+	// History are the conversation's earlier turns, oldest first, which
+	// the prompt follows. Only with Chat.
+	History []Turn
 	// Draft has the model's draft model (DeepSeek-V4.1's DSpark) propose
 	// tokens, verified a block at a time: fewer passes through the stages,
 	// the same text.
@@ -41,6 +44,12 @@ type GenerateRequest struct {
 	// before the text of the message; without, the text marks each place
 	// with the model's image placeholder.
 	Images [][]byte
+}
+
+// Turn is a user's message and the model's answer to it.
+type Turn struct {
+	User      string `json:"user"`
+	Assistant string `json:"assistant"`
 }
 
 // Event is one generated token.
@@ -161,7 +170,7 @@ func (s *Service) llamaCoordinator(ctx context.Context, cm *coordModel, provider
 // prompt encodes a generation's prompt.
 func (cm *coordModel) prompt(req GenerateRequest) ([]int, error) {
 	if cm.ds != nil {
-		return cm.ds.prompt(req.Prompt, req.Chat, len(req.Images))
+		return cm.ds.prompt(req.Prompt, req.Chat, len(req.Images), req.History)
 	}
 	if len(req.Images) > 0 {
 		return nil, errors.New("the model takes no images")
@@ -172,7 +181,12 @@ func (cm *coordModel) prompt(req GenerateRequest) ([]int, error) {
 		if m.Chat == nil {
 			return nil, errors.New("the model has no chat format")
 		}
-		prompt = m.Chat.Prefix + prompt + m.Chat.Suffix
+		var err error
+		if prompt, err = m.Chat.render(req.History, prompt); err != nil {
+			return nil, err
+		}
+	} else if len(req.History) > 0 {
+		return nil, errors.New("a history needs chat")
 	}
 	tokens := cm.tok.Encode(prompt)
 	if bos := m.bos(); bos >= 0 {
