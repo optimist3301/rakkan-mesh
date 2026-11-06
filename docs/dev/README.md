@@ -135,7 +135,7 @@ rakkan-node daemon -config node.json
 ## Сборка и релизы
 
 ```sh
-make                          # ./rakkan-node для этой машины
+make                          # ./rakkan-node и ./rakkan-web (веб-страница для узла) для этой машины
 make test                     # go vet + go test
 make dist VERSION=0.006-alpha # архивы и SHA256SUMS в dist/ для linux, macOS и Windows (amd64, arm64)
 rakkan-node version

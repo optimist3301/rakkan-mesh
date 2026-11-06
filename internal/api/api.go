@@ -8,6 +8,7 @@
 //	POST /v1/map         {module_hash, inputs, ...}  -> NDJSON stream of results
 //	GET  /v1/status                                  -> node, load and members
 //	POST /v1/llm/models  {checkpoint, tokenizer}     -> {"model", "config"}
+//	GET  /v1/llm/models/{id}                         -> {"name", "arch", "chat", ...}
 //	POST /v1/llm/generate {model, prompt, ...}       -> NDJSON stream of tokens
 //
 // Tasks may attach up to 16 stored blobs ("blobs"), which they read in
@@ -49,6 +50,7 @@ type Server struct {
 	Node    *mesh.Node
 	Trust   *trust.Service // nil disables /v1/trust
 	Network string
+	Version string
 }
 
 // Listen opens the unix socket, replacing a stale one, with owner-only
@@ -79,6 +81,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("GET /v1/trust", s.trust)
 	mux.HandleFunc("POST /v1/llm/models", s.importModel)
+	mux.HandleFunc("GET /v1/llm/models/{id}", s.modelInfo)
 	mux.HandleFunc("POST /v1/llm/generate", s.generate)
 	mux.HandleFunc("POST /v1/llm/prefetch", s.prefetch)
 	return mux
@@ -424,14 +427,17 @@ type loadJSON struct {
 }
 
 type memberJSON struct {
-	ID        string    `json:"id"`
-	Roles     []string  `json:"roles"`
-	Guest     bool      `json:"guest,omitempty"`
-	Score     *float64  `json:"score,omitempty"`
-	Connected bool      `json:"connected"`
-	Relayed   bool      `json:"relayed"`
-	RTTMs     float64   `json:"rtt_ms"`
-	Load      *loadJSON `json:"load,omitempty"`
+	ID        string   `json:"id"`
+	Roles     []string `json:"roles"`
+	Guest     bool     `json:"guest,omitempty"`
+	Score     *float64 `json:"score,omitempty"`
+	Connected bool     `json:"connected"`
+	Relayed   bool     `json:"relayed"`
+	RTTMs     float64  `json:"rtt_ms"`
+	// Addr is the remote address of the preferred connection.
+	Addr     string    `json:"addr,omitempty"`
+	LastSeen time.Time `json:"last_seen,omitzero"`
+	Load     *loadJSON `json:"load,omitempty"`
 }
 
 func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
@@ -439,8 +445,15 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 	local := s.Service.LocalLoad()
 	pol := s.Node.Policy()
 	out := struct {
-		ID      string       `json:"id"`
-		Network string       `json:"network"`
+		ID      string   `json:"id"`
+		Version string   `json:"version,omitempty"`
+		Network string   `json:"network"`
+		Addrs   []string `json:"addrs"`
+		// Yggdrasil is the node's /ygg address and its peerings up.
+		Yggdrasil *struct {
+			Addr  string `json:"addr"`
+			Peers int    `json:"peers"`
+		} `json:"yggdrasil,omitempty"`
 		Guest   bool         `json:"guest"`
 		Open    bool         `json:"open"`
 		PowBits int          `json:"pow_bits,omitempty"`
@@ -448,10 +461,20 @@ func (s *Server) status(w http.ResponseWriter, _ *http.Request) {
 		Members []memberJSON `json:"members"`
 		// LLM lists the nodes serving model stages, fastest first.
 		LLM []llm.NodeInfo `json:"llm,omitempty"`
-	}{ID: s.Node.ID().String(), Network: s.Network, Guest: !s.Node.Certified(), Open: pol.Open, PowBits: pol.PowBits,
+	}{ID: s.Node.ID().String(), Version: s.Version, Network: s.Network, Addrs: []string{}, Guest: !s.Node.Certified(), Open: pol.Open, PowBits: pol.PowBits,
 		Load: loadJSON{local.Slots, local.Busy, local.Queued, local.Capabilities}, Members: []memberJSON{}}
+	for _, a := range s.Node.AddrInfo().Addrs {
+		out.Addrs = append(out.Addrs, a.String())
+	}
+	if y := s.Node.YggdrasilAddr(); y != nil {
+		out.Yggdrasil = &struct {
+			Addr  string `json:"addr"`
+			Peers int    `json:"peers"`
+		}{y.String(), s.Node.YggdrasilPeers()}
+	}
 	for _, m := range s.Node.Members() {
-		mj := memberJSON{ID: m.ID.String(), Roles: m.Roles, Guest: m.Guest, Connected: m.Connected, Relayed: m.Relayed, RTTMs: float64(m.RTT.Microseconds()) / 1000}
+		mj := memberJSON{ID: m.ID.String(), Roles: m.Roles, Guest: m.Guest, Connected: m.Connected, Relayed: m.Relayed, RTTMs: float64(m.RTT.Microseconds()) / 1000,
+			Addr: m.Addr, LastSeen: m.LastSeen}
 		if m.Guest && s.Trust != nil {
 			sc := s.Trust.Score(m.ID)
 			mj.Score = &sc
@@ -627,14 +650,39 @@ func (s *Server) importHF(w http.ResponseWriter, req importRequest, read func(st
 	writeJSON(w, http.StatusOK, map[string]any{"model": id.String(), "config": m.Config, "chat": m.Chat != nil})
 }
 
+// modelInfo describes a model: its name, and what a generation may ask.
+func (s *Server) modelInfo(w http.ResponseWriter, r *http.Request) {
+	if s.LLM == nil {
+		badRequest(w, "language models are not enabled on this node")
+		return
+	}
+	id, err := blob.ParseID(r.PathValue("id"))
+	if err != nil {
+		badRequest(w, "model: %v", err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+	info, err := s.LLM.ModelInfo(ctx, id)
+	if err != nil {
+		var e errorJSON
+		e.Error.Kind, e.Error.Message = "not_found", err.Error()
+		writeJSON(w, http.StatusNotFound, e)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 type generateRequest struct {
-	Chat        bool    `json:"chat,omitempty"`
-	Model       string  `json:"model"`
-	Prompt      string  `json:"prompt"`
-	MaxTokens   int     `json:"max_tokens,omitempty"`
-	Temperature float32 `json:"temperature,omitempty"`
-	Seed        uint64  `json:"seed,omitempty"`
-	Stages      int     `json:"stages,omitempty"`
+	Chat bool `json:"chat,omitempty"`
+	// History are the conversation's earlier turns, with chat.
+	History     []llm.Turn `json:"history,omitempty"`
+	Model       string     `json:"model"`
+	Prompt      string     `json:"prompt"`
+	MaxTokens   int        `json:"max_tokens,omitempty"`
+	Temperature float32    `json:"temperature,omitempty"`
+	Seed        uint64     `json:"seed,omitempty"`
+	Stages      int        `json:"stages,omitempty"`
 	// Draft has DeepSeek-V4.1's draft model propose tokens: the same text,
 	// fewer passes through the stages.
 	Draft bool `json:"draft,omitempty"`
@@ -694,7 +742,7 @@ func (s *Server) generate(w http.ResponseWriter, r *http.Request) {
 	flusher, _ := w.(http.Flusher)
 	enc := json.NewEncoder(w)
 	stats, err := s.LLM.Generate(r.Context(), llm.GenerateRequest{
-		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat, Draft: req.Draft,
+		Model: model, Prompt: req.Prompt, MaxTokens: req.MaxTokens, Temperature: req.Temperature, Seed: req.Seed, Stages: req.Stages, Chat: req.Chat, History: req.History, Draft: req.Draft,
 		Images: images,
 	}, func(e llm.Event) error {
 		if err := enc.Encode(map[string]any{"token": e.Token, "text": e.Text}); err != nil {

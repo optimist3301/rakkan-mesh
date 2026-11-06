@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rakkan</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="app.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <img src="favicon.svg" alt="" width="22" height="22">
+    <span>Rakkan</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" id="tab-net" aria-controls="view-net" aria-selected="true" data-i18n="tabNet">Сеть</button>
+    <button role="tab" id="tab-chat" aria-controls="view-chat" aria-selected="false" data-i18n="tabChat">Чат</button>
+  </nav>
+  <div class="conn" id="conn" aria-live="polite"><span class="dot"></span><span id="conn-text">…</span></div>
+</header>
+
+<main>
+  <section id="view-net" role="tabpanel" aria-labelledby="tab-net">
+    <div class="self card">
+      <div class="self-row">
+        <div>
+          <div class="label" data-i18n="thisNode">Этот узел</div>
+          <div class="mono big" id="self-id">—</div>
+        </div>
+        <div>
+          <div class="label" data-i18n="network">Сеть</div>
+          <div class="mono" id="self-net">—</div>
+        </div>
+        <div>
+          <div class="label" data-i18n="version">Версия</div>
+          <div id="self-version">—</div>
+        </div>
+      </div>
+      <details>
+        <summary data-i18n="addresses">Адреса</summary>
+        <ul class="addrs mono" id="self-addrs"></ul>
+      </details>
+    </div>
+
+    <div class="stats">
+      <div class="stat card"><div class="label" data-i18n="connected">Подключено</div><div class="value" id="st-connected">—</div><div class="sub" id="st-known"></div></div>
+      <div class="stat card"><div class="label" data-i18n="guests">Гости</div><div class="value" id="st-guests">—</div><div class="sub" id="st-open"></div></div>
+      <div class="stat card"><div class="label" data-i18n="llmNodes">Узлы нейросетей</div><div class="value" id="st-llm">—</div><div class="sub" id="st-llm-sub"></div></div>
+      <div class="stat card"><div class="label">Yggdrasil</div><div class="value" id="st-ygg">—</div><div class="sub" id="st-ygg-sub"></div></div>
+      <div class="stat card"><div class="label" data-i18n="ownLoad">Своя нагрузка</div><div class="value" id="st-load">—</div><div class="sub" id="st-queue"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2 data-i18n="members">Участники</h2>
+        <label class="check"><input type="checkbox" id="show-offline" checked> <span data-i18n="showOffline">показывать отключённых</span></label>
+      </div>
+      <div class="table-wrap">
+        <table id="members">
+          <thead><tr>
+            <th data-i18n="node">Узел</th>
+            <th data-i18n="role">Роль</th>
+            <th data-i18n="state">Состояние</th>
+            <th data-i18n="path">Путь</th>
+            <th class="num">RTT</th>
+            <th data-i18n="load">Нагрузка</th>
+            <th data-i18n="caps">Возможности</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="empty" id="members-empty" hidden data-i18n="noMembers">Пока никого не видно. Узел ищет сеть в DHT и через Yggdrasil — это может занять минуту.</p>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2 data-i18n="llmTitle">Нейросети в сети</h2></div>
+      <div class="table-wrap">
+        <table id="llm">
+          <thead><tr>
+            <th data-i18n="node">Узел</th>
+            <th data-i18n="device">Устройство</th>
+            <th class="num" data-i18n="speed">Скорость</th>
+            <th class="num" data-i18n="freeMem">Свободно</th>
+            <th data-i18n="shards">Держит слои</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="empty" id="llm-empty" hidden data-i18n="noLLM">Ни один узел не обслуживает нейросети. Запустите узел с флагом -llm.</p>
+    </div>
+  </section>
+
+  <section id="view-chat" role="tabpanel" aria-labelledby="tab-chat" hidden>
+    <div class="chat">
+      <aside class="chat-side card">
+        <label class="label" for="model" data-i18n="model">Модель</label>
+        <select id="model"></select>
+        <div class="model-info" id="model-info"></div>
+        <form id="add-model" class="add-model">
+          <input id="add-model-id" class="mono" placeholder="ID модели" data-i18n-ph="modelIdPh" autocomplete="off" spellcheck="false">
+          <button type="submit" data-i18n="add">Добавить</button>
+        </form>
+        <label class="label" for="temp"><span data-i18n="temperature">Температура</span> <output id="temp-out">0.7</output></label>
+        <input type="range" id="temp" min="0" max="1.5" step="0.05" value="0.7">
+        <label class="label" for="max-tokens" data-i18n="maxTokens">Длина ответа, токенов</label>
+        <input type="number" id="max-tokens" min="1" max="8192" value="512">
+        <label class="check" id="draft-row" hidden><input type="checkbox" id="draft" checked> <span data-i18n="draft">черновая модель (быстрее)</span></label>
+        <button id="new-chat" class="secondary" data-i18n="newChat">Новый разговор</button>
+      </aside>
+
+      <div class="chat-main card">
+        <div class="messages" id="messages" aria-live="polite">
+          <div class="hint" id="chat-hint" data-i18n="chatHint">Выберите модель и напишите сообщение. Ответ считают узлы сети: каждый — свой кусок слоёв.</div>
+        </div>
+        <form id="composer" class="composer">
+          <div class="attachments" id="attachments"></div>
+          <div class="composer-row">
+            <label class="attach" id="attach-label" hidden title="Картинка" data-i18n-title="image">
+              <input type="file" id="attach" accept="image/png,image/jpeg" multiple>
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M16.5 6.5v10a4.5 4.5 0 0 1-9 0V5a3 3 0 0 1 6 0v10.5a1.5 1.5 0 0 1-3 0V6.5H9v9a3 3 0 0 0 6 0V5a4.5 4.5 0 0 0-9 0v11.5a6 6 0 0 0 12 0v-10z"/></svg>
+            </label>
+            <textarea id="input" rows="1" placeholder="Сообщение…" data-i18n-ph="messagePh"></textarea>
+            <button type="submit" id="send" data-i18n="send">Отправить</button>
+            <button type="button" id="stop" class="danger" hidden data-i18n="stop">Стоп</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </section>
+</main>
+
+<dialog id="token-dialog">
+  <form method="dialog" id="token-form">
+    <h3 data-i18n="tokenTitle">Нужен токен</h3>
+    <p data-i18n="tokenText">Узел слушает не только localhost и просит токен из флага -web-token.</p>
+    <input id="token-input" type="password" autocomplete="current-password">
+    <div class="dialog-buttons"><button value="ok" data-i18n="ok">Войти</button></div>
+  </form>
+</dialog>
+</body>
+</html>

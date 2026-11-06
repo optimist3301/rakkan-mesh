@@ -800,9 +800,21 @@ func newDeepseekCoord(m *Manifest, tokenizer []byte, readHead func() (map[string
 // places are the model's image token, from the config: a tokenizer may
 // spell the placeholder otherwise. Without chat, the placeholder in the
 // text marks them.
-func (d *deepseekCoord) prompt(text string, chat bool, images int) ([]int, error) {
+func (d *deepseekCoord) prompt(text string, chat bool, images int, history []Turn) ([]int, error) {
 	c := d.head.Cfg
+	if !chat && len(history) > 0 {
+		return nil, errors.New("a history needs chat")
+	}
 	if chat {
+		var msgs []*dsv41.Value
+		for _, t := range history {
+			for _, m := range [][2]string{{"user", t.User}, {"assistant", t.Assistant}} {
+				v := dsv41.NewObject()
+				v.Set("role", dsv41.NewString(m[0]))
+				v.Set("content", dsv41.NewString(m[1]))
+				msgs = append(msgs, v)
+			}
+		}
 		msg := dsv41.NewObject()
 		msg.Set("role", dsv41.NewString("user"))
 		if images == 0 {
@@ -820,7 +832,7 @@ func (d *deepseekCoord) prompt(text string, chat bool, images int) ([]int, error
 			b.Set("text", dsv41.NewString(text))
 			msg.Set("content", dsv41.NewArray(append(blocks, b)...))
 		}
-		p, _, err := dsv41.EncodeChat([]*dsv41.Value{msg}, dsv41.ChatOptions{ThinkingMode: "chat"})
+		p, _, err := dsv41.EncodeChat(append(msgs, msg), dsv41.ChatOptions{ThinkingMode: "chat"})
 		if err != nil {
 			return nil, err
 		}

@@ -262,7 +262,7 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("api: %w", err))
 		}
 		defer os.Remove(*apiPath)
-		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID}
+		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID, Version: version}
 		go func() {
 			if err := srv.Serve(ctx, l); err != nil {
 				slog.Error("api", "err", err)
