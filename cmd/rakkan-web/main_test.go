@@ -39,6 +39,7 @@ func fakeNode(t *testing.T, sock string, sawAuth *string) {
 		io.WriteString(w, `{"id":"x","addrs":[]}`)
 	})
 	mux.HandleFunc("POST /v1/llm/generate", func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body) // as the node's handler reads the request
 		io.WriteString(w, `{"text":"a"}`+"\n")
 		w.(http.Flusher).Flush()
 		time.Sleep(300 * time.Millisecond)
