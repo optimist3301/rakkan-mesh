@@ -1,9 +1,11 @@
-// Package web serves the node's web page: the members it sees, the nodes
-// serving language models, and a chat with a model of the network.
+// Package web serves a web page for a node: the members it sees, the nodes
+// serving language models, and a chat with a model of the network. The
+// command rakkan-web runs it apart from the node, as a client of the node's
+// local API (package api).
 //
-// The page talks to part of the local API (package api): reading the
-// status and trust, describing a model, and generating. Nothing else, so
-// the page cannot run tasks or import models.
+// The page reaches part of that API: reading the status and trust,
+// describing a model, and generating. Nothing else, so it cannot run tasks
+// or import models.
 //
 // A browser on the same machine may load pages from anywhere, and any of
 // them may send requests to a port on localhost. On a loopback address the

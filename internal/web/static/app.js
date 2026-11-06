@@ -29,6 +29,9 @@ const T = {
     errNoCapacity: "Сейчас никто не может посчитать эту модель: нет узлов с -llm или им не хватает памяти.",
     errLLM: "На этом узле нейросети не включены.", stopped: "остановлено", ago: { s: "{0} с назад", m: "{0} мин назад", h: "{0} ч назад", d: "{0} дн назад" },
     badModel: "Не похоже на ID модели", notFound: "Модель не найдена: {0}",
+    node_failed: "Узел оборвал запрос. Подробности — в журнале rakkan-node.",
+    node_unreachable: "rakkan-web не достучался до узла. Запущен ли rakkan-node?",
+    oldNode: "Узел старше 0.007-alpha: модель не видит прошлых реплик разговора, а имена моделей неизвестны. Обновите rakkan-node.",
     emptyAnswer: "(пустой ответ: модель сразу закончила)", lost: "Соединение с узлом прервалось. Загляните в журнал узла.",
   },
   en: {
@@ -57,6 +60,9 @@ const T = {
     errNoCapacity: "Nobody can run this model now: no -llm nodes, or not enough memory.",
     errLLM: "Language models are not enabled on this node.", stopped: "stopped", ago: { s: "{0}s ago", m: "{0} min ago", h: "{0} h ago", d: "{0} d ago" },
     badModel: "That does not look like a model ID", notFound: "Model not found: {0}",
+    node_failed: "The node broke off the request. See rakkan-node's log.",
+    node_unreachable: "rakkan-web cannot reach the node. Is rakkan-node running?",
+    oldNode: "The node is older than 0.007-alpha: the model does not see the conversation's earlier turns, and model names are unknown. Update rakkan-node.",
     emptyAnswer: "(empty answer: the model stopped at once)", lost: "The connection to the node broke. See the node's log.",
   },
 };
@@ -144,6 +150,7 @@ function askToken() {
 async function errorText(res) {
   try {
     const j = await res.json();
+    if (j.error && L[j.error.kind]) return L[j.error.kind];
     if (j.error) return typeof j.error === "string" ? j.error : j.error.message;
   } catch { /* not JSON */ }
   return res.status + " " + res.statusText;
@@ -187,8 +194,13 @@ function loadCell(l) {
   return el("span", { class: "state" }, bar, el("span", { class: "num", text: l.busy + "/" + l.slots + q }));
 }
 
+// A node older than 0.007-alpha reports no addresses; it ignores a
+// conversation's history and cannot describe models.
+let oldNode = false;
+
 function renderStatus(s) {
   status = s;
+  if (oldNode !== !("addrs" in s)) { oldNode = !oldNode; onModelChange(); }
   $("self-id").textContent = s.id;
   $("self-net").textContent = s.network;
   $("self-version").textContent = s.version || "—";
@@ -350,7 +362,7 @@ function onModelChange() {
   $("draft-row").hidden = !(info && info.draft);
   $("attach-label").hidden = !(info && info.images);
   if (!(info && info.images)) { attachments = []; renderAttachments(); }
-  hint.textContent = m ? L.chatHint : L.noModelsHint;
+  hint.textContent = (m ? L.chatHint : L.noModelsHint) + (oldNode ? "\n\n" + L.oldNode : "");
 }
 $("model").addEventListener("change", onModelChange);
 
@@ -507,37 +519,22 @@ $("composer").addEventListener("submit", async (e) => {
   };
   if (m.info && m.info.draft && $("draft").checked) req.draft = true;
   if (turn.images.length) req.images = turn.images;
-  try {
-    const res = await api("/v1/llm/generate", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req), signal: ctrl.signal,
-    });
-    if (!res.ok) throw new Error(await errorText(res));
-    const reader = res.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (!line.trim()) continue;
-        const ev = JSON.parse(line);
-        if (ev.error) {
-          throw new Error(ev.error.kind === "no_capacity" ? L.errNoCapacity : ev.error.message);
-        } else if (ev.done) {
-          turn.stats = ev.stats;
-        } else if (ev.text != null) {
-          const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
-          turn.assistant += ev.text;
-          renderText(turn.node, turn.assistant);
-          if (stick) box.scrollTop = box.scrollHeight;
-        }
-      }
+  // A model not described (an old node) is asked in the chat format first,
+  // and again without it if it has none.
+  const ask = async () => {
+    try {
+      return await stream(req, ctrl, turn, box);
+    } catch (err) {
+      if (!req.chat || m.info || turn.assistant || !String(err.message).includes("no chat format")) throw err;
+      models.set(m.id, { model: m.id, arch: "?", chat: false });
+      onModelChange();
+      req.chat = false;
+      req.history = [];
+      return stream(req, ctrl, turn, box);
     }
+  };
+  try {
+    await ask();
   } catch (err) {
     if (err.name === "AbortError") {
       turn.stats = Object.assign({ tokens: 0, stages: [] }, turn.stats, { stopped: true });
@@ -566,5 +563,39 @@ $("composer").addEventListener("submit", async (e) => {
     input.focus();
   }
 });
+
+// stream runs a generation, adding its text to turn as it comes.
+async function stream(req, ctrl, turn, box) {
+  const res = await api("/v1/llm/generate", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req), signal: ctrl.signal,
+  });
+  if (!res.ok) throw new Error(await errorText(res));
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const ev = JSON.parse(line);
+      if (ev.error) {
+        throw new Error(ev.error.kind === "no_capacity" ? L.errNoCapacity : ev.error.message);
+      } else if (ev.done) {
+        turn.stats = ev.stats;
+      } else if (ev.text != null) {
+        const stick = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        turn.assistant += ev.text;
+        renderText(turn.node, turn.assistant);
+        if (stick) box.scrollTop = box.scrollHeight;
+      }
+    }
+  }
+}
 
 renderConvo();

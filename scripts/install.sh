@@ -818,7 +818,6 @@ EOF
       say "  Logs:  tail -f \"$LOG_FILE\"" "  Журнал:  tail -f \"$LOG_FILE\""
     fi
   fi
-  say "  Web page (members, chat with a model): http://localhost:7780" "  Веб-страница (участники, чат с нейросетью): http://localhost:7780"
   if [ "$TYPE" = relay ] && [ "$MAINLINE" = y ]; then
     printf '\n'
     say "  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:" \
