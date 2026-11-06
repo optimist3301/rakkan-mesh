@@ -17,6 +17,7 @@
   <nav class="tabs" role="tablist">
     <button role="tab" id="tab-net" aria-controls="view-net" aria-selected="true" data-i18n="tabNet">Сеть</button>
     <button role="tab" id="tab-chat" aria-controls="view-chat" aria-selected="false" data-i18n="tabChat">Чат</button>
+    <button role="tab" id="tab-models" aria-controls="view-models" aria-selected="false" data-i18n="tabModels">Модели</button>
   </nav>
   <div class="conn" id="conn" aria-live="polite"><span class="dot"></span><span id="conn-text">…</span></div>
 </header>
@@ -127,6 +128,59 @@
           </div>
         </form>
       </div>
+    </div>
+  </section>
+  <section id="view-models" role="tabpanel" aria-labelledby="tab-models" hidden>
+    <div class="card">
+      <div class="card-head"><h2 data-i18n="importTitle">Загрузить модель с Hugging Face</h2></div>
+      <p class="caps" data-i18n="importText">rakkan-web скачает файлы модели и передаст их узлу; узлы с -llm потом возьмут себе её слои. Подходят Llama 3, Qwen2/2.5 и Qwen3 в safetensors, а также DeepSeek-V4.1.</p>
+      <form id="import-form" class="import-form">
+        <label class="field wide">
+          <span class="label" data-i18n="repo">Репозиторий</span>
+          <input id="imp-repo" class="mono" list="repo-examples" placeholder="Qwen/Qwen2.5-0.5B-Instruct" autocomplete="off" spellcheck="false" required>
+          <datalist id="repo-examples">
+            <option value="Qwen/Qwen2.5-0.5B-Instruct">
+            <option value="Qwen/Qwen2.5-1.5B-Instruct">
+            <option value="Qwen/Qwen2.5-7B-Instruct">
+            <option value="Qwen/Qwen3-0.6B">
+            <option value="Qwen/Qwen3-4B">
+            <option value="meta-llama/Llama-3.2-1B-Instruct">
+          </datalist>
+        </label>
+        <label class="field">
+          <span class="label" data-i18n="revision">Версия</span>
+          <input id="imp-rev" class="mono" value="main" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span class="label" data-i18n="quant">Хранить веса</span>
+          <select id="imp-quant">
+            <option value="q8_0" data-i18n="q8">q8_0 — вдвое меньше, почти без потерь</option>
+            <option value="q4_m" data-i18n="q4m">q4_m — втрое меньше</option>
+            <option value="q4_0" data-i18n="q40">q4_0 — втрое меньше, грубее</option>
+            <option value="bf16" data-i18n="bf16">bf16 — как есть, точно</option>
+            <option value="" data-i18n="asIs">как в файлах</option>
+          </select>
+        </label>
+        <label class="field">
+          <span class="label" data-i18n="modelName">Имя</span>
+          <input id="imp-name" placeholder="по имени репозитория" data-i18n-ph="namePh" autocomplete="off">
+        </label>
+        <label class="field">
+          <span class="label" data-i18n="hfToken">Токен Hugging Face (для закрытых моделей, например Llama)</span>
+          <input id="imp-token" type="password" placeholder="hf_…" autocomplete="off">
+        </label>
+        <div class="import-buttons">
+          <button type="button" id="imp-check" class="secondary" data-i18n="check">Проверить</button>
+          <button type="submit" id="imp-start" data-i18n="download">Скачать и загрузить в сеть</button>
+        </div>
+      </form>
+      <div id="imp-info" class="imp-info" hidden></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2 data-i18n="importsTitle">Загрузки</h2></div>
+      <div id="jobs"></div>
+      <p class="empty" id="jobs-empty" data-i18n="noJobs">Пока ничего не загружалось.</p>
     </div>
   </section>
 </main>

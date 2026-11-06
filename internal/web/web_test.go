@@ -10,6 +10,9 @@ import (
 // fakeAPI answers 200 "api" to anything, so the tests see what reaches it.
 var fakeAPI = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Write([]byte("api")) })
 
+// fakeApp answers "api" too: the program's own routes are guarded alike.
+var fakeApp = fakeAPI
+
 func do(h http.Handler, method, url, host string, hdr map[string]string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, url, strings.NewReader("{}"))
 	r.Host = host
@@ -22,7 +25,7 @@ func do(h http.Handler, method, url, host string, hdr map[string]string) *httpte
 }
 
 func TestLoopback(t *testing.T) {
-	h := Handler(fakeAPI, "")
+	h := Handler(fakeAPI, fakeApp, "")
 	json := map[string]string{"Content-Type": "application/json"}
 	for _, c := range []struct {
 		name, method, url, host string
@@ -43,6 +46,10 @@ func TestLoopback(t *testing.T) {
 		{"run is not offered", "POST", "/v1/run", "localhost:7780", json, 405, false},
 		{"blobs are not offered", "GET", "/v1/blobs/x", "localhost:7780", nil, 404, false},
 		{"import is not offered", "POST", "/v1/llm/models", "localhost:7780", json, 405, false},
+		{"app route", "POST", "/app/models/import", "localhost:7780", json, 200, true},
+		{"app route, foreign origin", "POST", "/app/models/import", "localhost:7780", map[string]string{"Content-Type": "application/json", "Origin": "https://evil.example"}, 403, false},
+		{"app route, form post", "POST", "/app/models/import", "localhost:7780", map[string]string{"Content-Type": "text/plain"}, 415, false},
+		{"app route, rebinding", "GET", "/app/models/jobs", "evil.example", nil, http.StatusMisdirectedRequest, false},
 	} {
 		w := do(h, c.method, c.url, c.host, c.hdr)
 		if w.Code != c.code {
@@ -62,9 +69,12 @@ func TestLoopback(t *testing.T) {
 }
 
 func TestToken(t *testing.T) {
-	h := Handler(fakeAPI, "s3cret")
+	h := Handler(fakeAPI, fakeApp, "s3cret")
 	if w := do(h, "GET", "/", "node.lan:7780", nil); w.Code != 200 {
 		t.Errorf("page without token: %d", w.Code)
+	}
+	if w := do(h, "GET", "/app/models/jobs", "node.lan:7780", nil); w.Code != 401 {
+		t.Errorf("app route without token: %d", w.Code)
 	}
 	if w := do(h, "GET", "/v1/status", "node.lan:7780", nil); w.Code != 401 {
 		t.Errorf("status without token: %d", w.Code)

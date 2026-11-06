@@ -54,7 +54,7 @@ func TestProxy(t *testing.T) {
 	sock := filepath.Join(shortDir(t), "rakkan.sock")
 	var auth string
 	fakeNode(t, sock, &auth)
-	ts := httptest.NewServer(web.Handler(nodeAPI(sock), "tok"))
+	ts := httptest.NewServer(web.Handler(nodeAPI(sock), nil, "tok"))
 	defer ts.Close()
 
 	req, _ := http.NewRequest("GET", ts.URL+"/v1/status", nil)
@@ -95,7 +95,7 @@ func TestProxy(t *testing.T) {
 
 func TestNodeDown(t *testing.T) {
 	sock := filepath.Join(shortDir(t), "none.sock")
-	ts := httptest.NewServer(web.Handler(nodeAPI(sock), ""))
+	ts := httptest.NewServer(web.Handler(nodeAPI(sock), nil, ""))
 	defer ts.Close()
 	// httptest's Host is 127.0.0.1:port, a loopback host.
 	res, err := http.Get(ts.URL + "/v1/status")

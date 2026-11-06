@@ -4,7 +4,21 @@
 
 const T = {
   ru: {
-    tabNet: "Сеть", tabChat: "Чат", thisNode: "Этот узел", network: "Сеть", version: "Версия",
+    tabNet: "Сеть", tabChat: "Чат", tabModels: "Модели", archLlama: "llama-подобная",
+    importTitle: "Загрузить модель с Hugging Face",
+    importText: "rakkan-web скачает файлы модели и передаст их узлу; узлы с -llm потом возьмут себе её слои. Подходят Llama 3, Qwen2/2.5 и Qwen3 в safetensors, а также DeepSeek-V4.1.",
+    repo: "Репозиторий", revision: "Версия", quant: "Хранить веса", modelName: "Имя", namePh: "по имени репозитория",
+    q8: "q8_0 — вдвое меньше, почти без потерь", q4m: "q4_m — втрое меньше", q40: "q4_0 — втрое меньше, грубее",
+    bf16: "bf16 — как есть, точно", asIs: "как в файлах",
+    hfToken: "Токен Hugging Face (для закрытых моделей, например Llama)", check: "Проверить", download: "Скачать и загрузить в сеть",
+    importsTitle: "Загрузки", noJobs: "Пока ничего не загружалось.",
+    files: "файлов: {0}, всего {1}", archLine: "Архитектура: {0} · коммит {1}",
+    noteDeepseek: "DeepSeek-V4.1: rakkan-web ничего не скачивает — узлы с -llm возьмут свои слои с Hub сами (весов {0}). Для закрытого репозитория токен нужен самому узлу (HF_TOKEN).",
+    noteMistral: "Mistral пока не поддерживается: его токенизатор (SentencePiece с byte fallback) узел не умеет.",
+    noteUnsupported: "Архитектура {0} не поддерживается: подходят llama, qwen2, qwen3 и DeepSeek-V4.1.",
+    st: { downloading: "скачивается", importing: "узел режет модель на слои", done: "готово", failed: "ошибка", cancelled: "отменено" },
+    cancel: "Отменить", openChat: "Открыть в чате", eta: "осталось ~{0}", speedOf: "{0}/с",
+    modelReady: "ID модели: {0}", thisNode: "Этот узел", network: "Сеть", version: "Версия",
     addresses: "Адреса", connected: "Подключено", guests: "Гости", llmNodes: "Узлы нейросетей",
     ownLoad: "Своя нагрузка", members: "Участники", showOffline: "показывать отключённых",
     node: "Узел", role: "Роль", state: "Состояние", path: "Путь", load: "Нагрузка", caps: "Возможности",
@@ -35,7 +49,21 @@ const T = {
     emptyAnswer: "(пустой ответ: модель сразу закончила)", lost: "Соединение с узлом прервалось. Загляните в журнал узла.",
   },
   en: {
-    tabNet: "Network", tabChat: "Chat", thisNode: "This node", network: "Network", version: "Version",
+    tabNet: "Network", tabChat: "Chat", tabModels: "Models", archLlama: "llama-like",
+    importTitle: "Load a model from Hugging Face",
+    importText: "rakkan-web downloads the model's files and hands them to the node; nodes with -llm then take its layers. Llama 3, Qwen2/2.5 and Qwen3 in safetensors fit, and DeepSeek-V4.1.",
+    repo: "Repository", revision: "Revision", quant: "Store weights as", modelName: "Name", namePh: "the repository's name",
+    q8: "q8_0 — half the size, nearly lossless", q4m: "q4_m — a third of the size", q40: "q4_0 — a third, coarser",
+    bf16: "bf16 — as is, exact", asIs: "as in the files",
+    hfToken: "Hugging Face token (for gated models such as Llama)", check: "Check", download: "Download into the network",
+    importsTitle: "Imports", noJobs: "Nothing imported yet.",
+    files: "{0} files, {1} in all", archLine: "Architecture: {0} · commit {1}",
+    noteDeepseek: "DeepSeek-V4.1: rakkan-web downloads nothing — the -llm nodes fetch their layers from the Hub themselves ({0} of weights). A gated repository needs the token on the node (HF_TOKEN).",
+    noteMistral: "Mistral is not supported yet: the node cannot read its tokenizer (SentencePiece with byte fallback).",
+    noteUnsupported: "Architecture {0} is not supported: llama, qwen2, qwen3 and DeepSeek-V4.1 are.",
+    st: { downloading: "downloading", importing: "the node is splitting it into layers", done: "done", failed: "failed", cancelled: "cancelled" },
+    cancel: "Cancel", openChat: "Open in chat", eta: "~{0} left", speedOf: "{0}/s",
+    modelReady: "Model ID: {0}", thisNode: "This node", network: "Network", version: "Version",
     addresses: "Addresses", connected: "Connected", guests: "Guests", llmNodes: "Model nodes",
     ownLoad: "Own load", members: "Members", showOffline: "show disconnected",
     node: "Node", role: "Role", state: "State", path: "Path", load: "Load", caps: "Capabilities",
@@ -158,18 +186,19 @@ async function errorText(res) {
 
 // --- tabs --------------------------------------------------------------
 
+const TABS = ["net", "chat", "models"];
 function showTab(name) {
-  for (const t of ["net", "chat"]) {
+  if (!TABS.includes(name)) name = "net";
+  for (const t of TABS) {
     $("tab-" + t).setAttribute("aria-selected", String(t === name));
     $("view-" + t).hidden = t !== name;
   }
   store.set("tab", name);
-  history.replaceState(null, "", name === "chat" ? "#chat" : "#");
+  history.replaceState(null, "", "#" + name);
   if (name === "chat") $("input").focus();
+  if (name === "models") pollJobs();
 }
-$("tab-net").addEventListener("click", () => showTab("net"));
-$("tab-chat").addEventListener("click", () => showTab("chat"));
-showTab(location.hash === "#chat" ? "chat" : location.hash === "#net" ? "net" : store.get("tab", "net"));
+for (const t of TABS) $("tab-" + t).addEventListener("click", () => showTab(t));
 
 // --- monitoring --------------------------------------------------------
 
@@ -352,7 +381,7 @@ function onModelChange() {
   const info = m && m.info;
   const parts = [];
   if (info) {
-    parts.push(info.arch);
+    parts.push(info.arch === "llama" ? L.archLlama : info.arch);
     if (info.layers) parts.push(fmt(L.layers, info.layers));
     if (info.images) parts.push(L.images);
     if (!info.chat) parts.push(L.noChat);
@@ -599,3 +628,151 @@ async function stream(req, ctrl, turn, box) {
 }
 
 renderConvo();
+
+// --- models ------------------------------------------------------------
+
+function duration(s) {
+  if (!isFinite(s) || s < 0) return "";
+  if (s < 90) return Math.round(s) + (lang === "ru" ? " с" : " s");
+  if (s < 5400) return Math.round(s / 60) + (lang === "ru" ? " мин" : " min");
+  return (s / 3600).toFixed(1) + (lang === "ru" ? " ч" : " h");
+}
+
+function importRequest() {
+  return {
+    repo: $("imp-repo").value.trim(), revision: $("imp-rev").value.trim() || "main",
+    quant: $("imp-quant").value, name: $("imp-name").value.trim(), token: $("imp-token").value.trim(),
+  };
+}
+
+async function appPost(path, body) {
+  const res = await api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(await errorText(res));
+  return res.json();
+}
+
+function showInfo(content, bad) {
+  const box = $("imp-info");
+  box.hidden = false;
+  box.className = "imp-info" + (bad ? " bad" : "");
+  box.replaceChildren(...[].concat(content));
+}
+
+function describeRepo(info) {
+  const out = [el("div", { text: fmt(L.archLine, info.model_type || "?", info.revision.slice(0, 10)) })];
+  if (info.deepseek) {
+    out.push(el("div", { class: "warn", text: fmt(L.noteDeepseek, bytes(info.total)) }));
+  } else {
+    out.push(el("div", { text: fmt(L.files, info.files.length, bytes(info.total)) }));
+    out.push(el("ul", {}, ...info.files.map((f) => el("li", { class: "mono", text: f.name + " — " + bytes(f.size) }))));
+  }
+  if (info.note === "mistral") out.push(el("div", { class: "warn", text: L.noteMistral }));
+  if (info.note === "unsupported") out.push(el("div", { class: "warn", text: fmt(L.noteUnsupported, info.model_type || "?") }));
+  return out;
+}
+
+$("imp-repo").addEventListener("input", () => { $("imp-info").hidden = true; });
+$("imp-check").addEventListener("click", async () => {
+  const req = importRequest();
+  if (!req.repo) return $("imp-repo").focus();
+  $("imp-check").disabled = true;
+  try {
+    const info = await appPost("/app/models/inspect", req);
+    showInfo(describeRepo(info), !info.supported);
+    $("imp-quant").disabled = !!info.deepseek;
+  } catch (err) {
+    showInfo(el("span", { text: err.message }), true);
+  } finally {
+    $("imp-check").disabled = false;
+  }
+});
+$("import-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const req = importRequest();
+  if ($("imp-quant").disabled) req.quant = "";
+  $("imp-start").disabled = true;
+  try {
+    await appPost("/app/models/import", req);
+    $("imp-info").hidden = true;
+    pollJobs();
+  } catch (err) {
+    showInfo(el("span", { text: err.message }), true);
+  } finally {
+    $("imp-start").disabled = false;
+  }
+});
+
+// Speeds: the bytes a job had at the last poll.
+const lastDone = new Map();
+let jobsTimer = null;
+const announced = new Set(store.get("importedJobs", []));
+
+function renderJob(j) {
+  const now = Date.now();
+  const prev = lastDone.get(j.id);
+  lastDone.set(j.id, { done: j.done, at: now });
+  const running = j.state === "downloading" || j.state === "importing";
+  let sub = L.st[j.state] || j.state;
+  if (j.state === "downloading" && j.total) {
+    sub += " · " + bytes(j.done) + " / " + bytes(j.total);
+    if (prev && now > prev.at && j.done > prev.done) {
+      const speed = ((j.done - prev.done) * 1000) / (now - prev.at);
+      sub += " · " + fmt(L.speedOf, bytes(speed)) + " · " + fmt(L.eta, duration((j.total - j.done) / speed));
+    }
+  }
+  if (j.quant) sub += " · " + j.quant;
+  const actions = el("div", { class: "actions" });
+  if (running) actions.append(el("button", { class: "secondary", text: L.cancel, onclick: () => appPost("/app/models/jobs/" + j.id + "/cancel", {}).then(pollJobs) }));
+  if (j.state === "done" && j.model) actions.append(el("button", { text: L.openChat, onclick: () => openInChat(j.model) }));
+  const row = el("div", { class: "job" },
+    el("div", {}, el("div", { class: "job-title", text: j.name + "  ·  " + j.repo }), el("div", { class: "job-sub", text: sub })),
+    actions);
+  if (running || j.state === "done") {
+    const bar = el("div", { class: "progress" }, el("i"));
+    const frac = j.state === "done" ? 1 : j.total ? j.done / j.total : 0;
+    bar.firstChild.style.width = Math.round(frac * 100) + "%";
+    row.append(bar);
+  }
+  if (j.error) row.append(el("div", { class: "err", text: j.error }));
+  if (j.model) row.append(el("div", { class: "job-sub mono", title: j.model, text: fmt(L.modelReady, j.model) }));
+  return row;
+}
+
+function rememberModel(id) {
+  if (!models.has(id)) models.set(id, null);
+  const saved = store.get("models", []);
+  if (!saved.includes(id)) { saved.push(id); store.set("models", saved); }
+  failed.delete(id);
+  renderModelSelect();
+  updateModels();
+}
+
+function openInChat(id) {
+  rememberModel(id);
+  $("model").value = id;
+  onModelChange();
+  showTab("chat");
+}
+
+async function pollJobs() {
+  clearTimeout(jobsTimer);
+  let jobs = [];
+  try {
+    const res = await api("/app/models/jobs");
+    if (res.ok) jobs = await res.json();
+  } catch { /* shown by the connection dot */ }
+  $("jobs").replaceChildren(...jobs.map(renderJob));
+  $("jobs-empty").hidden = jobs.length > 0;
+  for (const j of jobs) {
+    if (j.state === "done" && j.model && !announced.has(j.model)) {
+      announced.add(j.model);
+      store.set("importedJobs", [...announced]);
+      rememberModel(j.model);
+    }
+  }
+  const active = jobs.some((j) => j.state === "downloading" || j.state === "importing");
+  if (active || !$("view-models").hidden) jobsTimer = setTimeout(pollJobs, active ? 1000 : 5000);
+}
+
+showTab(location.hash.slice(1) || store.get("tab", "net"));
+pollJobs();

@@ -384,8 +384,25 @@ rakkan-web -listen 0.0.0.0:7780 -token <пароль>
 для системы запускайте `sudo -u rakkan rakkan-web`.
 
 Странице доступна часть API: `GET /v1/status`, `GET /v1/trust`,
-`GET /v1/llm/models/{id}`, `POST /v1/llm/generate`. Остального — задач,
-блобов, импорта моделей — через неё нет.
+`GET /v1/llm/models/{id}`, `POST /v1/llm/generate`. Задач и блобов через неё
+нет.
+
+Вкладка «Модели» загружает модель с Hugging Face Hub (`-hub`, по умолчанию
+`https://huggingface.co`). Это делает сама `rakkan-web`: закрепляет ветку как
+коммит, скачивает `config.json`, `tokenizer.json`, по возможности
+`generation_config.json` и `tokenizer_config.json`, и веса — шарды из
+`model.safetensors.index.json` или `.safetensors` в корне репозитория. Файлы
+идут потоком с Hub прямо в `POST /v1/blobs` узла, на диск `rakkan-web` ничего
+не пишет. SHA-256 каждого файла весов сверяется с тем, что публикует Hub.
+Оборванная загрузка файла повторяется с начала, до трёх раз. Затем
+`rakkan-web` вызывает `POST /v1/llm/models` с `"format": "hf"` и выбранным
+`quant`. DeepSeek-V4.1 она узнаёт по `config.json` и передаёт узлу
+`"format": "hub"`: веса скачают узлы, считающие стадии, каждый свои слои.
+Токен Hugging Face для закрытых моделей страница передаёт только на время
+загрузки и нигде не хранит (DeepSeek из закрытого репозитория требует
+`HF_TOKEN` у самих узлов). Маршруты программы — `/app/models/inspect`,
+`/app/models/import`, `/app/models/jobs`, `/app/models/jobs/{id}/cancel` —
+защищены так же, как `/v1/`; загрузки помнятся, пока программа работает.
 
 Защита. Любая страница в браузере может слать запросы на порт localhost,
 поэтому на loopback-адресе `rakkan-web` отвечает только запросам с
