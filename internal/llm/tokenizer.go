@@ -71,8 +71,13 @@ func (t *Tokenizer) Encode(text string, bos bool) []int {
 		if id, ok := t.index[text[i:i+size]]; ok {
 			tokens = append(tokens, id)
 		} else {
+			// Byte fallback, as run.c: tokens 3..258 are the bytes. A
+			// vocabulary without them (a toy one) drops the character
+			// rather than naming tokens it lacks.
 			for _, b := range []byte(text[i : i+size]) {
-				tokens = append(tokens, int(b)+3)
+				if id := int(b) + 3; id < len(t.vocab) {
+					tokens = append(tokens, id)
+				}
 			}
 		}
 		i += size
