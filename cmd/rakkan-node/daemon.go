@@ -17,6 +17,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +32,7 @@ import (
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	"github.com/optimist3301/rakkan-mesh/internal/web"
 	"github.com/optimist3301/rakkan-mesh/internal/ygg"
 )
 
@@ -60,6 +62,8 @@ func daemonCmd(args []string) int {
 	workers := flags.Int("workers", runtime.GOMAXPROCS(0), "tasks this node runs for the network at once; 0 only submits tasks")
 	isolation := flags.String("isolation", "strict", "worker isolation: strict, ns or process")
 	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
+	webAddr := flags.String("web", "127.0.0.1:7780", "address of the web page: members, models and a chat; empty disables")
+	webToken := flags.String("web-token", os.Getenv("RAKKAN_WEB_TOKEN"), "token the web page asks for; required when -web is not a loopback address (default $RAKKAN_WEB_TOKEN)")
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
@@ -262,13 +266,18 @@ func daemonCmd(args []string) int {
 			return fail(fmt.Errorf("api: %w", err))
 		}
 		defer os.Remove(*apiPath)
-		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID}
+		srv := &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID, Version: version}
 		go func() {
 			if err := srv.Serve(ctx, l); err != nil {
 				slog.Error("api", "err", err)
 			}
 		}()
 		fmt.Printf("api on %s\n", *apiPath)
+	}
+	if *webAddr != "" {
+		if err := startWeb(ctx, *webAddr, *webToken, &api.Server{Service: svc, Blobs: store, LLM: lm, Node: node, Trust: tr, Network: n.ID, Version: version}); err != nil {
+			return fail(err)
+		}
 	}
 	status := time.NewTicker(*statusEvery)
 	defer status.Stop()
@@ -400,6 +409,31 @@ func publishPolicyIfNewer(ctx context.Context, node *mesh.Node, n *membership.Ne
 		return
 	}
 	fmt.Printf("published policy %d (open: %v)\n", p.Seq, p.Open)
+}
+
+// startWeb serves the web page. A busy port (another node on the machine)
+// only costs the page; an address beyond loopback without a token is an
+// error.
+func startWeb(ctx context.Context, addr, token string, srv *api.Server) error {
+	if !web.IsLoopback(addr) && token == "" {
+		return fmt.Errorf("-web %s is reachable from other machines: set -web-token (or RAKKAN_WEB_TOKEN), or use 127.0.0.1", addr)
+	}
+	l, err := net.Listen("tcp", addr)
+	if err != nil {
+		slog.Warn("web page disabled", "addr", addr, "err", err)
+		return nil
+	}
+	go func() {
+		if err := web.Serve(ctx, l, web.Handler(srv.Handler(), token)); err != nil {
+			slog.Error("web", "err", err)
+		}
+	}()
+	host := l.Addr().String()
+	if web.IsLoopback(addr) {
+		host = strings.Replace(host, "127.0.0.1", "localhost", 1)
+	}
+	fmt.Printf("web page on http://%s\n", host)
+	return nil
 }
 
 func printMembers(node *mesh.Node, tr *trust.Service) {

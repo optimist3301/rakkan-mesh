@@ -518,6 +518,7 @@ Write-Host ''
 Say '  Run by hand:' '  Запуск вручную:'
 Write-Host "    & '$Bin' daemon -config '$Conf'"
 if ($Auto) { Say "  Log:  Get-Content -Wait '$LogFile'" "  Журнал:  Get-Content -Wait '$LogFile'" }
+Say '  Web page (members, chat with a model): http://localhost:7780' '  Веб-страница (участники, чат с нейросетью): http://localhost:7780'
 if ($Type -eq 'relay' -and $Mainline) {
     Write-Host ''
     Say '  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:' '  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:'
