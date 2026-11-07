@@ -13,11 +13,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -82,8 +84,18 @@ func run(listen, token, apiPath, configPath, hub string) error {
 	return web.Serve(ctx, l, web.Handler(nodeAPI(sock), newImporter(hub, sock).handler(), token))
 }
 
+// maxRequestBody bounds a request the page sends the node: the node's own
+// bound on a generation (its prompt and images).
+const maxRequestBody = 64 << 20
+
 // nodeAPI forwards requests to the node's API socket, streaming responses
 // (a generation's tokens) as they come.
+//
+// A request's body is read whole before it is forwarded. The proxy flushes
+// the node's first tokens while its transport may still be finishing the
+// request; once a response is flushed, an HTTP/1 server makes the request
+// body unavailable, and the transport's late read of it failed the request,
+// cutting the stream after its first line.
 func nodeAPI(sock string) http.Handler {
 	p := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
@@ -110,7 +122,22 @@ func nodeAPI(sock string) http.Handler {
 			json.NewEncoder(w).Encode(map[string]any{"error": map[string]string{"kind": kind, "message": msg}})
 		},
 	}
-	return p
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil && r.Body != http.NoBody {
+			body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBody+1))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if len(body) > maxRequestBody {
+				http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+		}
+		p.ServeHTTP(w, r)
+	})
 }
 
 // findSocket picks the node's API socket: -api, the "api" of -config, or
