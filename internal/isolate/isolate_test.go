@@ -300,21 +300,24 @@ func TestPoolTimeoutIsPrecise(t *testing.T) {
 func TestCompileBombIsContained(t *testing.T) {
 	defer func(g time.Duration) { workerGrace = g }(workerGrace)
 	workerGrace = 300 * time.Millisecond
-	lim := testLimits()
-	lim.Timeout = time.Second
-
 	cases := map[string]struct {
-		memory int64
-		want   []error
+		memory  int64
+		timeout time.Duration
+		want    []error
 	}{
 		// The default worker memory is far below what compilation wants.
-		"memory": {0, []error{ErrWorkerOOM}},
+		// The timeout is long so that only memory stops it: compilation
+		// reaches the limit in 0.5-1 s, which a slow machine can stretch
+		// past a short timeout.
+		"memory": {0, 10 * time.Second, []error{ErrWorkerOOM}},
 		// With ample memory, the timeout stops it (or memory, if it grows
 		// faster than the timeout on this machine).
-		"time": {4 << 30, []error{sandbox.ErrTimeout, ErrWorkerOOM}},
+		"time": {4 << 30, time.Second, []error{sandbox.ErrTimeout, ErrWorkerOOM}},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
+			lim := testLimits()
+			lim.Timeout = c.timeout
 			if raceEnabled && name == "memory" {
 				t.Skip("address space limits are meaningless under ThreadSanitizer")
 			}
