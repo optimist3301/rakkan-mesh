@@ -321,7 +321,10 @@ func (s *execState) instantiateHost(ctx context.Context, rt wazero.Runtime) erro
 	if err := s.instantiateImage(ctx, rt); err != nil {
 		return err
 	}
-	return s.instantiateTensor(ctx, rt)
+	if err := s.instantiateTensor(ctx, rt); err != nil {
+		return err
+	}
+	return s.instantiateRandomX(ctx, rt)
 }
 
 func (s *execState) blobCount() uint32 {

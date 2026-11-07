@@ -59,6 +59,13 @@ type Config struct {
 	// long without use. Default: 30s.
 	IdleTimeout time.Duration
 	Isolation   Isolation
+	// HostExtraBytes is added to the default worker memory limit, for host
+	// kernels that hold memory of their own (RandomX: sandbox.RandomXHostBytes).
+	// Ignored when Isolation.MemoryBytes is set.
+	HostExtraBytes int64
+	// ExtraFiles are passed to every worker as descriptors 3, 4, ... (the
+	// shared RandomX dataset is descriptor 3).
+	ExtraFiles []*os.File
 	// Executable is the worker binary. Default: the running executable,
 	// which must call RunWorker when IsWorker reports true.
 	Executable string
@@ -99,7 +106,7 @@ func NewPool(cfg Config) (*Pool, error) {
 		// Linear memory may be copied when it grows; the worker also holds
 		// the task's input and output, the runtime and compiled code.
 		cfg.Isolation.MemoryBytes = 2*int64(cfg.Ceiling.MaxMemoryPages)*sandbox.PageSize +
-			int64(cfg.Ceiling.MaxInputBytes) + int64(cfg.Ceiling.MaxOutputBytes) + 256<<20
+			int64(cfg.Ceiling.MaxInputBytes) + int64(cfg.Ceiling.MaxOutputBytes) + 256<<20 + cfg.HostExtraBytes
 	}
 	if cfg.Executable == "" {
 		exe, err := os.Executable()
@@ -318,6 +325,7 @@ func (p *Pool) spawn() (*worker, error) {
 	cmd.Args = append([]string{"rakkan-worker"}, p.cfg.args...)
 	cmd.Env = []string{workerEnv + "=" + iso.encode(iso.startStage())}
 	cmd.Dir = "/"
+	cmd.ExtraFiles = p.cfg.ExtraFiles
 	cmd.SysProcAttr = iso.sysProcAttr()
 
 	w := &worker{cmd: cmd, stderr: &tailBuffer{}, exited: make(chan struct{})}
