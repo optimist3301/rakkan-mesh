@@ -7,14 +7,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/optimist3301/rakkan-mesh/internal/api"
-	"github.com/optimist3301/rakkan-mesh/internal/blob"
-	"github.com/optimist3301/rakkan-mesh/internal/exec"
-	"github.com/optimist3301/rakkan-mesh/internal/gpu"
-	"github.com/optimist3301/rakkan-mesh/internal/isolate"
-	"github.com/optimist3301/rakkan-mesh/internal/llm"
-	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
-	"github.com/optimist3301/rakkan-mesh/internal/trust"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -25,6 +17,15 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/optimist3301/rakkan-mesh/internal/api"
+	"github.com/optimist3301/rakkan-mesh/internal/blob"
+	"github.com/optimist3301/rakkan-mesh/internal/exec"
+	"github.com/optimist3301/rakkan-mesh/internal/gpu"
+	"github.com/optimist3301/rakkan-mesh/internal/isolate"
+	"github.com/optimist3301/rakkan-mesh/internal/llm"
+	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
+	"github.com/optimist3301/rakkan-mesh/internal/trust"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -62,6 +63,8 @@ func daemonCmd(args []string) int {
 	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
+	rxFast := flags.Bool("randomx-fast", true, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network")
+	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
 	maxOutputMB := flags.Int("max-output-mb", 16, "largest task output this node accepts, in MiB")
@@ -209,6 +212,19 @@ func daemonCmd(args []string) int {
 	ceiling := sandbox.DefaultLimits()
 	ceiling.MaxInputBytes = *maxInputMB << 20
 	ceiling.MaxOutputBytes = *maxOutputMB << 20
+	var shared *sandbox.RandomXShared
+	if *rxFast {
+		shared, err = sandbox.NewRandomXShared()
+		if err != nil {
+			return fail(fmt.Errorf("randomx-fast: %w", err))
+		}
+		defer shared.Close()
+		shared.Enable()
+		sctx, stopShared := context.WithCancel(context.Background())
+		defer stopShared()
+		cfg.Logger.Info("randomx-fast", "huge_pages", shared.Huge)
+		go shared.Serve(sctx, *rxThreads, func(f string, a ...any) { cfg.Logger.Info(fmt.Sprintf(f, a...)) })
+	}
 	svcCfg := exec.Config{Node: node, Blobs: blobs, Ceiling: ceiling, Trust: tr, Logger: cfg.Logger}
 	if *workers > 0 {
 		iso, err := parseIsolation(*isolation)
@@ -216,7 +232,12 @@ func daemonCmd(args []string) int {
 			return fail(err)
 		}
 		iso.Cgroup = *cgroup
-		pool, err := isolate.NewPool(isolate.Config{Ceiling: ceiling, Workers: *workers, Isolation: iso})
+		poolCfg := isolate.Config{Ceiling: ceiling, Workers: *workers, Isolation: iso, HostExtraBytes: sandbox.RandomXHostBytes}
+		if shared != nil {
+			poolCfg.HostExtraBytes += sandbox.RandomXFastHostBytes
+			poolCfg.ExtraFiles = []*os.File{shared.File()}
+		}
+		pool, err := isolate.NewPool(poolCfg)
 		if err != nil {
 			return fail(err)
 		}

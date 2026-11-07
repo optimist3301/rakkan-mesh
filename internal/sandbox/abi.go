@@ -49,14 +49,16 @@ var (
 			// memory (0 at the end), or -1 for no such blob
 			"blob_read": sig([]api.ValueType{i32, i32, i64, i32}, i32),
 		},
-		ImageModule:  imageABI,
-		TensorModule: tensorABI,
+		ImageModule:       imageABI,
+		TensorModule:      tensorABI,
+		RandomXModule:     randomxABI,
+		RandomXFastModule: randomxFastABI,
 	}
 
 	// capabilityOf names the capability each optional namespace provides.
 	// Nodes advertise capabilities; schedulers send tasks only to nodes
 	// having every capability a task imports.
-	capabilityOf = map[string]string{ImageModule: ImageCapability, TensorModule: TensorCapability}
+	capabilityOf = map[string]string{ImageModule: ImageCapability, TensorModule: TensorCapability, RandomXModule: RandomXCapability, RandomXFastModule: RandomXFastCapability}
 	f32          = api.ValueTypeF32
 
 	// Entry points take no arguments and return an exit code; 0 means success.
@@ -66,7 +68,13 @@ var (
 // Capabilities lists the optional host APIs this build provides.
 func Capabilities() []string {
 	var out []string
+	rxShared.mu.Lock()
+	fast := rxShared.enabled
+	rxShared.mu.Unlock()
 	for _, c := range capabilityOf {
+		if c == RandomXFastCapability && !fast {
+			continue // only a node with a shared dataset offers it
+		}
 		out = append(out, c)
 	}
 	slices.Sort(out)

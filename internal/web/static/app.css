@@ -172,7 +172,32 @@ dialog::backdrop { background: rgb(0 0 0 / 0.4); }
 dialog input { width: 100%; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font: inherit; }
 .dialog-buttons { display: flex; justify-content: flex-end; margin-top: 12px; }
 
+/* models */
+.import-form { display: grid; grid-template-columns: 2fr 1fr 2fr; gap: 10px 14px; margin-top: 10px; }
+.field { display: flex; flex-direction: column; min-width: 0; }
+.field.wide { grid-column: span 2; }
+.field input, .field select {
+  padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--bg); color: var(--text); font: inherit; min-width: 0;
+}
+.import-buttons { grid-column: 1 / -1; display: flex; gap: 8px; justify-content: flex-end; }
+.imp-info { margin-top: 12px; padding: 10px 12px; border-radius: 8px; background: var(--bot); font-size: 14px; }
+.imp-info.bad { background: none; border: 1px solid var(--bad); color: var(--bad); }
+.imp-info .warn { color: var(--warn); }
+.imp-info ul { margin: 6px 0 0; padding-left: 18px; color: var(--muted); font-size: 13px; }
+.job { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; }
+.job:first-child { border-top: 0; }
+.job-title { font-weight: 600; word-break: break-all; }
+.job-sub { color: var(--muted); font-size: 13px; }
+.job .progress { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.job .progress > i { display: block; height: 100%; background: var(--accent); transition: width 0.4s; }
+.job .err { grid-column: 1 / -1; color: var(--bad); font-size: 13px; }
+.job .actions { display: flex; gap: 6px; }
+.job .actions button { padding: 5px 10px; font-size: 13px; }
+
 @media (max-width: 900px) {
+  .import-form { grid-template-columns: 1fr; }
+  .field.wide, .import-buttons { grid-column: auto; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .self-row { grid-template-columns: 1fr; }
   .chat { grid-template-columns: 1fr; height: auto; }

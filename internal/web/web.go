@@ -38,10 +38,11 @@ var Routes = []string{
 	"POST /v1/llm/generate",
 }
 
-// Handler serves the page, and api's Routes under /v1/. With a token, API
-// requests must carry it as "Authorization: Bearer <token>"; without one,
-// only loopback hosts are answered.
-func Handler(api http.Handler, token string) http.Handler {
+// Handler serves the page, api's Routes under /v1/, and app, if not nil,
+// under /app/: the routes of the program serving the page. With a token,
+// requests to both must carry it as "Authorization: Bearer <token>";
+// without one, only loopback hosts are answered.
+func Handler(api, app http.Handler, token string) http.Handler {
 	files, err := fs.Sub(static, "static")
 	if err != nil {
 		panic(err)
@@ -49,6 +50,10 @@ func Handler(api http.Handler, token string) http.Handler {
 	mux := http.NewServeMux()
 	for _, r := range Routes {
 		mux.Handle(r, api)
+	}
+	if app != nil {
+		mux.Handle("GET /app/", app)
+		mux.Handle("POST /app/", app)
 	}
 	mux.Handle("GET /", http.FileServerFS(files))
 	return &guard{next: mux, token: token}
@@ -69,7 +74,7 @@ func (g *guard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this page answers on localhost only", http.StatusMisdirectedRequest)
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/v1/") {
+	if strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/app/") {
 		if g.token != "" && !g.authorized(r) {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="rakkan"`)
 			http.Error(w, "token required", http.StatusUnauthorized)

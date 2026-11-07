@@ -4,7 +4,8 @@
 //
 // It is a client of the node like the SDKs: it talks to the node's local
 // API over its unix socket (-api), and passes the page only the API routes
-// it needs (package web). The node knows nothing of it.
+// it needs (package web). The node knows nothing of it. It also imports
+// models from the Hugging Face Hub into the node (models.go).
 //
 //	rakkan-web                          # finds the socket of an installed node
 //	rakkan-web -api /path/rakkan.sock   # or -config /path/node.json
@@ -46,19 +47,20 @@ func main() {
 	token := flags.String("token", os.Getenv("RAKKAN_WEB_TOKEN"), "token the page asks for; required when -listen is not a loopback address (default $RAKKAN_WEB_TOKEN)")
 	apiPath := flags.String("api", "", "the node's API socket (default: from -config, or where the installer puts it)")
 	configPath := flags.String("config", "", "the node's JSON config, to take the socket from its \"api\" field")
+	hub := flags.String("hub", "https://huggingface.co", "Hugging Face Hub to import models from")
 	showVersion := flags.Bool("version", false, "print the version")
 	flags.Parse(os.Args[1:])
 	if *showVersion {
 		fmt.Println("rakkan-web", version, runtime.GOOS+"/"+runtime.GOARCH, runtime.Version())
 		return
 	}
-	if err := run(*listen, *token, *apiPath, *configPath); err != nil {
+	if err := run(*listen, *token, *apiPath, *configPath, *hub); err != nil {
 		fmt.Fprintln(os.Stderr, "rakkan-web:", err)
 		os.Exit(1)
 	}
 }
 
-func run(listen, token, apiPath, configPath string) error {
+func run(listen, token, apiPath, configPath, hub string) error {
 	if !web.IsLoopback(listen) && token == "" {
 		return fmt.Errorf("-listen %s is reachable from other machines: set -token (or RAKKAN_WEB_TOKEN), or use 127.0.0.1", listen)
 	}
@@ -77,7 +79,7 @@ func run(listen, token, apiPath, configPath string) error {
 		host = strings.Replace(host, "127.0.0.1", "localhost", 1)
 	}
 	fmt.Printf("rakkan-web %s: http://%s, node API at %s\n", version, host, sock)
-	return web.Serve(ctx, l, web.Handler(nodeAPI(sock), token))
+	return web.Serve(ctx, l, web.Handler(nodeAPI(sock), newImporter(hub, sock).handler(), token))
 }
 
 // nodeAPI forwards requests to the node's API socket, streaming responses
