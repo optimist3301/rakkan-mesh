@@ -33,6 +33,7 @@ commands:
   network show      print a certificate, revocation list or policy
   network announce  publish in the Mainline DHT the members newcomers find
   run <task.wasm>   execute a task locally in the sandbox
+  update            install the latest release from GitHub (-check: only look)
   version           print the version
 `
 
@@ -55,7 +56,14 @@ func main() {
 	case "id":
 		os.Exit(idCmd(os.Args[2:]))
 	case "daemon":
-		os.Exit(daemonCmd(os.Args[2:]))
+		code := daemonCmd(os.Args[2:])
+		if restartPending {
+			restartSelf()
+			code = exitRestart
+		}
+		os.Exit(code)
+	case "update":
+		os.Exit(updateCmd(os.Args[2:]))
 	case "version", "-version", "--version":
 		fmt.Println("rakkan-node", version, runtime.GOOS+"/"+runtime.GOARCH, runtime.Version())
 		os.Exit(0)

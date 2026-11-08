@@ -25,7 +25,7 @@
     RAKKAN_LANG=en|ru  RAKKAN_NETWORK=public|<network ID>  RAKKAN_CERT=<file>
     RAKKAN_NODE_TYPE=worker|client|relay|llm  RAKKAN_WORKERS=<n>
     RAKKAN_STORE_GB=<n>  RAKKAN_MAINLINE=yes|no  RAKKAN_BOOTSTRAP=<multiaddr,...>
-    RAKKAN_AUTOSTART=yes|no  RAKKAN_ADD_TO_PATH=yes|no
+    RAKKAN_AUTOSTART=yes|no  RAKKAN_AUTOUPDATE=yes|no  RAKKAN_ADD_TO_PATH=yes|no
 #>
 [CmdletBinding()]
 param(
@@ -425,6 +425,11 @@ Step '6/6' 'Autostart' 'Автозапуск'
 if ($env:RAKKAN_AUTOSTART) { $Auto = $env:RAKKAN_AUTOSTART -in @('y', 'yes', 'true', '1') }
 elseif ($IsAdmin) { $Auto = Ask-YN 'Start the node automatically at boot (scheduled task, as LOCAL SERVICE)?' 'Запускать узел автоматически при загрузке системы (задача планировщика, от LOCAL SERVICE)?' $true }
 else { $Auto = Ask-YN 'Start the node automatically at logon (scheduled task)?' 'Запускать узел автоматически при входе в систему (задача планировщика)?' $true }
+if ($env:RAKKAN_AUTOUPDATE) { $AutoUpd = $env:RAKKAN_AUTOUPDATE -in @('y', 'yes', 'true', '1', 'on') }
+else {
+    Info "The node can check GitHub releases (github.com/$Repo) and install new versions by itself, restarting when it does. Releases are verified only against the checksums published with them. It briefly interrupts running tasks." "Узел может сам проверять релизы на GitHub (github.com/$Repo) и ставить новые версии, перезапускаясь при этом. Релизы проверяются только по контрольным суммам, опубликованным вместе с ними. Выполняемые задачи на миг прерываются."
+    $AutoUpd = Ask-YN 'Update the node automatically from GitHub releases?' 'Обновлять узел автоматически из релизов GitHub?' $true
+}
 if ($env:RAKKAN_ADD_TO_PATH) { $AddPath = $env:RAKKAN_ADD_TO_PATH -in @('y', 'yes', 'true', '1') }
 elseif ($IsAdmin) { $AddPath = Ask-YN "Add rakkan-node to every user's PATH?" 'Добавить rakkan-node в PATH всех пользователей?' $true }
 else { $AddPath = Ask-YN 'Add rakkan-node to your PATH?' 'Добавить rakkan-node в PATH?' $true }
@@ -447,6 +452,7 @@ $cfg['peers'] = Join-Path $DataDir 'peers.json'
 $cfg['proof'] = Join-Path $DataDir 'node.proof'
 if ($Boot) { $cfg['bootstrap'] = (($Boot -split ',') | ForEach-Object { $_.Trim() }) -join ',' }
 $cfg['mainline'] = [bool]$Mainline
+$cfg['auto-update'] = [bool]$AutoUpd
 if ($Type -eq 'relay') {
     $cfg['relay'] = $true
     $cfg['reachability'] = 'public'
@@ -464,6 +470,8 @@ Write-Utf8NoBom $Conf ''
 if ($IsAdmin) {
     & icacls $Conf /inheritance:r /grant:r "$($SidSystem):(F)" "$($SidAdmins):(F)" "$($SidLocalService):(R)" | Out-Null
     & icacls $DataDir /inheritance:r /grant:r "$($SidSystem):(OI)(CI)(F)" "$($SidAdmins):(OI)(CI)(F)" "$($SidLocalService):(OI)(CI)(M)" | Out-Null
+    # An updating node replaces its own program, so its account may write the program's folder.
+    if ($AutoUpd) { & icacls $BinDir /grant "$($SidLocalService):(OI)(CI)(M)" | Out-Null }
 }
 else {
     & icacls $Conf /inheritance:r /grant:r "$($env:USERNAME):(F)" | Out-Null

@@ -26,6 +26,7 @@ import (
 	"github.com/optimist3301/rakkan-mesh/internal/llm"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 	"github.com/optimist3301/rakkan-mesh/internal/trust"
+	"github.com/optimist3301/rakkan-mesh/internal/update"
 
 	"github.com/libp2p/go-libp2p/core/crypto"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -63,7 +64,7 @@ func daemonCmd(args []string) int {
 	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
-	rxFast := flags.Bool("randomx-fast", false, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network")
+	rxFast := flags.Bool("randomx-fast", true, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
@@ -73,6 +74,9 @@ func daemonCmd(args []string) int {
 	gpuFlag := flags.String("gpu", "auto", `GPU for language models: "auto" (the best exact one), "off", a device index, or "list" to show them`)
 	gpuMemGB := flags.Float64("gpu-mem-gb", 0, "GPU memory for model weights, in GiB (default: 85% of the device's)")
 	hubURL := flags.String("hub", "https://huggingface.co", `Hugging Face Hub for models imported from it ("hub" format); empty: only from members (HF_TOKEN authorizes gated repositories)`)
+	autoUpd := flags.Bool("auto-update", false, "install new releases from GitHub by itself and restart; a node on a pre-release follows pre-releases, one on a stable release only stable ones")
+	updInterval := flags.Duration("update-interval", 12*time.Hour, "how often -auto-update looks for a release (at least 1h)")
+	updRepo := flags.String("update-repo", update.DefaultRepo, "GitHub repository (owner/name) -auto-update takes releases from")
 	statusEvery := flags.Duration("status", 30*time.Second, "how often to print the member table")
 	flags.Parse(args)
 
@@ -291,6 +295,18 @@ func daemonCmd(args []string) int {
 		}()
 		fmt.Printf("api on %s\n", *apiPath)
 	}
+	restart := make(chan struct{})
+	if *autoUpd {
+		if _, ok := update.ParseVersion(version); !ok {
+			cfg.Logger.Warn("auto-update off: this is not a release build", "version", version)
+		} else {
+			if exe, err := selfPath(); err == nil {
+				update.CleanUp(exe)
+			}
+			every := max(*updInterval, minUpdateInterval)
+			go autoUpdate(ctx, &update.Updater{Repo: *updRepo}, every, cfg.Logger, func() { close(restart) })
+		}
+	}
 	status := time.NewTicker(*statusEvery)
 	defer status.Stop()
 	reload := time.NewTicker(5 * time.Second)
@@ -298,6 +314,9 @@ func daemonCmd(args []string) int {
 	for {
 		select {
 		case <-ctx.Done():
+			return 0
+		case <-restart:
+			restartPending = true
 			return 0
 		case <-status.C:
 			printMembers(node, tr)

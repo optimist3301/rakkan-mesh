@@ -25,7 +25,7 @@
 #   RAKKAN_LANG=en|ru  RAKKAN_NETWORK=public|<network ID>  RAKKAN_CERT=<file>
 #   RAKKAN_NODE_TYPE=worker|client|relay|llm  RAKKAN_WORKERS=<n>
 #   RAKKAN_STORE_GB=<n>  RAKKAN_MAINLINE=yes|no  RAKKAN_BOOTSTRAP=<multiaddr,...>
-#   RAKKAN_AUTOSTART=yes|no
+#   RAKKAN_AUTOSTART=yes|no  RAKKAN_AUTOUPDATE=yes|no
 
 set -euo pipefail
 
@@ -38,6 +38,9 @@ LABEL="network.rakkan.node"
 # The system install's user: the node never runs as root.
 SYS_USER="rakkan"
 SYSTEM=0 # set when run as root
+# A system install that updates itself keeps the program here, owned by the
+# service's user, which must be able to replace it; BIN links to it.
+APP_DIR="/usr/local/lib/rakkan"
 
 YES=0
 UNINSTALL=0
@@ -244,6 +247,7 @@ do_uninstall() {
     rm -f "$PLIST"
   fi
   rm -f "$BIN"
+  if [ "$SYSTEM" = 1 ]; then rm -rf "$APP_DIR"; fi
   ok "Service and binary removed." "Служба и программа удалены."
   if [ "$PURGE" = 1 ]; then
     local sure
@@ -340,7 +344,7 @@ Wants=network-online.target
 
 [Service]
 User=$SYS_USER
-ExecStart="$BIN" daemon -config "$CONF"
+ExecStart="$SVC_BIN" daemon -config "$CONF"
 WorkingDirectory=$DATA_DIR
 Restart=on-failure
 RestartSec=5
@@ -349,7 +353,7 @@ RestartSec=5
 NoNewPrivileges=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=$DATA_DIR
+ReadWritePaths=$DATA_DIR $([ "$AUTOUPD" = y ] && echo "$APP_DIR")
 
 [Install]
 WantedBy=multi-user.target
@@ -374,7 +378,7 @@ UNIT
   <key>Label</key><string>$LABEL</string>
   <key>UserName</key><string>$SYS_USER</string>
   <key>ProgramArguments</key>
-  <array><string>$BIN</string><string>daemon</string><string>-config</string><string>$CONF</string></array>
+  <array><string>$SVC_BIN</string><string>daemon</string><string>-config</string><string>$CONF</string></array>
   <key>WorkingDirectory</key><string>$DATA_DIR</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -458,7 +462,7 @@ main() {
       --binary) LOCAL_BINARY="${2:?--binary needs a path}"; shift ;;
       --uninstall) UNINSTALL=1 ;;
       --purge) PURGE=1 ;;
-      --help|-h) sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+      --help|-h) sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
       *) die "Unknown option: $1" ;;
     esac
     shift
@@ -599,6 +603,8 @@ main() {
   fi
 
   local ISOLATION="process"
+  AUTOUPD=n
+  SVC_BIN="$BIN"
   if [ "$OS" = linux ]; then
     if strict_isolation_works; then
       ISOLATION=strict
@@ -663,6 +669,14 @@ main() {
     fi
   fi
   case "$AUTO" in y|yes) AUTO=y ;; *) AUTO=n ;; esac
+  local AUTOUPD_IN="${RAKKAN_AUTOUPDATE:-}"
+  if [ -z "$AUTOUPD_IN" ]; then
+    info "The node can check GitHub releases (github.com/$REPO) and install new versions by itself, restarting when it does. Releases are verified only against the checksums published with them. It briefly interrupts running tasks." \
+         "Узел может сам проверять релизы на GitHub (github.com/$REPO) и ставить новые версии, перезапускаясь при этом. Релизы проверяются только по контрольным суммам, опубликованным вместе с ними. Выполняемые задачи на миг прерываются."
+    ask_yn AUTOUPD_IN "Update the node automatically from GitHub releases?" \
+      "Обновлять узел автоматически из релизов GitHub?" y
+  fi
+  case "$AUTOUPD_IN" in y|yes|true|1|on) AUTOUPD=y ;; *) AUTOUPD=n ;; esac
   if [ "$AUTO" = y ] && [ "$SYSTEM" = 0 ] && [ "$OS" = linux ] && have loginctl; then
     ask_yn LINGER "Keep it running from boot, even when you are not logged in?" \
       "Держать запущенным с загрузки системы, даже без вашего входа?" n
@@ -689,6 +703,7 @@ main() {
   F+=("  \"proof\": \"$(jesc "$DATA_DIR/node.proof")\"")
   [ -z "$BOOT" ] || F+=("  \"bootstrap\": \"$(jesc "$BOOT")\"")
   if [ "$MAINLINE" = y ]; then F+=("  \"mainline\": true"); else F+=("  \"mainline\": false"); fi
+  if [ "$AUTOUPD" = y ]; then F+=("  \"auto-update\": true"); else F+=("  \"auto-update\": false"); fi
   if [ "$TYPE" = relay ]; then
     F+=("  \"relay\": true")
     F+=("  \"reachability\": \"public\"")
@@ -714,6 +729,15 @@ main() {
   if [ "$SYSTEM" = 1 ]; then
     # The node's own user owns its key, config and data; only it reads them.
     ensure_system_user
+    if [ "$AUTOUPD" = y ]; then
+      # The service's user must be able to replace the program.
+      mkdir -p "$APP_DIR"
+      install -m 0755 "$BIN" "$APP_DIR/rakkan-node"
+      ln -sf "$APP_DIR/rakkan-node" "$BIN"
+      chown -R "$SYS_USER:" "$APP_DIR"
+      chmod 755 "$APP_DIR"
+      SVC_BIN="$APP_DIR/rakkan-node"
+    fi
     chown "$SYS_USER:" "$CONF"
     chown -R "$SYS_USER:" "$DATA_DIR"
     chmod 700 "$DATA_DIR"
