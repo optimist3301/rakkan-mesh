@@ -18,7 +18,7 @@
   (A plain "irm ... | iex" does not work with scripts that take parameters.)
   Or download it and pass options:
 
-    .\install.ps1 [-Yes] [-Version 0.010-alpha] [-Binary C:\path\rakkan-node.exe] [-Uninstall [-Purge]]
+    .\install.ps1 [-Yes] [-Version 0.011-alpha] [-Binary C:\path\rakkan-node.exe] [-Uninstall [-Purge]]
 
   Every question can be answered beforehand with an environment variable,
   which also makes the script usable unattended with -Yes:
@@ -30,7 +30,7 @@
 [CmdletBinding()]
 param(
     [switch]$Yes,
-    [string]$Version = $(if ($env:RAKKAN_VERSION) { $env:RAKKAN_VERSION } else { '0.010-alpha' }),
+    [string]$Version = $(if ($env:RAKKAN_VERSION) { $env:RAKKAN_VERSION } else { '0.011-alpha' }),
     [string]$Binary = '',
     [switch]$Uninstall,
     [switch]$Purge
