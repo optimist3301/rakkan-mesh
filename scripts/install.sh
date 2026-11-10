@@ -329,6 +329,24 @@ remove_system_user() {
   ok "Removed the user $SYS_USER." "Пользователь $SYS_USER удалён."
 }
 
+# add_api_user offers the user who ran sudo the node's API, through its group.
+add_api_user() {
+  local who="${SUDO_USER:-}" yes
+  [ -n "$who" ] && [ "$who" != root ] || return 0
+  ask_yn yes "Let $who use the node's API (rakkan-web, SDKs) by adding them to the group $SYS_USER?" \
+    "Дать $who доступ к API узла (rakkan-web, SDK), добавив в группу $SYS_USER?" y
+  [ "$yes" = y ] || return 0
+  if [ "$OS" = linux ]; then
+    usermod -aG "$SYS_USER" "$who" 2>/dev/null || addgroup "$who" "$SYS_USER" 2>/dev/null ||
+      { warn "Could not add $who to $SYS_USER." "Не удалось добавить $who в $SYS_USER."; return 0; }
+  else
+    dseditgroup -o edit -a "$who" -t user "$SYS_USER" ||
+      { warn "Could not add $who to $SYS_USER." "Не удалось добавить $who в $SYS_USER."; return 0; }
+  fi
+  ok "$who is in the group $SYS_USER (takes effect at their next login)." \
+     "$who в группе $SYS_USER (подействует со следующего входа)."
+}
+
 # install_system_service starts the node at boot as SYS_USER.
 install_system_service() {
   if [ "$OS" = linux ]; then
@@ -699,6 +717,8 @@ main() {
   F+=("  \"store-gb\": $STORE_GB")
   F+=("  \"data\": \"$(jesc "$DATA_DIR")\"")
   F+=("  \"api\": \"$(jesc "$DATA_DIR/rakkan.sock")\"")
+  # A system node's API is for the members of its group, too.
+  [ "$SYSTEM" = 1 ] && F+=("  \"api-mode\": \"0660\"")
   F+=("  \"peers\": \"$(jesc "$DATA_DIR/peers.json")\"")
   F+=("  \"proof\": \"$(jesc "$DATA_DIR/node.proof")\"")
   [ -z "$BOOT" ] || F+=("  \"bootstrap\": \"$(jesc "$BOOT")\"")
@@ -738,9 +758,12 @@ main() {
       chmod 755 "$APP_DIR"
       SVC_BIN="$APP_DIR/rakkan-node"
     fi
+    add_api_user
     chown "$SYS_USER:" "$CONF"
     chown -R "$SYS_USER:" "$DATA_DIR"
-    chmod 700 "$DATA_DIR"
+    # The group may enter the data directory to reach the API socket, but
+    # not list it.
+    chmod 710 "$DATA_DIR"
     chmod 755 "$CONF_DIR"
     if [ "$OS" = linux ] && [ "$TYPE" = llm ]; then
       # GPUs: /dev/dri and /dev/kfd belong to these groups.
@@ -847,6 +870,10 @@ EOF
     say "  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:" \
         "  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:"
     printf '    rakkan-node network announce -key root.key -announcers %s\n' "$PEER"
+  fi
+  if [ "$SYSTEM" = 1 ]; then
+    say "  API for other users: add them to the group $SYS_USER (socket $DATA_DIR/rakkan.sock)." \
+        "  API для других пользователей: добавьте их в группу $SYS_USER (сокет $DATA_DIR/rakkan.sock)."
   fi
   if [ "$SYSTEM" = 1 ]; then
     say "  Remove: sudo install.sh --uninstall" "  Удалить: sudo install.sh --uninstall"

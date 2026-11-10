@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -68,7 +69,7 @@ func startNode(t *testing.T) *http.Client {
 		t.Fatal(err)
 	}
 	sock := filepath.Join(t.TempDir(), "api.sock")
-	l, err := Listen(sock)
+	l, err := Listen(sock, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,5 +197,19 @@ func TestAPIBlobs(t *testing.T) {
 	}
 	if res, _ := c.Get("http://rakkan/v1/blobs/" + strings.Repeat("0", 64)); res.StatusCode != 404 {
 		t.Fatalf("unknown blob: %d", res.StatusCode)
+	}
+}
+
+func TestListenMode(t *testing.T) {
+	for _, mode := range []os.FileMode{0o600, 0o660} {
+		sock := filepath.Join(t.TempDir(), "api.sock")
+		l, err := Listen(sock, mode)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if fi, _ := os.Stat(sock); runtime.GOOS != "windows" && fi.Mode().Perm() != mode {
+			t.Errorf("socket permissions %v, want %v", fi.Mode().Perm(), mode)
+		}
+		l.Close()
 	}
 }

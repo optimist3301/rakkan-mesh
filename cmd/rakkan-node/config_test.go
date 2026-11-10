@@ -38,3 +38,16 @@ func TestConfigApply(t *testing.T) {
 		t.Fatal("unknown field accepted")
 	}
 }
+
+func TestParseSocketMode(t *testing.T) {
+	for s, want := range map[string]os.FileMode{"0600": 0o600, "600": 0o600, "0660": 0o660, "0640": 0o640} {
+		if got, err := parseSocketMode(s); err != nil || got != want {
+			t.Errorf("%s: got %o, %v", s, got, err)
+		}
+	}
+	for _, s := range []string{"0666", "0606", "0400", "0604", "rw", "", "1660"} {
+		if _, err := parseSocketMode(s); err == nil {
+			t.Errorf("%s accepted", s)
+		}
+	}
+}

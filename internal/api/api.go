@@ -53,9 +53,9 @@ type Server struct {
 	Version string
 }
 
-// Listen opens the unix socket, replacing a stale one, with owner-only
-// permissions.
-func Listen(path string) (net.Listener, error) {
+// Listen opens the unix socket, replacing a stale one, with the permission
+// bits mode: 0600 lets only the node's user in, 0660 also its group.
+func Listen(path string, mode os.FileMode) (net.Listener, error) {
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
@@ -63,7 +63,7 @@ func Listen(path string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	if err := os.Chmod(path, mode.Perm()); err != nil {
 		l.Close()
 		return nil, err
 	}
