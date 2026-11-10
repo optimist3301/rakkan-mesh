@@ -74,7 +74,9 @@ $Lang = $env:RAKKAN_LANG
 
 # ---------------------------------------------------------------- output ----
 
-function T([string]$en, [string]$ru) { if ($script:Lang -eq 'ru') { $ru } else { $en } }
+# $Lang, not $script:Lang: run through [scriptblock]::Create, as the README
+# does, the script: scope is the caller's, where $Lang is not set.
+function T([string]$en, [string]$ru) { if ($Lang -eq 'ru') { $ru } else { $en } }
 function Say([string]$en, [string]$ru) { Write-Host (T $en $ru) }
 function Info([string]$en, [string]$ru) { Write-Host '  • ' -ForegroundColor Cyan -NoNewline; Write-Host (T $en $ru) }
 function Ok([string]$en, [string]$ru) { Write-Host '  ✔ ' -ForegroundColor Green -NoNewline; Write-Host (T $en $ru) }
@@ -490,10 +492,27 @@ if ($AddPath) {
 
 # --------------------------------------------------------------- service
 if ($Auto) {
+    # Task Scheduler restarts a task only when it cannot start it, not when
+    # it exits: the task runs a loop that starts the node again after a crash
+    # or an update (which exits with code 75). cmd.exe writes the node's
+    # output to the log as it is; PowerShell would wrap every stderr line in
+    # a NativeCommandError. -EncodedCommand spares quoting the paths twice.
     $q = { param($s) $s -replace "'", "''" }
-    $cmd = "& '$(& $q $Bin)' daemon -config '$(& $q $Conf)' *>> '$(& $q $LogFile)'"
+    $runner = @"
+`$exe = '$(& $q $Bin)'; `$conf = '$(& $q $Conf)'; `$log = '$(& $q $LogFile)'
+while (`$true) {
+    `$psi = New-Object System.Diagnostics.ProcessStartInfo 'cmd.exe', ('/d /s /c ""' + `$exe + '" daemon -config "' + `$conf + '" >> "' + `$log + '" 2>&1"')
+    `$psi.UseShellExecute = `$false
+    `$psi.CreateNoWindow = `$true
+    `$p = [System.Diagnostics.Process]::Start(`$psi)
+    `$p.WaitForExit()
+    [System.IO.File]::AppendAllText(`$log, "rakkan-node exited with code `$(`$p.ExitCode); starting it again in 10 s`r`n")
+    Start-Sleep -Seconds 10
+}
+"@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($runner))
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' `
-        -Argument ('-NoProfile -WindowStyle Hidden -Command "' + $cmd + '"') -WorkingDirectory $DataDir
+        -Argument ('-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand ' + $encoded) -WorkingDirectory $DataDir
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
     if ($IsAdmin) {
@@ -531,7 +550,10 @@ if ($Type -eq 'relay' -and $Mainline) {
     Say '  This node is public: the network admin can list it in the DHT, so that newcomers find the network through it:' '  Этот узел публичный: администратор сети может перечислить его в DHT, чтобы новички находили сеть через него:'
     Write-Host "    rakkan-node network announce -key root.key -announcers $Peer"
 }
-if ($IsAdmin) { Say '  Remove (as administrator): .\install.ps1 -Uninstall' '  Удалить (от администратора): .\install.ps1 -Uninstall' }
-else { Say '  Remove: .\install.ps1 -Uninstall' '  Удалить: .\install.ps1 -Uninstall' }
+# Run from the README's one-liner there is no file to run again.
+$removeCmd = '.\install.ps1 -Uninstall'
+if (-not $PSCommandPath) { $removeCmd = "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/$Repo/main/scripts/install.ps1).TrimStart([char]0xFEFF))) -Uninstall" }
+if ($IsAdmin) { Say "  Remove (as administrator): $removeCmd" "  Удалить (от администратора): $removeCmd" }
+else { Say "  Remove: $removeCmd" "  Удалить: $removeCmd" }
 Write-Host $rule -ForegroundColor Magenta
 Write-Host ''
