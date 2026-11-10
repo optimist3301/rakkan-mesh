@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -125,7 +126,8 @@ func TestApply(t *testing.T) {
 			t.Errorf("%s = %q, want %q", p, b, want)
 		}
 	}
-	if st, _ := os.Stat(exe); st.Mode().Perm()&0o111 == 0 {
+	// Windows has no executable bits.
+	if st, _ := os.Stat(exe); runtime.GOOS != "windows" && st.Mode().Perm()&0o111 == 0 {
 		t.Error("new program is not executable")
 	}
 	if left, _ := filepath.Glob(filepath.Join(dir, ".rakkan-update-*")); len(left) != 0 {
