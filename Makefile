@@ -5,7 +5,7 @@
 #   make randomx      build librandomx for this machine (build/randomx/)
 #   make test         run the tests
 #   make dist         cross-compile archives and SHA256SUMS into dist/
-#   make dist VERSION=0.012-alpha
+#   make dist VERSION=0.013-alpha
 #
 # RandomX is the reference C++ library, linked through cgo, so a node with it
 # needs a C/C++ compiler and cmake (scripts/build-randomx.sh says which for
