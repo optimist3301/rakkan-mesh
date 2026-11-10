@@ -27,6 +27,7 @@ import (
 //	8   generation, u64: odd while the dataset is being rebuilt
 //	16  seed length, u32; 24 the seed it was built for (up to 64 bytes)
 //	96  wanted seed length, u32; 104 the seed a worker asked for
+//	168 last use, u64: Unix nanoseconds of the latest hash request
 //
 // A worker that is asked to hash under another seed writes it as wanted and
 // answers "not ready"; the node notices, rebuilds in place and bumps the
@@ -34,6 +35,11 @@ import (
 // its results if it changed, so a rebuild under a running search cannot
 // produce a wrong hash. Tasks answer "not ready" with exit code 3 and the
 // caller retries.
+//
+// The dataset takes memory only once it is built, and not for ever: when no
+// hash has been asked for during RandomXShared.IdleRelease the node hands its
+// pages back to the system (Linux; a Windows section cannot be emptied) and
+// the next request builds it again, a few seconds later.
 //
 // Gas per hash is fixed here and does not depend on the node, as replicas
 // compare gas; nodes without a dataset do not offer the capability.
@@ -78,6 +84,7 @@ const (
 	offSeed    = 24
 	offWantLen = 96
 	offWant    = 104
+	offLastUse = 168
 	seedMax    = 64
 )
 
@@ -98,6 +105,15 @@ func newView(hdr, data []byte) (*rxView, error) {
 }
 
 func (v *rxView) gen() *uint64 { return (*uint64)(unsafe.Pointer(&v.hdr[offGen])) }
+
+// touch records that a hash was just asked for or finished.
+func (v *rxView) touch() {
+	atomic.StoreInt64((*int64)(unsafe.Pointer(&v.hdr[offLastUse])), time.Now().UnixNano())
+}
+
+func (v *rxView) lastUse() time.Time {
+	return time.Unix(0, atomic.LoadInt64((*int64)(unsafe.Pointer(&v.hdr[offLastUse]))))
+}
 
 func (v *rxView) field(lenOff, off int) []byte {
 	n := binary.LittleEndian.Uint32(v.hdr[lenOff:])
@@ -150,12 +166,14 @@ func rxOpen(s *execState, seed []byte) (vm *rxlibVM, done func() bool, code int3
 		}
 		return nil, nil, rxErrNotReady
 	}
+	v.touch()
 	vm, err := newRxlibVM(v.ds)
 	if err != nil {
 		s.trap(fmt.Errorf("%w: randomx vm: %v", ErrTrap, err))
 	}
 	return vm, func() bool {
 		vm.close()
+		v.touch()
 		return atomic.LoadUint64(v.gen()) == g
 	}, 0
 }
@@ -165,7 +183,12 @@ type RandomXShared struct {
 	f *os.File
 	// Huge reports that the dataset sits in huge pages.
 	Huge bool
-	v    *rxView
+	// IdleRelease is how long the built dataset is kept without a request
+	// before its memory is returned to the system; zero keeps it for good.
+	// Set it before Serve.
+	IdleRelease time.Duration
+	v           *rxView
+	noRelease   bool // releasing failed once: do not try again
 }
 
 // NewRandomXShared allocates the shared file. Nothing is built until a worker
@@ -226,6 +249,7 @@ func (s *RandomXShared) Serve(ctx context.Context, threads int, logf func(format
 		}
 		want := bytes.Clone(v.wanted())
 		if want == nil || bytes.Equal(want, v.seed()) {
+			s.releaseIfIdle(logf)
 			continue
 		}
 		start := time.Now()
@@ -253,8 +277,31 @@ func (s *RandomXShared) build(seed []byte, threads int) error {
 	binary.LittleEndian.PutUint32(v.hdr[offSeedLen:], 0)
 	v.ds.fill(cache, threads)
 	v.setField(offSeedLen, offSeed, seed)
+	v.touch()
 	atomic.AddUint64(v.gen(), 1)
 	return nil
+}
+
+// releaseIfIdle empties the dataset when nothing has asked for a hash for
+// IdleRelease. Workers see the generation change and answer "not ready", the
+// same as while a rebuild runs; the next request writes its seed as wanted and
+// Serve builds the dataset again.
+func (s *RandomXShared) releaseIfIdle(logf func(format string, args ...any)) {
+	v := s.v
+	if s.IdleRelease <= 0 || s.noRelease || v.seed() == nil || time.Since(v.lastUse()) < s.IdleRelease {
+		return
+	}
+	binary.LittleEndian.PutUint32(v.hdr[offWantLen:], 0) // or Serve would rebuild at once
+	atomic.AddUint64(v.gen(), 1)
+	binary.LittleEndian.PutUint32(v.hdr[offSeedLen:], 0)
+	err := releasePages(s.f, sharedHeaderSize, datasetMapBytes)
+	atomic.AddUint64(v.gen(), 1)
+	if err != nil {
+		s.noRelease = true
+		logf("randomx dataset: cannot return its memory, keeping it: %v", err)
+		return
+	}
+	logf("randomx dataset released after %s without use", s.IdleRelease)
 }
 
 // Close releases the file; workers keep their own mappings.

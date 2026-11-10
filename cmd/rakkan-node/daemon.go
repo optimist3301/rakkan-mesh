@@ -65,7 +65,10 @@ func daemonCmd(args []string) int {
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	apiMode := flags.String("api-mode", "0600", `permissions of the API socket, in octal: "0660" lets the node's group in too (the group must also be able to enter the socket's directory)`)
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
-	rxFast := flags.Bool("randomx-fast", false, "hold the 2 GiB RandomX dataset in memory and offer RandomX tasks (randomx-fast/1) to the network (Linux and Windows builds with librandomx)")
+	var rx bool
+	flags.BoolVar(&rx, "randomx", true, "hold the 2 GiB RandomX dataset in memory and offer RandomX tasks (randomx-fast/1) to the network; only Linux and Windows builds with librandomx have it, elsewhere it is skipped")
+	flags.BoolVar(&rx, "randomx-fast", true, "deprecated name of -randomx")
+	rxIdle := flags.Duration("randomx-idle", 10*time.Minute, "return the RandomX dataset's memory to the system after this long without a RandomX task (Linux; it is built again, in seconds, by the next task); 0 keeps it")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
@@ -218,21 +221,33 @@ func daemonCmd(args []string) int {
 	ceiling.MaxInputBytes = *maxInputMB << 20
 	ceiling.MaxOutputBytes = *maxOutputMB << 20
 	var shared *sandbox.RandomXShared
-	if *rxFast && !sandbox.RandomXSharedSupported() {
-		// A config carried over from another node must not stop this one.
-		cfg.Logger.Warn("randomx-fast needs a Linux or Windows build with librandomx; going on without it")
-		*rxFast = false
-	}
-	if *rxFast {
-		shared, err = sandbox.NewRandomXShared()
-		if err != nil {
-			return fail(fmt.Errorf("randomx-fast: %w", err))
+	// RandomX is on by default, so a node that cannot have it (a platform
+	// without it, no memory for the dataset) goes on without; only a node
+	// that was asked for it, by flag or config, treats that as an error.
+	rxAsked := false
+	flags.Visit(func(f *flag.Flag) { rxAsked = rxAsked || f.Name == "randomx" || f.Name == "randomx-fast" })
+	if rx && !sandbox.RandomXSharedSupported() {
+		if rxAsked {
+			cfg.Logger.Warn("randomx needs a Linux or Windows build with librandomx; going on without it")
 		}
+		rx = false
+	}
+	if rx {
+		shared, err = sandbox.NewRandomXShared()
+		if err != nil && !rxAsked {
+			cfg.Logger.Warn("randomx: going on without it", "err", err)
+			shared, err = nil, nil
+		} else if err != nil {
+			return fail(fmt.Errorf("randomx: %w", err))
+		}
+	}
+	if shared != nil {
 		defer shared.Close()
+		shared.IdleRelease = *rxIdle
 		shared.Enable()
 		sctx, stopShared := context.WithCancel(context.Background())
 		defer stopShared()
-		cfg.Logger.Info("randomx-fast", "huge_pages", shared.Huge)
+		cfg.Logger.Info("randomx", "huge_pages", shared.Huge)
 		go shared.Serve(sctx, *rxThreads, func(f string, a ...any) { cfg.Logger.Info(fmt.Sprintf(f, a...)) })
 	}
 	svcCfg := exec.Config{Node: node, Blobs: blobs, Ceiling: ceiling, Trust: tr, Logger: cfg.Logger}
