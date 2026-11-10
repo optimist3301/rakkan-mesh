@@ -49,3 +49,9 @@ func inheritedShared() (int, bool) {
 }
 
 func unmapShared(b []byte) { unix.Munmap(b) }
+
+// releasePages gives the pages of the file back to the system; the file keeps
+// its size and reads as zeros.
+func releasePages(f *os.File, off, length int64) error {
+	return unix.Fallocate(int(f.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE, off, length)
+}

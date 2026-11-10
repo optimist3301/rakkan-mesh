@@ -68,6 +68,7 @@ func daemonCmd(args []string) int {
 	var rx bool
 	flags.BoolVar(&rx, "randomx", true, "hold the 2 GiB RandomX dataset in memory and offer RandomX tasks (randomx-fast/1) to the network; only Linux and Windows builds with librandomx have it, elsewhere it is skipped")
 	flags.BoolVar(&rx, "randomx-fast", true, "deprecated name of -randomx")
+	rxIdle := flags.Duration("randomx-idle", 10*time.Minute, "return the RandomX dataset's memory to the system after this long without a RandomX task (Linux; it is built again, in seconds, by the next task); 0 keeps it")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
@@ -242,6 +243,7 @@ func daemonCmd(args []string) int {
 	}
 	if shared != nil {
 		defer shared.Close()
+		shared.IdleRelease = *rxIdle
 		shared.Enable()
 		sctx, stopShared := context.WithCancel(context.Background())
 		defer stopShared()
