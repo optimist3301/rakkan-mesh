@@ -63,6 +63,7 @@ func daemonCmd(args []string) int {
 	isolation := flags.String("isolation", "strict", "worker isolation: strict, ns or process")
 	cgroup := flags.String("cgroup", "", `delegated cgroup v2 directory for per-worker limits, or "self"`)
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
+	apiMode := flags.String("api-mode", "0600", `permissions of the API socket, in octal: "0660" lets the node's group in too (the group must also be able to enter the socket's directory)`)
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
 	rxFast := flags.Bool("randomx-fast", true, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
@@ -282,7 +283,11 @@ func daemonCmd(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if *apiPath != "" {
-		l, err := api.Listen(*apiPath)
+		mode, err := parseSocketMode(*apiMode)
+		if err != nil {
+			return fail(err)
+		}
+		l, err := api.Listen(*apiPath, mode)
 		if err != nil {
 			return fail(fmt.Errorf("api: %w", err))
 		}
@@ -469,4 +474,14 @@ func printMembers(node *mesh.Node, tr *trust.Service) {
 		}
 		fmt.Printf("  %s %-24s %s\n", m.ID, strings.Join(m.Roles, ","), state)
 	}
+}
+
+// parseSocketMode parses -api-mode. Others may never be let in: whoever
+// reaches the socket runs tasks and spends the node's credit.
+func parseSocketMode(s string) (os.FileMode, error) {
+	m, err := strconv.ParseUint(s, 8, 32)
+	if err != nil || m&^0o770 != 0 || m&0o600 != 0o600 {
+		return 0, fmt.Errorf("-api-mode %q: want octal permissions such as 0600 or 0660, with read and write for the owner and nothing for others", s)
+	}
+	return os.FileMode(m), nil
 }
