@@ -65,7 +65,7 @@ func daemonCmd(args []string) int {
 	apiPath := flags.String("api", "rakkan.sock", "unix socket for the local API used by SDKs; empty disables")
 	apiMode := flags.String("api-mode", "0600", `permissions of the API socket, in octal: "0660" lets the node's group in too (the group must also be able to enter the socket's directory)`)
 	dataDir := flags.String("data", "data", "directory for stored blobs: large task inputs and outputs")
-	rxFast := flags.Bool("randomx-fast", true, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network")
+	rxFast := flags.Bool("randomx-fast", false, "hold the 2 GiB RandomX dataset in memory and offer fast RandomX tasks (randomx-fast/1) to the network (Linux only)")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
@@ -218,6 +218,11 @@ func daemonCmd(args []string) int {
 	ceiling.MaxInputBytes = *maxInputMB << 20
 	ceiling.MaxOutputBytes = *maxOutputMB << 20
 	var shared *sandbox.RandomXShared
+	if *rxFast && runtime.GOOS != "linux" {
+		// A config carried over from a Linux node must not stop this one.
+		cfg.Logger.Warn("randomx-fast is Linux only; going on without it")
+		*rxFast = false
+	}
 	if *rxFast {
 		shared, err = sandbox.NewRandomXShared()
 		if err != nil {
