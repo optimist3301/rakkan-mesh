@@ -60,11 +60,12 @@ type Config struct {
 	IdleTimeout time.Duration
 	Isolation   Isolation
 	// HostExtraBytes is added to the default worker memory limit, for host
-	// kernels that hold memory of their own (RandomX: sandbox.RandomXHostBytes).
+	// kernels that hold memory of their own (RandomX: sandbox.RandomXFastHostBytes).
 	// Ignored when Isolation.MemoryBytes is set.
 	HostExtraBytes int64
-	// ExtraFiles are passed to every worker as descriptors 3, 4, ... (the
-	// shared RandomX dataset is descriptor 3).
+	// ExtraFiles are passed to every worker (on Linux as descriptors 3, 4, ...;
+	// the shared RandomX dataset is descriptor 3; on Windows as inherited
+	// handles, see inheritFiles).
 	ExtraFiles []*os.File
 	// Executable is the worker binary. Default: the running executable,
 	// which must call RunWorker when IsWorker reports true.
@@ -325,8 +326,8 @@ func (p *Pool) spawn() (*worker, error) {
 	cmd.Args = append([]string{"rakkan-worker"}, p.cfg.args...)
 	cmd.Env = []string{workerEnv + "=" + iso.encode(iso.startStage())}
 	cmd.Dir = "/"
-	cmd.ExtraFiles = p.cfg.ExtraFiles
 	cmd.SysProcAttr = iso.sysProcAttr()
+	inheritFiles(cmd, p.cfg.ExtraFiles)
 
 	w := &worker{cmd: cmd, stderr: &tailBuffer{}, exited: make(chan struct{})}
 	cmd.Stderr = w.stderr

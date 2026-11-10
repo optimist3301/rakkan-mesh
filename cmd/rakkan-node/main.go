@@ -140,7 +140,7 @@ func runCmd(args []string) int {
 		}
 		iso.Cgroup = *cgroup
 		var pool *isolate.Pool
-		pool, err = isolate.NewPool(isolate.Config{Ceiling: lim, Workers: 1, Isolation: iso, HostExtraBytes: sandbox.RandomXHostBytes})
+		pool, err = isolate.NewPool(isolate.Config{Ceiling: lim, Workers: 1, Isolation: iso})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1

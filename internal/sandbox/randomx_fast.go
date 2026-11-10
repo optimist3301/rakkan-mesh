@@ -12,15 +12,14 @@ import (
 	"sync/atomic"
 	"time"
 	"unsafe"
-
-	randomx "git.gammaspectra.live/P2Pool/go-randomx/v4"
 )
 
-// Fast RandomX: hashing against the 2 GiB dataset instead of the 256 MiB
-// cache, about ten times quicker. Workers are separate processes, so the
-// dataset cannot live in each of them. The node (the parent of the workers)
-// owns one copy in a memfd, builds it, and hands the file to every worker as
-// descriptor 3; the workers map it read-only.
+// RandomX hashes against a 2 GiB dataset. Workers are separate processes, so
+// the dataset cannot live in each of them. The node (the parent of the
+// workers) owns one copy in shared memory (a memfd on Linux, a pagefile
+// section on Windows), builds it, and hands it to every worker (descriptor 3
+// on Linux, an inherited handle named by an environment variable on
+// Windows); the workers map it read-only.
 //
 // The memfd starts with a header page:
 //
@@ -51,7 +50,7 @@ const (
 	// aligned for a hugetlb mapping; the dataset is rounded up to one too.
 	hugePage         = 2 << 20
 	sharedHeaderSize = hugePage
-	datasetMapBytes  = (randomx.DatasetSize + hugePage - 1) / hugePage * hugePage
+	datasetMapBytes  = (rxDatasetSize + hugePage - 1) / hugePage * hugePage
 	// RandomXSharedBytes is the size of the shared dataset file.
 	RandomXSharedBytes = sharedHeaderSize + datasetMapBytes
 	// RandomXFastHostBytes is the address space a worker needs to map it.
@@ -59,8 +58,18 @@ const (
 
 	rxErrNoFast = -4 // this node has no shared dataset
 
-	sharedFD = 3 // where a worker finds the file
 )
+
+// InheritedHandlesEnv names, on Windows, the handles a worker inherited (see
+// isolate.inheritFiles); the shared dataset is the first. On Linux the
+// dataset is descriptor 3.
+const InheritedHandlesEnv = "RAKKAN_INHERITED_HANDLES"
+
+// RandomXSharedSupported reports whether this build can offer RandomX: it
+// links librandomx and has shared memory for the workers.
+func RandomXSharedSupported() bool {
+	return rxlibAvailable && (runtime.GOOS == "linux" || runtime.GOOS == "windows")
+}
 
 const (
 	offMagic   = 0
@@ -74,20 +83,18 @@ const (
 
 var sharedMagic = [8]byte{'R', 'X', 'D', 'S', 'E', 'T', '0', '1'}
 
-var randomxFastABI = randomxABI
-
 type rxView struct {
 	hdr  []byte // header page, read-write
 	data []byte // the dataset
-	ds   *randomx.Dataset
+	ds   *rxlibDataset
 }
 
-func newView(hdr, data []byte) *rxView {
-	// Dataset has no constructor over foreign memory; its first field is the
-	// slice of lines it reads. TestFastMatchesLight guards the layout.
-	ds := &randomx.Dataset{}
-	*(*[]randomx.RegisterLine)(unsafe.Pointer(ds)) = unsafe.Slice((*randomx.RegisterLine)(unsafe.Pointer(&data[0])), randomx.DatasetItemCount)
-	return &rxView{hdr: hdr, data: data, ds: ds}
+func newView(hdr, data []byte) (*rxView, error) {
+	ds, err := newRxlibDataset(data)
+	if err != nil {
+		return nil, err
+	}
+	return &rxView{hdr: hdr, data: data, ds: ds}, nil
 }
 
 func (v *rxView) gen() *uint64 { return (*uint64)(unsafe.Pointer(&v.hdr[offGen])) }
@@ -128,7 +135,10 @@ func sharedView() *rxView {
 	return rxShared.v
 }
 
-var rxFast = &rxBackend{gas: randomxFastHashGas, open: func(s *execState, seed []byte) (*randomx.VM, func() bool, int32) {
+// rxOpen returns a VM for the seed. done releases it and reports whether its
+// results can be trusted (the dataset did not change under it). A negative
+// code is returned to the task instead.
+func rxOpen(s *execState, seed []byte) (vm *rxlibVM, done func() bool, code int32) {
 	v := sharedView()
 	if v == nil {
 		return nil, nil, rxErrNoFast
@@ -140,17 +150,15 @@ var rxFast = &rxBackend{gas: randomxFastHashGas, open: func(s *execState, seed [
 		}
 		return nil, nil, rxErrNotReady
 	}
-	vm, err := randomx.NewVM(randomxFastFlags(), nil, v.ds)
+	vm, err := newRxlibVM(v.ds)
 	if err != nil {
 		s.trap(fmt.Errorf("%w: randomx vm: %v", ErrTrap, err))
 	}
 	return vm, func() bool {
-		vm.Close()
+		vm.close()
 		return atomic.LoadUint64(v.gen()) == g
 	}, 0
-}}
-
-func randomxFastFlags() randomx.Flags { return randomxFlags() | randomx.RANDOMX_FLAG_FULL_MEM }
+}
 
 // RandomXShared is the node's copy of the dataset.
 type RandomXShared struct {
@@ -182,7 +190,13 @@ func NewRandomXShared() (*RandomXShared, error) {
 			return nil, err
 		}
 		copy(mem[offMagic:], sharedMagic[:])
-		return &RandomXShared{f: f, Huge: huge, v: newView(mem[:sharedHeaderSize:sharedHeaderSize], mem[sharedHeaderSize:])}, nil
+		v, err := newView(mem[:sharedHeaderSize:sharedHeaderSize], mem[sharedHeaderSize:])
+		if err != nil {
+			unmapShared(mem)
+			f.Close()
+			return nil, err
+		}
+		return &RandomXShared{f: f, Huge: huge, v: v}, nil
 	}
 	panic("unreachable")
 }
@@ -228,16 +242,16 @@ func (s *RandomXShared) build(seed []byte, threads int) error {
 		return errors.New("bad seed")
 	}
 	v := s.v
-	cache, err := randomx.NewCache(randomxFlags())
+	cache, err := newRxlibCache()
 	if err != nil {
 		return err
 	}
-	defer cache.Close()
-	cache.Init(seed)
+	defer cache.close()
+	cache.init(seed)
 
 	atomic.AddUint64(v.gen(), 1) // odd: workers stop trusting the dataset
 	binary.LittleEndian.PutUint32(v.hdr[offSeedLen:], 0)
-	v.ds.InitDatasetParallel(cache, max(threads, 1))
+	v.ds.fill(cache, threads)
 	v.setField(offSeedLen, offSeed, seed)
 	atomic.AddUint64(v.gen(), 1)
 	return nil
@@ -248,18 +262,22 @@ func (s *RandomXShared) Close() { s.f.Close() }
 
 // attachShared maps the dataset inherited as descriptor 3, if there is one.
 func attachShared() *rxView {
-	size, ok := fdSize(sharedFD)
-	if !ok || size != RandomXSharedBytes {
+	fd, ok := inheritedShared()
+	if !ok {
 		return nil
 	}
-	hdr, err := mapShared(sharedFD, 0, sharedHeaderSize, true)
+	hdr, err := mapShared(fd, 0, sharedHeaderSize, true)
 	if err != nil || !bytes.Equal(hdr[:8], sharedMagic[:]) {
 		return nil
 	}
-	data, err := mapShared(sharedFD, sharedHeaderSize, datasetMapBytes, false)
+	data, err := mapShared(fd, sharedHeaderSize, datasetMapBytes, false)
 	if err != nil {
 		return nil
 	}
 	runtime.KeepAlive(hdr)
-	return newView(hdr, data)
+	v, err := newView(hdr, data)
+	if err != nil {
+		return nil
+	}
+	return v
 }

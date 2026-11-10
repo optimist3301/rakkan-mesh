@@ -19,8 +19,8 @@
 Разработчикам: [документация по API, задачам и распределённым программам](docs/dev/README.md).
 
 ```sh
-go test ./...
-CGO_ENABLED=0 go build ./cmd/rakkan-node   # статический бинарник рекомендуется
+make test                                  # собирает librandomx (нужны cmake и g++) и гоняет тесты
+make                                       # ./rakkan-node (cgo: RandomX) и ./rakkan-web
 ./rakkan-node run -input data.bin -mem 64 -gas 1000000000 -timeout 5s task.wasm
 ```
 
