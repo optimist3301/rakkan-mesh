@@ -21,5 +21,24 @@ jobs:
       - name: Allow unprivileged user namespaces
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: go build ./...
-      - run: go test ./...
+      # RandomX is the C++ library linked through cgo. Linux builds it with
+      # the runner's compiler and macOS builds without it (make knows which).
+      - if: runner.os != 'Windows'
+        run: make test
+      # Windows builds it with MSYS2's MinGW-w64 toolchain.
+      - if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          path-type: inherit
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            make
+            git
+      - if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: |
+          sh scripts/build-randomx.sh windows amd64
+          CGO_ENABLED=1 go vet -tags netgo,osusergo ./...
+          CGO_ENABLED=1 go test -tags netgo,osusergo ./...

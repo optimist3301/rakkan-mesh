@@ -51,14 +51,13 @@ var (
 		},
 		ImageModule:       imageABI,
 		TensorModule:      tensorABI,
-		RandomXModule:     randomxABI,
-		RandomXFastModule: randomxFastABI,
+		RandomXFastModule: randomxABI,
 	}
 
 	// capabilityOf names the capability each optional namespace provides.
 	// Nodes advertise capabilities; schedulers send tasks only to nodes
 	// having every capability a task imports.
-	capabilityOf = map[string]string{ImageModule: ImageCapability, TensorModule: TensorCapability, RandomXModule: RandomXCapability, RandomXFastModule: RandomXFastCapability}
+	capabilityOf = map[string]string{ImageModule: ImageCapability, TensorModule: TensorCapability, RandomXFastModule: RandomXFastCapability}
 	f32          = api.ValueTypeF32
 
 	// Entry points take no arguments and return an exit code; 0 means success.

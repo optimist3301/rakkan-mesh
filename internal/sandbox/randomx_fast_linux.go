@@ -38,3 +38,14 @@ func fdSize(fd int) (int64, bool) {
 	}
 	return st.Size, true
 }
+
+// sharedFD is where a worker finds the dataset.
+const sharedFD = 3
+
+// inheritedShared is the descriptor of the dataset the node passed, if any.
+func inheritedShared() (int, bool) {
+	size, ok := fdSize(sharedFD)
+	return sharedFD, ok && size == RandomXSharedBytes
+}
+
+func unmapShared(b []byte) { unix.Munmap(b) }

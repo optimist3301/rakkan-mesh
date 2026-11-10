@@ -12,3 +12,4 @@ tools/llmref/.venv/
 __pycache__/
 tools/llmref/.venv-gpu/
 /gpu-results-*
+/build/

@@ -20,6 +20,13 @@ jobs:
       # Ubuntu runners forbid the user namespaces the worker isolation uses.
       - name: Allow unprivileged user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # RandomX is built from source for each platform that has it.
+      - name: Install the C and C++ toolchains
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake g++ zip \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
       - run: make test
       - run: make dist VERSION=${GITHUB_REF_NAME#v}
       - uses: softprops/action-gh-release@v2

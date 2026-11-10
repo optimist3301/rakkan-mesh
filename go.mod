@@ -3,7 +3,6 @@ module github.com/optimist3301/rakkan-mesh
 go 1.26.10
 
 require (
-	git.gammaspectra.live/P2Pool/go-randomx/v4 v4.7.0
 	github.com/Arceliar/ironwood v0.0.0-20261023231900-0712eccbb962
 	github.com/ebitengine/purego v0.8.4
 	github.com/libp2p/go-libp2p v0.51.0
