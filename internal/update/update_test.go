@@ -59,7 +59,9 @@ func fakeGitHub(t *testing.T, tags string, files map[string][]byte) *Updater {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	return &Updater{Repo: "o/r", APIBase: srv.URL, DownloadBase: srv.URL, GOOS: "linux", GOARCH: "amd64"}
+	// The programs in these archives are text, not something to run.
+	accept := func(string, string) error { return nil }
+	return &Updater{Repo: "o/r", APIBase: srv.URL, DownloadBase: srv.URL, GOOS: "linux", GOARCH: "amd64", Verify: accept}
 }
 
 func TestLatest(t *testing.T) {
@@ -174,5 +176,52 @@ func TestApplyZip(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(exe); string(b) != "NEW EXE" {
 		t.Errorf("exe = %q", b)
+	}
+}
+
+// A release whose program does not run here leaves the installed one alone.
+func TestApplyKeepsNodeThatWouldNotRun(t *testing.T) {
+	name := "rakkan-node-0.011-alpha-linux-amd64"
+	tgz := tarball(t, name, map[string]string{"rakkan-node": "NEW NODE", "rakkan-web": "NEW WEB"})
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "rakkan-node")
+	web := filepath.Join(dir, "rakkan-web")
+	os.WriteFile(exe, []byte("old node"), 0o755)
+	os.WriteFile(web, []byte("old web"), 0o755)
+	u := fakeGitHub(t, "[]", map[string][]byte{
+		"v0.011-alpha/" + name + ".tar.gz": tgz,
+		"v0.011-alpha/SHA256SUMS":          sum(name+".tar.gz", tgz),
+	})
+	u.Verify = RunsAs // the real check: "NEW NODE" is no program
+	err := u.Apply(context.Background(), &Release{Tag: "v0.011-alpha", Version: "0.011-alpha"}, exe)
+	if err == nil || !strings.Contains(err.Error(), "keeping the current version") {
+		t.Fatalf("err = %v", err)
+	}
+	for p, want := range map[string]string{exe: "old node", web: "old web"} {
+		if b, _ := os.ReadFile(p); string(b) != want {
+			t.Errorf("%s = %q, want %q", p, b, want)
+		}
+	}
+	if left, _ := filepath.Glob(filepath.Join(dir, ".rakkan-update-*")); len(left) != 0 {
+		t.Errorf("temp files left: %v", left)
+	}
+}
+
+func TestRunsAs(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a shell script")
+	}
+	dir := t.TempDir()
+	prog := filepath.Join(dir, "rakkan-node")
+	os.WriteFile(prog, []byte("#!/bin/sh\necho rakkan-node 0.015-alpha linux/amd64 go1.26\n"), 0o755)
+	if err := RunsAs(prog, "0.015-alpha"); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunsAs(prog, "0.016-alpha"); err == nil {
+		t.Fatal("a program of another version passed")
+	}
+	os.WriteFile(prog, []byte("#!/bin/sh\necho 'version GLIBC_2.38 not found' >&2\nexit 1\n"), 0o755)
+	if err := RunsAs(prog, "0.015-alpha"); err == nil || !strings.Contains(err.Error(), "GLIBC_2.38") {
+		t.Fatalf("err = %v", err)
 	}
 }
