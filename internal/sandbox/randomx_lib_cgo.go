@@ -13,7 +13,7 @@ package sandbox
 #cgo windows,amd64 LDFLAGS: -L${SRCDIR}/../../build/randomx/windows-amd64/lib
 // The library is C++: link its runtime in, so the binary needs no libstdc++
 // (or libgcc_s, or the MinGW DLLs) on the machine it runs on.
-#cgo linux LDFLAGS: -lrandomx -Wl,-Bstatic -lstdc++ -Wl,-Bdynamic -lm -static-libgcc
+#cgo linux LDFLAGS: -lrandomx -l:libstdc++.a -lm -static-libgcc
 #cgo windows LDFLAGS: -lrandomx -lstdc++ -static
 #include <randomx.h>
 #include <stdint.h>

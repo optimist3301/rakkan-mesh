@@ -30,7 +30,7 @@
 set -euo pipefail
 
 REPO="optimist3301/rakkan-mesh"
-VERSION="${RAKKAN_VERSION:-0.014-alpha}"
+VERSION="${RAKKAN_VERSION:-0.015-alpha}"
 # The open network run by the project: anyone may join as a guest.
 PUBLIC_NETWORK="12D3KooWJRPbdQ6Q8TXSctKQ8B4ZYHtKArqbKKReeQdx4iojLx7s"
 SERVICE="rakkan-node"

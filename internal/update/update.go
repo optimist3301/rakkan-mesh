@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -108,10 +109,33 @@ type Updater struct {
 	Repo   string       // owner/name; default DefaultRepo
 	Client *http.Client // default: a client with a generous timeout
 
+	// Verify checks a downloaded rakkan-node before it replaces the
+	// running one; Apply gives up, changing nothing, when it fails. Default:
+	// RunsAs, which runs it.
+	Verify func(path, version string) error
+
 	// Overridable for tests.
 	APIBase      string // default https://api.github.com
 	DownloadBase string // default https://github.com
 	GOOS, GOARCH string // default: this program's
+}
+
+// RunsAs checks that the program at path starts on this machine and is the
+// version expected: "rakkan-node version" prints "rakkan-node <version> ...".
+// A release this machine cannot run (a C library too old, the wrong
+// architecture) would otherwise replace a working node with a dead one,
+// and a node that cannot start cannot update itself back.
+func RunsAs(path, version string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, path, "version").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("the new rakkan-node does not run here (%v): %s", err, strings.TrimSpace(string(out)))
+	}
+	if f := strings.Fields(string(out)); len(f) < 2 || f[0] != "rakkan-node" || f[1] != version {
+		return fmt.Errorf("the new rakkan-node says %q, want version %s", strings.TrimSpace(string(out)), version)
+	}
+	return nil
 }
 
 func (u *Updater) repo() string {
@@ -262,8 +286,16 @@ func (u *Updater) Apply(ctx context.Context, rel *Release, exe string) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := extracted["rakkan-node"+ext]; !ok {
+	node, ok := extracted["rakkan-node"+ext]
+	if !ok {
 		return fmt.Errorf("%s does not contain rakkan-node%s", archive, ext)
+	}
+	verify := u.Verify
+	if verify == nil {
+		verify = RunsAs
+	}
+	if err := verify(node, rel.Version); err != nil {
+		return fmt.Errorf("%s: %w; keeping the current version", rel.Tag, err)
 	}
 	// The node first, so a failure on the web page's program leaves a
 	// consistent node.

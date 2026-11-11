@@ -5,12 +5,16 @@
 #   make randomx      build librandomx for this machine (build/randomx/)
 #   make test         run the tests
 #   make dist         cross-compile archives and SHA256SUMS into dist/
-#   make dist VERSION=0.014-alpha
+#   make dist VERSION=0.015-alpha
 #
 # RandomX is the reference C++ library, linked through cgo, so a node with it
 # needs a C/C++ compiler and cmake (scripts/build-randomx.sh says which for
 # each platform). The platforms in RANDOMX_PLATFORMS get it; the others are
 # built without cgo and have no RandomX tasks. rakkan-web has no cgo.
+#
+# make dist builds the Linux nodes fully static against musl, in an Alpine
+# container (scripts/build-linux-static.sh: docker or podman, and QEMU for
+# the architecture that is not the host's), so they run on any distribution.
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo dev)
 PLATFORMS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64
@@ -50,7 +54,9 @@ dist: clean
 	  echo "build $$name"; \
 	  mkdir -p dist/$$name; \
 	  case " $(RANDOMX_PLATFORMS) " in *" $$os/$$arch "*) rx=1;; *) rx=0;; esac; \
-	  if [ $$rx = 1 ]; then \
+	  if [ $$rx = 1 ] && [ $$os = linux ]; then \
+	    sh scripts/build-linux-static.sh $$arch dist/$$name $(VERSION); \
+	  elif [ $$rx = 1 ]; then \
 	    sh scripts/build-randomx.sh $$os $$arch; \
 	    env $$(sh scripts/build-randomx.sh env $$os $$arch) CGO_ENABLED=1 GOOS=$$os GOARCH=$$arch $(GO) build -tags $(TAGS) -trimpath -ldflags '$(LDFLAGS)' -o dist/$$name/rakkan-node$$ext ./cmd/rakkan-node; \
 	  else \
@@ -58,7 +64,13 @@ dist: clean
 	  fi; \
 	  CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o dist/$$name/rakkan-web$$ext ./cmd/rakkan-web; \
 	  cp README.md dist/$$name/; \
-	  if [ $$rx = 1 ]; then mkdir -p dist/$$name/licenses/randomx; cp build/randomx/$$os-$$arch/LICENSE dist/$$name/licenses/randomx/; fi; \
+	  if [ $$rx = 1 ] && [ $$os = linux ]; then \
+	    mkdir -p dist/$$name/licenses/randomx dist/$$name/licenses/musl; \
+	    cp build/musl-$$arch/randomx/linux-$$arch/LICENSE dist/$$name/licenses/randomx/; \
+	    cp scripts/licenses/musl-COPYRIGHT dist/$$name/licenses/musl/COPYRIGHT; \
+	  elif [ $$rx = 1 ]; then \
+	    mkdir -p dist/$$name/licenses/randomx; cp build/randomx/$$os-$$arch/LICENSE dist/$$name/licenses/randomx/; \
+	  fi; \
 	  mkdir -p dist/$$name/licenses/yggdrasil; \
 	  cp internal/ygg/NOTICE internal/ygg/licenses/* dist/$$name/licenses/yggdrasil/; \
 	  if [ $$os = windows ]; then \

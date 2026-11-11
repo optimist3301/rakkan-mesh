@@ -42,3 +42,18 @@ jobs:
           sh scripts/build-randomx.sh windows amd64
           CGO_ENABLED=1 go vet -tags netgo,osusergo ./...
           CGO_ENABLED=1 go test -tags netgo,osusergo ./...
+
+  # The release's Linux node: static, against musl, in an Alpine container.
+  # It must start on a distribution with an old glibc and on Alpine.
+  static-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: sh scripts/build-linux-static.sh amd64 out ci
+      - run: |
+          for img in debian:11 alpine:3.22; do
+            docker run --rm -v "$PWD/out:/x:ro" "$img" /x/rakkan-node version
+          done

@@ -25,8 +25,12 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends cmake g++ zip \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
             gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+      # Linux nodes are built static in Alpine containers (make dist); the
+      # arm64 one runs under QEMU.
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
       - run: make test
       - run: make dist VERSION=${GITHUB_REF_NAME#v}
       - uses: softprops/action-gh-release@v2
