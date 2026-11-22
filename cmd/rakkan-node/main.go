@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/optimist3301/rakkan-mesh/internal/isolate"
+	netmapcli "github.com/optimist3301/rakkan-mesh/internal/netmap/cli"
 	"github.com/optimist3301/rakkan-mesh/internal/sandbox"
 )
 
@@ -32,6 +33,7 @@ commands:
   network close     stop admitting guests
   network show      print a certificate, revocation list or policy
   network announce  publish in the Mainline DHT the members newcomers find
+  map <command>     network map: scan, watch, show, serve, publish (members), collect (root only)
   run <task.wasm>   execute a task locally in the sandbox
   update            install the latest release from GitHub (-check: only look)
   version           print the version
@@ -67,6 +69,8 @@ func main() {
 	case "version", "-version", "--version":
 		fmt.Println("rakkan-node", version, runtime.GOOS+"/"+runtime.GOARCH, runtime.Version())
 		os.Exit(0)
+	case "map":
+		os.Exit(netmapcli.Main(os.Args[2:]))
 	case "config":
 		os.Exit(configCmd(os.Args[2:]))
 	case "network":

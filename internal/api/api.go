@@ -80,6 +80,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/map", s.mapTasks)
 	mux.HandleFunc("GET /v1/status", s.status)
 	mux.HandleFunc("GET /v1/trust", s.trust)
+	mux.HandleFunc("POST /v1/reports", s.postReport)
+	mux.HandleFunc("GET /v1/reports", s.getReports)
 	mux.HandleFunc("POST /v1/llm/models", s.importModel)
 	mux.HandleFunc("GET /v1/llm/models/{id}", s.modelInfo)
 	mux.HandleFunc("POST /v1/llm/generate", s.generate)
@@ -824,4 +826,54 @@ func (s *Server) prefetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"model": req.Model, "bytes": n})
+}
+
+// postReport hands the node a report for the root of the network: the node
+// seals it to the root key, so that only the root can read it, and spreads
+// it. The body is the report, bytes the node does not interpret.
+func (s *Server) postReport(w http.ResponseWriter, r *http.Request) {
+	if !s.Node.ReportsEnabled() {
+		badRequest(w, "reports are not enabled on this node")
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, mesh.MaxReport+1))
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	id, err := s.Node.PublishReport(r.Context(), body)
+	if err != nil {
+		badRequest(w, "%v", err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"id": id})
+}
+
+type reportJSON struct {
+	Seq int64  `json:"seq"`
+	ID  string `json:"id"`
+	// Packet is the sealed report as the network carries it (base64).
+	Packet []byte `json:"packet"`
+}
+
+// getReports lists the sealed reports this node holds that arrived after
+// ?after=SEQ, oldest first, in batches. Everything in them is sealed to the
+// root key: the node cannot read it, and neither can the caller unless it
+// holds that key.
+func (s *Server) getReports(w http.ResponseWriter, r *http.Request) {
+	var after int64
+	if v := r.URL.Query().Get("after"); v != "" {
+		if _, err := fmt.Sscan(v, &after); err != nil {
+			badRequest(w, "after: %v", err)
+			return
+		}
+	}
+	out := struct {
+		Network string       `json:"network"`
+		Reports []reportJSON `json:"reports"`
+	}{Network: s.Network, Reports: []reportJSON{}}
+	for _, p := range s.Node.Reports(after, 200, 16<<20) {
+		out.Reports = append(out.Reports, reportJSON{p.Seq, p.ID, p.Data})
+	}
+	writeJSON(w, http.StatusOK, out)
 }

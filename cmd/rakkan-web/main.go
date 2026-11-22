@@ -27,12 +27,12 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/optimist3301/rakkan-mesh/internal/nodesock"
 	"github.com/optimist3301/rakkan-mesh/internal/web"
 )
 
@@ -50,19 +50,29 @@ func main() {
 	apiPath := flags.String("api", "", "the node's API socket (default: from -config, or where the installer puts it)")
 	configPath := flags.String("config", "", "the node's JSON config, to take the socket from its \"api\" field")
 	hub := flags.String("hub", "https://huggingface.co", "Hugging Face Hub to import models from")
+	var mo mapOptions
+	flags.StringVar(&mo.DB, "map-db", "", "the map store the Map tab shows (default: your own map, ~/.local/share/rakkan/map.db; with -root-key, the network's, network.db next to it). A node's own map is in <its -data>/map/map.db")
+	flags.StringVar(&mo.RootKey, "root-key", "", "the network's root key: shows the WHOLE network's map, collected from the node's sealed reports (only its holder can read them); without it the Map tab shows only your own")
+	flags.StringVar(&mo.CRL, "crl", "", "with -root-key: revocation list; reports of revoked members are refused")
+	flags.DurationVar(&mo.Keep, "map-keep", 7*24*time.Hour, "show and keep this much history of the map; older observations are deleted from a collected network map")
+	flags.DurationVar(&mo.Every, "map-collect", time.Minute, "with -root-key: how often to take new reports from the node")
+	flags.StringVar(&mo.Tiles, "map-tiles", "", "basemap tiles URL template ({z}/{x}/{y}) for the geographic map; empty: none, no request leaves this machine")
 	showVersion := flags.Bool("version", false, "print the version")
 	flags.Parse(os.Args[1:])
 	if *showVersion {
 		fmt.Println("rakkan-web", version, runtime.GOOS+"/"+runtime.GOARCH, runtime.Version())
 		return
 	}
-	if err := run(*listen, *token, *apiPath, *configPath, *hub); err != nil {
+	if err := run(*listen, *token, *apiPath, *configPath, *hub, mo); err != nil {
 		fmt.Fprintln(os.Stderr, "rakkan-web:", err)
 		os.Exit(1)
 	}
 }
 
-func run(listen, token, apiPath, configPath, hub string) error {
+func run(listen, token, apiPath, configPath, hub string, mo mapOptions) error {
+	if err := mo.validate(); err != nil {
+		return err
+	}
 	if !web.IsLoopback(listen) && token == "" {
 		return fmt.Errorf("-listen %s is reachable from other machines: set -token (or RAKKAN_WEB_TOKEN), or use 127.0.0.1", listen)
 	}
@@ -81,7 +91,14 @@ func run(listen, token, apiPath, configPath, hub string) error {
 		host = strings.Replace(host, "127.0.0.1", "localhost", 1)
 	}
 	fmt.Printf("rakkan-web %s: http://%s, node API at %s\n", version, host, sock)
-	return web.Serve(ctx, l, web.Handler(nodeAPI(sock), newImporter(hub, sock).handler(), token))
+	pages, data, csp, err := mapHandlers(ctx, mo, sock)
+	if err != nil {
+		return err
+	}
+	app := http.NewServeMux()
+	app.Handle("/app/map/", http.StripPrefix("/app/map", data))
+	app.Handle("/", newImporter(hub, sock).handler())
+	return web.Serve(ctx, l, web.HandlerWithMap(nodeAPI(sock), app, token, pages, csp))
 }
 
 // maxRequestBody bounds a request the page sends the node: the node's own
@@ -140,63 +157,7 @@ func nodeAPI(sock string) http.Handler {
 	})
 }
 
-// findSocket picks the node's API socket: -api, the "api" of -config, or
-// the first that exists where the installers put it.
+// findSocket picks the node's API socket (see nodesock.Find).
 func findSocket(apiPath, configPath string) (string, error) {
-	if apiPath != "" {
-		return apiPath, nil
-	}
-	if configPath != "" {
-		data, err := os.ReadFile(configPath)
-		if err != nil {
-			return "", err
-		}
-		var cf struct {
-			API string `json:"api"`
-		}
-		if err := json.Unmarshal(data, &cf); err != nil {
-			return "", fmt.Errorf("%s: %w", configPath, err)
-		}
-		if cf.API == "" {
-			return "", fmt.Errorf("%s has no \"api\" socket", configPath)
-		}
-		if !filepath.IsAbs(cf.API) {
-			cf.API = filepath.Join(filepath.Dir(configPath), cf.API)
-		}
-		return cf.API, nil
-	}
-	candidates := socketCandidates()
-	for _, c := range candidates {
-		// Windows may not mark an AF_UNIX socket as one.
-		if fi, err := os.Stat(c); err == nil && (fi.Mode()&os.ModeSocket != 0 || runtime.GOOS == "windows") {
-			return c, nil
-		}
-	}
-	return "", errors.New("found no node API socket; start rakkan-node, or give -api or -config. Looked at:\n  " + strings.Join(candidates, "\n  "))
-}
-
-// socketCandidates are where scripts/install.sh and install.ps1 put the
-// socket (user install first, then system), and the daemon's default.
-func socketCandidates() []string {
-	home, _ := os.UserHomeDir()
-	var out []string
-	switch runtime.GOOS {
-	case "windows":
-		if d := os.Getenv("LOCALAPPDATA"); d != "" {
-			out = append(out, filepath.Join(d, "Rakkan", "data", "rakkan.sock"))
-		}
-		if d := os.Getenv("ProgramData"); d != "" {
-			out = append(out, filepath.Join(d, "Rakkan", "data", "rakkan.sock"))
-		}
-	case "darwin":
-		out = append(out, filepath.Join(home, "Library", "Application Support", "Rakkan", "data", "rakkan.sock"),
-			"/Library/Application Support/Rakkan/data/rakkan.sock")
-	default:
-		data := os.Getenv("XDG_DATA_HOME")
-		if data == "" {
-			data = filepath.Join(home, ".local", "share")
-		}
-		out = append(out, filepath.Join(data, "rakkan", "rakkan.sock"), "/var/lib/rakkan/rakkan.sock")
-	}
-	return append(out, "rakkan.sock")
+	return nodesock.Find(apiPath, configPath)
 }

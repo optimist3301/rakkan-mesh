@@ -33,6 +33,7 @@ import (
 
 	"github.com/optimist3301/rakkan-mesh/internal/membership"
 	"github.com/optimist3301/rakkan-mesh/internal/mesh"
+	netmapcli "github.com/optimist3301/rakkan-mesh/internal/netmap/cli"
 	"github.com/optimist3301/rakkan-mesh/internal/ygg"
 )
 
@@ -70,6 +71,14 @@ func daemonCmd(args []string) int {
 	flags.BoolVar(&rx, "randomx-fast", true, "deprecated name of -randomx")
 	rxIdle := flags.Duration("randomx-idle", 10*time.Minute, "return the RandomX dataset's memory to the system after this long without a RandomX task (Linux; it is built again, in seconds, by the next task); 0 keeps it")
 	rxThreads := flags.Int("randomx-threads", runtime.NumCPU(), "cores used to rebuild the RandomX dataset when its seed changes")
+	reportsDir := flags.String("reports", "", `directory of the spool of sealed reports for the network root (default: reports in -data); "off" turns reports off`)
+	reportsMB := flags.Int("reports-mb", 64, "disk budget of the report spool, in MiB")
+	mapEvery := flags.Duration("map-every", 15*time.Minute, "map this node's networks and report the map to the network root at this interval, sealed so that only the root key opens it (0: off). Needs a certificate (or, for a guest, its proof of work) and the report spool; on other systems than Linux it does nothing")
+	mapScan := flags.Bool("map-scan", false, "also scan this node's own networks actively before each report: a ping sweep of the subnet or its /24, mDNS and SSDP queries, TCP probes of a few ports. Off by default, it sends probes into the network and is for the owner of this node to switch on; the node always listens passively (neighbour table, mDNS/SSDP announcements, raw capture if permitted) and never probes without it")
+	mapDir := flags.String("map-dir", "", "where the node keeps its map and observer key (default: map in -data)")
+	mapKeep := flags.Duration("map-keep", 7*24*time.Hour, "how long the node keeps what it observed; older observations are deleted, so the store does not grow while the node runs")
+	mapLocation := flags.String("map-location", "keep", "positions in the reports: keep, drop, coarse:1km")
+	mapWAN := flags.String("map-wan", "keep", "external addresses of this node's networks in the reports: keep, drop")
 	storeGB := flags.Float64("store-gb", 10, "disk budget for stored blobs, in GiB")
 	maxInputMB := flags.Int("max-input-mb", 16, "largest task input this node accepts, in MiB")
 	maxOutputMB := flags.Int("max-output-mb", 16, "largest task output this node accepts, in MiB")
@@ -133,6 +142,14 @@ func daemonCmd(args []string) int {
 		return fail(err)
 	}
 	cfg := mesh.Config{Key: key, Network: n, Cert: cert, MDNS: *mdnsOn, Mainline: *mainline, NAT: *nat, RelayService: *relay, Reachability: reachability, PeerCache: *peerCache}
+	switch *reportsDir {
+	case "off":
+	case "":
+		cfg.Reports.Dir = filepath.Join(*dataDir, "reports")
+	default:
+		cfg.Reports.Dir = *reportsDir
+	}
+	cfg.Reports.MaxBytes = int64(*reportsMB) << 20
 	if *policyPath != "" {
 		if cfg.Policy, err = membership.LoadPolicy(*policyPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fail(err)
@@ -330,6 +347,29 @@ func daemonCmd(args []string) int {
 			}
 			every := max(*updInterval, minUpdateInterval)
 			go autoUpdate(ctx, &update.Updater{Repo: *updRepo}, every, cfg.Logger, func() { close(restart) })
+		}
+	}
+	if *mapEvery > 0 {
+		explicit := false
+		flags.Visit(func(f *flag.Flag) { explicit = explicit || f.Name == "map-every" })
+		dir := *mapDir
+		if dir == "" {
+			dir = filepath.Join(*dataDir, "map")
+		}
+		rep, err := netmapcli.NewReporter(netmapcli.ReporterOptions{
+			DB: filepath.Join(dir, "map.db"), Key: filepath.Join(dir, "observer.key"),
+			Every: *mapEvery, Scan: *mapScan, Keep: *mapKeep, Location: *mapLocation, WAN: *mapWAN,
+			Send: func(b []byte) error { _, err := node.PublishReport(ctx, b); return err }})
+		switch {
+		case err == nil && node.CanReport():
+			cfg.Logger.Info("reporting the network map to the root", "every", *mapEvery, "scan", *mapScan, "keep", *mapKeep, "dir", dir)
+			go rep.Run(ctx)
+		case explicit && err != nil:
+			return fail(err)
+		case explicit:
+			return fail(errors.New("-map-every needs reports (not -reports off) and a certificate or a proof of work"))
+		default:
+			cfg.Logger.Debug("not reporting the network map", "err", err, "reports", node.ReportsEnabled(), "member", node.Certified())
 		}
 	}
 	status := time.NewTicker(*statusEvery)
