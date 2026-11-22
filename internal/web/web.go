@@ -43,6 +43,14 @@ var Routes = []string{
 // requests to both must carry it as "Authorization: Bearer <token>";
 // without one, only loopback hosts are answered.
 func Handler(api, app http.Handler, token string) http.Handler {
+	return HandlerWithMap(api, app, token, nil, "")
+}
+
+// HandlerWithMap is Handler plus the network map viewer: its page (mapPages,
+// with its own Content-Security-Policy mapCSP, since it draws with inline
+// styles) under /map/. Its data belongs to app, under /app/map/, where the
+// token protects it like the rest.
+func HandlerWithMap(api, app http.Handler, token string, mapPages http.Handler, mapCSP string) http.Handler {
 	files, err := fs.Sub(static, "static")
 	if err != nil {
 		panic(err)
@@ -55,13 +63,17 @@ func Handler(api, app http.Handler, token string) http.Handler {
 		mux.Handle("GET /app/", app)
 		mux.Handle("POST /app/", app)
 	}
+	if mapPages != nil {
+		mux.Handle("GET /map/", http.StripPrefix("/map", mapPages))
+	}
 	mux.Handle("GET /", http.FileServerFS(files))
-	return &guard{next: mux, token: token}
+	return &guard{next: mux, token: token, mapCSP: mapCSP}
 }
 
 type guard struct {
-	next  http.Handler
-	token string
+	next   http.Handler
+	token  string
+	mapCSP string // for /map/
 }
 
 func (g *guard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +82,9 @@ func (g *guard) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "no-referrer")
 	h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data: blob:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+	if g.mapCSP != "" && strings.HasPrefix(r.URL.Path, "/map/") {
+		h.Set("Content-Security-Policy", g.mapCSP)
+	}
 	if g.token == "" && !loopbackHost(r.Host) {
 		http.Error(w, "this page answers on localhost only", http.StatusMisdirectedRequest)
 		return

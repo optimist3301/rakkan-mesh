@@ -116,6 +116,9 @@ type Config struct {
 	DiscoveryInterval time.Duration // default 1m
 	MaxBackoff        time.Duration // default 5m
 	Logger            *slog.Logger
+
+	// Reports configures sealed reports to the root (reports.go).
+	Reports ReportsConfig
 }
 
 func (c *Config) setDefaults() {
@@ -181,6 +184,8 @@ type Node struct {
 	ps       *pubsub.PubSub
 	crl      *pubsub.Topic
 	policy   *pubsub.Topic
+	reports  *pubsub.Topic
+	spool    *spool
 	mdns     mdns.Service
 	relay    *relayv2.Relay
 	ygg      *ygg.Node
@@ -345,6 +350,9 @@ func (n *Node) startServices() error {
 		return err
 	}
 	if err := n.startPolicyGossip(); err != nil {
+		return err
+	}
+	if err := n.startReports(); err != nil {
 		return err
 	}
 	if n.cfg.MDNS {

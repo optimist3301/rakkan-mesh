@@ -58,10 +58,11 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 17px; }
 .tabs { display: flex; gap: 4px; margin-left: 12px; }
-.tabs button {
+.tabs button, .tabs .tab-link {
   border: 0; background: none; color: var(--muted);
-  padding: 7px 14px; border-radius: 8px; font: inherit; cursor: pointer;
+  padding: 7px 14px; border-radius: 8px; font: inherit; cursor: pointer; text-decoration: none;
 }
+.tabs .tab-link:hover { color: var(--text); }
 .tabs button[aria-selected="true"] { background: var(--accent-soft); color: var(--text); font-weight: 600; }
 .conn { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--idle); flex: none; }

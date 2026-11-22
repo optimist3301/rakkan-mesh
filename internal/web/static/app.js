@@ -4,7 +4,7 @@
 
 const T = {
   ru: {
-    tabNet: "Сеть", tabChat: "Чат", tabModels: "Модели", archLlama: "llama-подобная",
+    tabNet: "Сеть", tabChat: "Чат", tabModels: "Модели", tabMap: "Карта", archLlama: "llama-подобная",
     importTitle: "Загрузить модель с Hugging Face",
     importText: "rakkan-web скачает файлы модели и передаст их узлу; узлы с -llm потом возьмут себе её слои. Подходят Llama 3, Qwen2/2.5 и Qwen3 в safetensors, а также DeepSeek-V4.1.",
     repo: "Репозиторий", revision: "Версия", quant: "Хранить веса", modelName: "Имя", namePh: "по имени репозитория",
@@ -49,7 +49,7 @@ const T = {
     emptyAnswer: "(пустой ответ: модель сразу закончила)", lost: "Соединение с узлом прервалось. Загляните в журнал узла.",
   },
   en: {
-    tabNet: "Network", tabChat: "Chat", tabModels: "Models", archLlama: "llama-like",
+    tabNet: "Network", tabChat: "Chat", tabModels: "Models", tabMap: "Map", archLlama: "llama-like",
     importTitle: "Load a model from Hugging Face",
     importText: "rakkan-web downloads the model's files and hands them to the node; nodes with -llm then take its layers. Llama 3, Qwen2/2.5 and Qwen3 in safetensors fit, and DeepSeek-V4.1.",
     repo: "Repository", revision: "Revision", quant: "Store weights as", modelName: "Name", namePh: "the repository's name",

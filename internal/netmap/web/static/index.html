@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ru" data-api="api/" data-home="0">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>rakkan map</title>
+<link rel="stylesheet" href="static/vendor/leaflet.css">
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+<header>
+  <a id="home" class="brand hidden" href="/" title="Страница узла">← Rakkan</a>
+  <div class="brand" id="brand">rakkan</div>
+  <div class="segmented" role="tablist">
+    <button id="tab-graph" class="seg active" role="tab" aria-selected="true">Граф</button>
+    <button id="tab-map" class="seg" role="tab" aria-selected="false">Карта</button>
+  </div>
+  <div class="time">
+    <input id="at" type="range" min="0" max="1000" value="1000" step="1" aria-label="На момент">
+    <span id="at-label">Сейчас</span>
+    <button id="at-now" class="pill hidden" title="Вернуться к текущему состоянию">Вернуться к сейчас</button>
+  </div>
+  <div id="summary" class="summary"></div>
+</header>
+<main>
+  <aside id="filters">
+    <div class="search">
+      <div class="q-field">
+        <input id="q" type="search" placeholder="Поиск или port:22 type:tv" autocomplete="off" spellcheck="false"
+          aria-describedby="q-hint">
+        <button id="q-help-btn" class="q-help-btn" type="button" title="Как искать" aria-expanded="false">?</button>
+      </div>
+      <div id="q-hint" class="q-hint" aria-live="polite"></div>
+      <div id="q-help" class="q-help hidden"></div>
+    </div>
+
+    <div class="group-title">Сеть</div>
+    <div class="group">
+      <select id="net"><option value="">Все сети</option></select>
+    </div>
+
+    <div class="group-title">Тип устройства</div>
+    <div class="group">
+      <select id="cls">
+        <option value="">Все типы</option>
+        <option value="computer">Компьютеры</option>
+        <option value="laptop">— ноутбуки</option>
+        <option value="desktop">— стационарные</option>
+        <option value="server">— серверы</option>
+        <option value="mobile">Телефоны и планшеты</option>
+        <option value="tv">Телевизоры и медиа</option>
+        <option value="iot">Интернет вещей</option>
+        <option value="printer">Принтеры</option>
+        <option value="network">Сетевое оборудование</option>
+        <option value="unknown">Тип неизвестен</option>
+      </select>
+    </div>
+
+    <div class="group-title">Наблюдение</div>
+    <div class="group">
+      <label class="row toggle"><span>Активное</span><input type="checkbox" class="mode" value="active" checked><i></i></label>
+      <label class="row toggle"><span>Пассивное</span><input type="checkbox" class="mode" value="passive" checked><i></i></label>
+      <label class="row toggle"><span>Локальное</span><input type="checkbox" class="mode" value="local" checked><i></i></label>
+    </div>
+
+    <div class="group-title">Связи</div>
+    <div class="group">
+      <label class="row toggle"><span>Членство в сети</span><input type="checkbox" class="kind" value="member" checked><i></i></label>
+      <label class="row toggle"><span>Кабель</span><input type="checkbox" class="kind" value="l2" checked><i></i></label>
+      <label class="row toggle"><span>За портом</span><input type="checkbox" class="kind" value="l2-behind" checked><i></i></label>
+      <label class="row toggle"><span>Wi-Fi</span><input type="checkbox" class="kind" value="wifi" checked><i></i></label>
+      <label class="row toggle"><span>Маршрут</span><input type="checkbox" class="kind" value="l3" checked><i></i></label>
+      <label class="row toggle"><span>Выход в интернет</span><input type="checkbox" class="kind" value="wan" checked><i></i></label>
+      <label class="row toggle"><span>Автономные системы</span><input type="checkbox" class="kind" value="as" checked><i></i></label>
+    </div>
+
+    <div class="group-title">Устройства</div>
+    <div class="group">
+      <label class="row toggle"><span>Только с местом</span><input type="checkbox" id="only-located"><i></i></label>
+      <label class="row toggle"><span>Скрыть чужие точки доступа</span><input type="checkbox" id="hide-ap"><i></i></label>
+    </div>
+
+    <div class="group legend">
+      <div class="row"><span class="dot observer"></span>Наблюдатель</div>
+      <div class="row"><span class="dot router"></span>Шлюз, роутер</div>
+      <div class="row"><span class="dot switch"></span>Коммутатор</div>
+      <div class="row"><span class="dot ap"></span>Точка доступа</div>
+      <div class="row"><span class="dot c-computer"></span>Компьютер</div>
+      <div class="row"><span class="dot c-server"></span>Сервер</div>
+      <div class="row"><span class="dot c-mobile"></span>Телефон, планшет</div>
+      <div class="row"><span class="dot c-tv"></span>Телевизор, медиа</div>
+      <div class="row"><span class="dot c-iot"></span>Интернет вещей</div>
+      <div class="row"><span class="dot c-printer"></span>Принтер</div>
+      <div class="row"><span class="dot c-unknown"></span>Тип неизвестен</div>
+      <div class="row"><span class="dot net"></span>Сеть</div>
+      <div class="row"><span class="dot as"></span>Автономная система</div>
+    </div>
+  </aside>
+  <section id="views">
+    <div id="graph" class="view"></div>
+    <div id="map" class="view hidden"></div>
+    <div id="map-empty" class="empty hidden">
+      <div>
+        <div class="empty-title">Нет устройств с известным местом</div>
+        Задайте положение наблюдателя:<br><code>rakkan locate here --lat … --lon …</code>
+      </div>
+    </div>
+    <div id="status" class="status"></div>
+  </section>
+  <aside id="details"><p class="hint">Выберите устройство или сеть</p></aside>
+</main>
+<script src="static/vendor/cytoscape.min.js"></script>
+<script src="static/vendor/leaflet.js"></script>
+<script src="static/search.js"></script>
+<script src="static/app.js"></script>
+</body>
+</html>
