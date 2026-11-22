@@ -34,7 +34,7 @@ func fakeGPSD(t *testing.T) string {
 		fmt.Fprintln(c, `{"class":"TPV","mode":1}`)
 		fmt.Fprintln(c, `not json`)
 		fmt.Fprintln(c, `{"class":"SKY","satellites":[]}`)
-		fmt.Fprintln(c, `{"class":"TPV","mode":3,"lat":50.087,"lon":14.42,"epx":6.0,"epy":8.0,"time":"2026-11-12T10:00:00.000Z"}`)
+		fmt.Fprintln(c, `{"class":"TPV","mode":3,"lat":50.087,"lon":14.42,"epx":6.0,"epy":8.0,"time":"`+time.Now().UTC().Format("2006-01-02T15:04:05.000Z")+`"}`)
 		time.Sleep(time.Second)
 	}()
 	return ln.Addr().String()
